@@ -101,6 +101,8 @@ public:
     }
 
     VkQueryPool GetInnerPool() {
+        // A result copy can be recorded in a later submission than the guest report.
+        last_used_tick = scheduler.CurrentTick();
         return *query_pool;
     }
 
@@ -419,9 +421,9 @@ private:
         ApplyBanksWideOp<true>(pending_sync, [&](SamplesQueryBank* bank, size_t start,
                                                  size_t amount) {
             size_t bank_id = bank->GetIndex();
+            scheduler.RequestOutsideRenderPassOperationContext();
             VkQueryPool query_pool = bank->GetInnerPool();
             scheduler.CountSampleCopies(amount, 1, 0, false);
-            scheduler.RequestOutsideRenderPassOperationContext();
             scheduler.Record([start, amount, base_offset, query_pool,
                               buffer](vk::CommandBuffer cmdbuf) {
                 const VkBufferMemoryBarrier copy_query_pool_barrier{
@@ -474,6 +476,7 @@ private:
         size_t base_offset = 0;
         std::vector<Run> runs;
         size_t copied_slots = 0;
+        scheduler.RequestOutsideRenderPassOperationContext();
         for (auto& [bank_id, slots] : slots_by_bank) {
             std::sort(slots.begin(), slots.end());
             slots.erase(std::unique(slots.begin(), slots.end()), slots.end());
@@ -495,7 +498,6 @@ private:
 
         scheduler.CountSampleCopies(copied_slots, runs.size(), base_offset / query_size - copied_slots,
                                   true);
-        scheduler.RequestOutsideRenderPassOperationContext();
         scheduler.Record([buffer, runs = std::move(runs), base_offset](vk::CommandBuffer cmdbuf) {
             for (const Run& run : runs) {
                 cmdbuf.CopyQueryPoolResults(run.pool, run.first, run.count, buffer, run.offset,
