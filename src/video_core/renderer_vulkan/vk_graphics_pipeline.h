@@ -78,7 +78,11 @@ class Scheduler;
 /// Mesh emulation on a device without VK_EXT_mesh_shader: the mesh program (stage 0) is built as
 /// a compute shader that writes its output to a storage buffer, and this vertex shader draws it
 /// (see Shader::Backend::SPIRV::EmitMeshEmulationVertex).
+class MeshLookupMode;
 struct MeshEmulationSetup {
+    // The emission worker and the build task share this result until the primary builds finish.
+    std::shared_ptr<std::vector<u32>> bounded_mesh_code;
+    MeshLookupMode* lookup_mode{};
     std::vector<u32> vertex_spirv;
     u32 output_binding{};
     u32 block_words{};    ///< output words per mesh workgroup
@@ -287,6 +291,8 @@ private:
                        const RenderAreaPushConstant& render_are);
 
     void MakePipeline(VkRenderPass render_pass);
+    vk::Pipeline MakeMeshComputePipeline(VkShaderModule module, VkPipelineLayout layout,
+                                         const Shader::Info* info);
 
     void Validate();
 
@@ -341,6 +347,7 @@ private:
     std::optional<MeshEmulationSetup> mesh_emulation;
     vk::ShaderModule mesh_vertex_module;
     vk::Pipeline mesh_compute_pipeline;
+    vk::Pipeline bounded_mesh_pipeline;
     VkDescriptorSet mesh_descriptor_set{}; ///< shared by the dispatch and the draw it feeds
     VkBuffer mesh_output_buffer{};
     VkDeviceSize mesh_output_offset{};

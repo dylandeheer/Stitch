@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -14,8 +15,10 @@
 #define SPV_ENABLE_UTILITY_CODE
 #include <spirv/unified1/spirv.hpp11>
 
+#include "common/scope_exit.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/frontend/ir/ir_emitter.h"
+#include "video_core/renderer_vulkan/mesh_lookup_mode.h"
 
 namespace {
 using namespace Shader;
@@ -452,4 +455,40 @@ TEST_CASE("Bounded task ownership lookup only changes task-fed compute mesh shad
     const auto bounded = EmitProgram(Stage::Mesh, true, true, TriangleMesh(), true, true);
     Dump(baseline, "owner-lookup-baseline");
     Dump(bounded, "owner-lookup-bounded");
+}
+
+TEST_CASE("Bounded mesh marker snapshots arms and rolls over at sixteen presentations",
+          "[video_core][mesh_fallback]") {
+    const auto path = std::filesystem::temp_directory_path() /
+                      ("mesh-lookup-mode-" +
+                       std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    SCOPE_EXIT {
+        std::error_code ec;
+        std::filesystem::remove(path, ec);
+    };
+    {
+        std::ofstream marker{path};
+        REQUIRE(marker.good());
+    }
+    Vulkan::MeshLookupMode mode, disabled;
+    disabled.Initialize(nullptr, path.string().c_str());
+    REQUIRE_FALSE(disabled.Enabled());
+    mode.Initialize("1", path.string().c_str());
+    REQUIRE(mode.Enabled());
+    const bool original_request = mode.Bounded();
+    std::filesystem::remove(path);
+    mode.TickFrame(15);
+    REQUIRE_FALSE(mode.Bounded());
+    mode.TickFrame(16);
+    const bool bounded_request = mode.Bounded();
+    {
+        std::ofstream marker{path};
+        REQUIRE(marker.good());
+    }
+    mode.TickFrame(31);
+    REQUIRE(mode.Bounded());
+    mode.TickFrame(32);
+    REQUIRE_FALSE(mode.Bounded());
+    REQUIRE_FALSE(original_request);
+    REQUIRE(bounded_request);
 }

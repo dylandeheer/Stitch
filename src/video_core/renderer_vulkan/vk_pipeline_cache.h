@@ -33,6 +33,7 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
+#include "video_core/renderer_vulkan/mesh_lookup_mode.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
@@ -160,7 +161,8 @@ private:
         ShaderPools& pools, const GraphicsPipelineCacheKey& key,
         std::span<Shader::Environment* const> envs, PipelineStatistics* statistics,
         bool build_in_parallel, std::shared_ptr<ShaderPools> emit_pools = nullptr,
-        std::unique_ptr<EmissionBudget::Reservation> reservation = nullptr);
+        std::unique_ptr<EmissionBudget::Reservation> reservation = nullptr,
+        GraphicsEnvironments* live_envs = nullptr);
 
     [[nodiscard]] bool StaleNullPointerSlot(const ComputePipelineCacheEntry& entry) const;
 
@@ -205,6 +207,7 @@ private:
     /// Destroys graphics pipelines unused for a while, once the GPU is done with them.
     void EvictUnusedPipelines();
     TensorPipelineMode tensor_mode;
+    MeshLookupMode mesh_lookup_mode;
     u64 frame_count{};
     /// Wait budget of native draws for unbuilt pipelines left in this frame, in microseconds
     /// (native_async_draws = Bounded). Only touched on the GPU thread; reset in TickFrame.

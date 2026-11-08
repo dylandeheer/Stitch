@@ -19,7 +19,12 @@
 
 #include "common/bit_field.h"
 #include "common/scope_exit.h"
+#include "common/settings.h"
+#include "shader_recompiler/exception.h"
+#include "video_core/gpu_logging/gpu_logging.h"
+#include "video_core/nx2_profile.h"
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
+#include "video_core/renderer_vulkan/mesh_lookup_mode.h"
 #include "video_core/renderer_vulkan/pipeline_statistics.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_frame_dump.h"
@@ -33,10 +38,6 @@
 #include "video_core/shader_notify.h"
 #include "video_core/texture_cache/texture_cache.h"
 #include "video_core/vulkan_common/vulkan_device.h"
-#include "video_core/gpu_logging/gpu_logging.h"
-#include "common/settings.h"
-#include "shader_recompiler/exception.h"
-#include "video_core/nx2_profile.h"
 
 #if defined(__clang__) && defined(NDEBUG)
 #define LAMBDA_FORCEINLINE __attribute__((always_inline))
@@ -863,10 +864,12 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
             });
         }
         auto dispatch = [this, descriptor_data, groups = mesh_groups, capacity = mesh_capacity,
-                          task_buffers = mesh_task_buffers,
-                          rescaling_data = rescaling.Data(), is_rescaling = texture_cache.IsRescaling(),
-                          uses_render_area = render_area.uses_render_area,
-                          render_area_data = render_area.words](vk::CommandBuffer cmdbuf) {
+                         want_bounded =
+                             mesh_emulation->lookup_mode && mesh_emulation->lookup_mode->Bounded(),
+                         task_buffers = mesh_task_buffers, rescaling_data = rescaling.Data(),
+                         is_rescaling = texture_cache.IsRescaling(),
+                         uses_render_area = render_area.uses_render_area,
+                         render_area_data = render_area.words](vk::CommandBuffer cmdbuf) {
             mesh_descriptor_set = VK_NULL_HANDLE;
             const bool has_task{mesh_emulation->has_task};
             if (!pipeline || !mesh_compute_pipeline || build->Failed() || groups == 0 ||
@@ -977,7 +980,11 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
                                VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_HOST_BIT);
             // 3. The mesh workgroups, as many as the tasks asked for (up to the arena's end).
-            cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *mesh_compute_pipeline);
+            const bool use_bounded = want_bounded && bounded_mesh_pipeline;
+            cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE,
+                                use_bounded ? *bounded_mesh_pipeline : *mesh_compute_pipeline);
+            if (mesh_emulation->lookup_mode)
+                mesh_emulation->lookup_mode->Bound(use_bounded);
             bind_program_state();
             cmdbuf.DispatchIndirect(task_buffers[2].buffer, task_buffers[2].offset);
             memory_barrier(VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
@@ -1099,6 +1106,43 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
     return true;
 }
 
+vk::Pipeline GraphicsPipeline::MakeMeshComputePipeline(VkShaderModule module,
+                                                       VkPipelineLayout layout,
+                                                       const Shader::Info* info) {
+    // Votes, ballots and shuffles span the guest's 32-thread warp, which a driver may split
+    // in compute shaders too (RDNA runs them wave64).
+    const VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT compute_subgroup_size_ci{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT,
+        .pNext = nullptr,
+        .requiredSubgroupSize = GuestWarpSize,
+    };
+    const bool uses_warp_ops{info &&
+                             (info->uses_subgroup_vote || info->uses_subgroup_invocation_id ||
+                              info->uses_subgroup_shuffles || info->uses_subgroup_mask ||
+                              info->uses_quad_shuffles || info->uses_fswzadd)};
+    const bool force_warp_size{uses_warp_ops && device.IsExtSubgroupSizeControlSupported() &&
+                               device.IsGuestWarpSizeSupported(VK_SHADER_STAGE_COMPUTE_BIT)};
+    return device.GetLogical().CreateComputePipeline(
+        VkComputePipelineCreateInfo{
+            .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .stage{
+                .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                .pNext = force_warp_size ? &compute_subgroup_size_ci : nullptr,
+                .flags = 0,
+                .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+                .module = module,
+                .pName = "main",
+                .pSpecializationInfo = nullptr,
+            },
+            .layout = layout,
+            .basePipelineHandle = nullptr,
+            .basePipelineIndex = 0,
+        },
+        *pipeline_cache);
+}
+
 void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
     if (IsMeshPipeline() && !device.IsExtMeshShaderSupported() && !mesh_emulation) {
         return;
@@ -1107,52 +1151,16 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
         // The mesh program (stage 0, or mesh_stage after a task program in stage 0) is built as
         // a compute shader, and so is the task program; the draw uses the vertex shader that
         // reads the mesh program's output.
-        // Votes, ballots and shuffles span the guest's 32-thread warp, which a driver may split
-        // in compute shaders too (RDNA runs them wave64).
-        const VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT compute_subgroup_size_ci{
-            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT,
-            .pNext = nullptr,
-            .requiredSubgroupSize = GuestWarpSize,
-        };
-        const auto make_compute = [&](VkShaderModule module, VkPipelineLayout layout,
-                                      const Shader::Info* info) {
-            const bool uses_warp_ops{info && (info->uses_subgroup_vote ||
-                                              info->uses_subgroup_invocation_id ||
-                                              info->uses_subgroup_shuffles ||
-                                              info->uses_subgroup_mask ||
-                                              info->uses_quad_shuffles || info->uses_fswzadd)};
-            const bool force_warp_size{uses_warp_ops && device.IsExtSubgroupSizeControlSupported() &&
-                                       device.IsGuestWarpSizeSupported(VK_SHADER_STAGE_COMPUTE_BIT)};
-            return device.GetLogical().CreateComputePipeline(
-                VkComputePipelineCreateInfo{
-                    .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
-                    .pNext = nullptr,
-                    .flags = 0,
-                    .stage{
-                        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-                        .pNext = force_warp_size ? &compute_subgroup_size_ci : nullptr,
-                        .flags = 0,
-                        .stage = VK_SHADER_STAGE_COMPUTE_BIT,
-                        .module = module,
-                        .pName = "main",
-                        .pSpecializationInfo = nullptr,
-                    },
-                    .layout = layout,
-                    .basePipelineHandle = nullptr,
-                    .basePipelineIndex = 0,
-                },
-                *pipeline_cache);
-        };
         mesh_vertex_module = BuildShader(device, mesh_emulation->vertex_spirv);
-        mesh_compute_pipeline = make_compute(*spv_modules[mesh_emulation->mesh_stage],
-                                             *pipeline_layout,
-                                             &stage_infos[mesh_emulation->mesh_stage]);
+        mesh_compute_pipeline =
+            MakeMeshComputePipeline(*spv_modules[mesh_emulation->mesh_stage], *pipeline_layout,
+                                    &stage_infos[mesh_emulation->mesh_stage]);
         if (mesh_emulation->has_task) {
             task_compute_pipeline =
-                make_compute(*spv_modules[0], *pipeline_layout, &stage_infos[0]);
+                MakeMeshComputePipeline(*spv_modules[0], *pipeline_layout, &stage_infos[0]);
             distribution_module = BuildShader(device, mesh_emulation->distribution_spirv);
             distribution_pipeline =
-                make_compute(*distribution_module, *distribution_layout, nullptr);
+                MakeMeshComputePipeline(*distribution_module, *distribution_layout, nullptr);
         }
     }
     FixedPipelineState::DynamicState dynamic{};
@@ -1627,6 +1635,26 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
                            std::chrono::steady_clock::now() - trace_begin)
                            .count());
 
+    // Complete every mandatory pipeline before an optional driver build can consume memory.
+    if (mesh_emulation && mesh_emulation->lookup_mode) {
+        auto code = std::move(mesh_emulation->bounded_mesh_code);
+        if (code && !code->empty()) {
+            try {
+                auto module = BuildShader(device, *code);
+                const auto stage = mesh_emulation->mesh_stage;
+                bounded_mesh_pipeline =
+                    MakeMeshComputePipeline(*module, *pipeline_layout, &stage_infos[stage]);
+            } catch (const std::exception& ex) {
+                LOG_WARNING(Render_Vulkan, "Optional bounded mesh {:016x} unavailable: {}",
+                            key.Hash(), ex.what());
+            }
+        }
+        mesh_emulation->lookup_mode->Built(static_cast<bool>(bounded_mesh_pipeline));
+        LOG_INFO(Render_Vulkan,
+                 "Mesh lookup pipeline={:016x} shader={:016x} original=true bounded={}", key.Hash(),
+                 key.unique_hashes[mesh_emulation->mesh_stage + 1],
+                 static_cast<bool>(bounded_mesh_pipeline));
+    }
     // Log graphics pipeline creation
     if (GPU::Logging::IsActive()) {
         const std::string pipeline_info = fmt::format(

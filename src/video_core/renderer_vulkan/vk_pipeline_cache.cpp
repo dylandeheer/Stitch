@@ -346,11 +346,68 @@ void AddRuntimeSpirvTime(size_t thread, std::chrono::steady_clock::time_point be
         std::memory_order::relaxed);
 }
 
+// Saved FileEnvironments stay alive during synchronous cache warmup. Live stages instead
+// own a serialized snapshot before translation hands the optional emission to a worker.
+struct MeshStageReplay {
+    std::unique_ptr<FileEnvironment> owned;
+    Shader::Environment* captured{};
+    std::shared_ptr<std::vector<u32>> output;
+    Shader::HostTranslateInfo host_info;
+    u64 pipeline_key{};
+
+    void Emit(const Shader::Profile& profile, const Shader::RuntimeInfo& runtime,
+              const Shader::Backend::Bindings& incoming, const Shader::Backend::Bindings& outgoing,
+              const Shader::IR::Program& primary, std::span<const u32> primary_code) const {
+        const auto counts = [](const Shader::Backend::Bindings& b) {
+            return std::array{b.unified, b.uniform_buffer,        b.storage_buffer,     b.texture,
+                              b.image,   b.texture_scaling_index, b.image_scaling_index};
+        };
+        const auto generate = [&](bool bounded) {
+            ShaderPools pools;
+            const u32 start =
+                static_cast<u32>(captured->StartAddress() + sizeof(Shader::ProgramHeader));
+            Shader::Maxwell::Flow::CFG cfg(*captured, pools.flow_block, start, false);
+            auto program = TranslateProgram(pools.inst, pools.block, *captured, cfg, host_info);
+            const auto& mesh = program.mesh;
+            if (program.stage != Shader::Stage::Mesh ||
+                program.workgroup_size != primary.workgroup_size ||
+                program.shared_memory_size != primary.shared_memory_size ||
+                mesh.max_vertices != primary.mesh.max_vertices ||
+                mesh.max_primitives != primary.mesh.max_primitives ||
+                mesh.payload_words != primary.mesh.payload_words ||
+                mesh.topology != primary.mesh.topology ||
+                mesh.vertex_lines != primary.mesh.vertex_lines ||
+                mesh.primitive_lines != primary.mesh.primitive_lines)
+                throw Shader::LogicError("Mesh replay changed its execution or arena layout");
+            ConvertLegacyToGeneric(program, runtime);
+            auto options = profile;
+            options.bounded_mesh_task_lookup = bounded;
+            auto bindings = incoming;
+            auto code = EmitSPIRV(options, runtime, program, bindings);
+            if (counts(bindings) != counts(outgoing))
+                throw Shader::LogicError("Mesh replay changed descriptor bindings");
+            return code;
+        };
+        if (!std::ranges::equal(generate(false), primary_code)) {
+            LOG_WARNING(Render_Vulkan, "Mesh lookup {:016x}: original replay differs",
+                        pipeline_key);
+            return;
+        }
+        auto candidate = generate(true);
+        if (!std::ranges::equal(candidate, primary_code))
+            *output = std::move(candidate);
+    }
+};
+
 vk::ShaderModule EmitShaderModule(const Device& device, const Shader::Profile& profile,
-                                 const Shader::RuntimeInfo& runtime_info,
-                                 Shader::IR::Program& program, Shader::Backend::Bindings& binding,
-                                 u64 shader_hash, size_t stage_index,
-                                 std::span<const u32> reference = {}) {
+                                  const Shader::RuntimeInfo& runtime_info,
+                                  Shader::IR::Program& program, Shader::Backend::Bindings& binding,
+                                  u64 shader_hash, size_t stage_index,
+                                  std::span<const u32> reference = {},
+                                  const MeshStageReplay* mesh_replay = nullptr) {
+    Shader::Backend::Bindings incoming{};
+    if (mesh_replay)
+        incoming = binding;
     const auto code =
         EmitPipelineShader(profile, runtime_info, program, binding, shader_hash, reference);
     device.SaveShader(code);
@@ -379,6 +436,14 @@ vk::ShaderModule EmitShaderModule(const Device& device, const Shader::Profile& p
     if (device.HasDebuggingToolAttached()) {
         const std::string name{fmt::format("Shader {:016x}", shader_hash)};
         module.SetObjectNameEXT(name.c_str());
+    }
+    if (mesh_replay) {
+        try {
+            mesh_replay->Emit(profile, runtime_info, incoming, binding, program, code);
+        } catch (const std::exception& ex) {
+            LOG_WARNING(Render_Vulkan, "Keeping original mesh {:016x}, optional replay failed: {}",
+                        shader_hash, ex.what());
+        }
     }
     return module;
 }
@@ -583,8 +648,10 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
         .min_ssbo_alignment = device.GetStorageBufferAlignment(),
         .max_user_clip_distances = device.GetMaxUserClipDistances()
     };
-    const char* mesh_lookup = std::getenv("STITCH_BOUNDED_MESH_TASK_LOOKUP");
-    profile.bounded_mesh_task_lookup = mesh_lookup && std::string_view{mesh_lookup} == "1";
+    // The shared profile always builds the mandatory original mesh compute pipeline.
+    profile.bounded_mesh_task_lookup = false;
+    mesh_lookup_mode.Initialize(std::getenv("STITCH_BOUNDED_MESH_TASK_LOOKUP"),
+                                std::getenv("STITCH_MESH_BASELINE_FILE"));
     profile.support_cooperative_hmma =
         device.IsCooperativeHmmaSupported() && TestCooperativeHmma(device);
     profile.support_cooperative_hmma_16x16x16 =
@@ -1348,6 +1415,7 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath() {
 void PipelineCache::TickFrame() {
     ++frame_count;
     tensor_mode.TickFrame(frame_count);
+    mesh_lookup_mode.TickFrame(frame_count);
     native_wait_budget_us =
         static_cast<s64>(Settings::values.native_pipeline_wait_ms.GetValue()) * 1000;
     while (!evicted_pipelines.empty() && scheduler.IsFree(evicted_pipelines.front().first)) {
@@ -1515,7 +1583,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     ShaderPools& pools, const GraphicsPipelineCacheKey& key,
     std::span<Shader::Environment* const> envs, PipelineStatistics* statistics,
     bool build_in_parallel, std::shared_ptr<ShaderPools> emit_pools,
-    std::unique_ptr<EmissionBudget::Reservation> reservation) try {
+    std::unique_ptr<EmissionBudget::Reservation> reservation, GraphicsEnvironments* live_envs) try {
     auto hash = key.Hash();
     LOG_DEBUG(Render_Vulkan, "{:#016x}", hash);
     size_t env_index{0};
@@ -1526,6 +1594,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     // Layer passthrough generation for devices without VK_EXT_shader_viewport_index_layer
     Shader::IR::Program* layer_source_program{};
     bool mesh_unsupported{};
+    Shader::Environment* original_mesh_env{};
 
     for (size_t index = 0; index < Maxwell::MaxShaderProgram; ++index) {
         const bool is_emulated_stage = layer_source_program != nullptr &&
@@ -1541,6 +1610,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         }
         Shader::Environment& env{*envs[env_index]};
         ++env_index;
+        if (env.ShaderStage() == Shader::Stage::Mesh)
+            original_mesh_env = &env;
         if (index == static_cast<size_t>(Maxwell::ShaderType::Geometry) &&
             !device.IsGeometryShaderSupported() && env.IsNativeProgram()) {
             // A native (Switch 2) geometry program on a device without geometry shaders: the
@@ -1797,6 +1868,43 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                 storage_buffers, set_limit);
         }
     }
+    std::shared_ptr<MeshStageReplay> mesh_replay;
+    if (mesh_lookup_mode.Enabled() && mesh_emulation && mesh_emulation->has_task &&
+        original_mesh_env && original_mesh_env->IsNativeProgram()) {
+        mesh_emulation->lookup_mode = &mesh_lookup_mode;
+        try {
+            auto candidate = std::make_shared<MeshStageReplay>();
+            if (live_envs) {
+                auto& live = live_envs->envs[mesh_index];
+                if (&live == original_mesh_env && live.CanBeSerialized()) {
+                    std::stringstream stream{std::ios::in | std::ios::out | std::ios::binary};
+                    stream.exceptions(std::ios::failbit | std::ios::badbit);
+                    live.Serialize(stream);
+                    stream.seekg(0);
+                    candidate->owned = std::make_unique<FileEnvironment>();
+                    candidate->owned->Deserialize(stream);
+                    candidate->captured = candidate->owned.get();
+                }
+            } else if (!emit_pools) {
+                candidate->captured = original_mesh_env;
+            }
+            if (candidate->captured) {
+                candidate->host_info = host_info;
+                candidate->pipeline_key = hash;
+                candidate->output = std::make_shared<std::vector<u32>>();
+                mesh_emulation->bounded_mesh_code = candidate->output;
+                mesh_replay = std::move(candidate);
+            }
+        } catch (const std::exception& ex) {
+            LOG_WARNING(Render_Vulkan, "Keeping original mesh pipeline {:016x}: {}", hash,
+                        ex.what());
+        }
+    }
+    // The legacy async verification path emits the same IR on two threads in succession.
+    // Mesh emission mutates that IR. For a dual-variant entry under verification, build its
+    // primary modules here once; the independent captures below still qualify the alternate.
+    const bool defer_stages = emit_pools && !(mesh_emulation && mesh_emulation->lookup_mode &&
+                                              VideoCommon::Nx2Perf::Verify());
     std::array<const Shader::Info*, Maxwell::MaxShaderStage> infos{};
     std::array<vk::ShaderModule, Maxwell::MaxShaderStage> modules;
     std::array<std::optional<Shader::RuntimeInfo>, Maxwell::MaxShaderStage> deferred_runtime_infos;
@@ -1850,15 +1958,16 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                            static_cast<std::streamsize>(code.size() * sizeof(u32)));
             }
         }
-        if (emit_pools) {
+        if (defer_stages) {
             deferred_runtime_infos[stage_index] = runtime_info;
             if (VideoCommon::Nx2Perf::Verify()) {
                 reference_spirv[stage_index] = EmitSPIRV(profile, runtime_info, program, binding);
             }
         } else {
             const auto begin = std::chrono::steady_clock::now();
-            modules[stage_index] = EmitShaderModule(device, profile, runtime_info, program, binding,
-                                                   key.unique_hashes[index], stage_index);
+            modules[stage_index] = EmitShaderModule(
+                device, profile, runtime_info, program, binding, key.unique_hashes[index],
+                stage_index, {}, index == mesh_index ? mesh_replay.get() : nullptr);
             if (build_in_parallel) {
                 AddRuntimeSpirvTime(0, begin);
             }
@@ -1866,7 +1975,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         previous_stage = &program;
     }
     std::function<std::array<vk::ShaderModule, Maxwell::MaxShaderStage>()> emit_stages;
-    if (emit_pools) {
+    if (defer_stages) {
         auto job = std::make_shared<DeferredStages>();
         job->reservation = std::move(reservation);
         job->pools = emit_pools;
@@ -1878,18 +1987,20 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                 infos[stage] = &job->programs[stage + 1].info;
             }
         }
-        emit_stages = [this, job = std::move(job), hashes = key.unique_hashes]() mutable {
+        emit_stages = [this, job = std::move(job), hashes = key.unique_hashes, mesh_index,
+                       mesh_replay = std::move(mesh_replay)]() mutable {
             const auto begin = std::chrono::steady_clock::now();
             std::array<vk::ShaderModule, Maxwell::MaxShaderStage> stage_modules;
             Shader::Backend::Bindings stage_binding;
             for (size_t stage = 0; stage < stage_modules.size(); ++stage) {
                 if (job->runtime_infos[stage]) {
-                    stage_modules[stage] =
-                        EmitShaderModule(device, profile, *job->runtime_infos[stage],
-                                         job->programs[stage + 1], stage_binding,
-                                         hashes[stage + 1], stage, job->reference_spirv[stage]);
+                    stage_modules[stage] = EmitShaderModule(
+                        device, profile, *job->runtime_infos[stage], job->programs[stage + 1],
+                        stage_binding, hashes[stage + 1], stage, job->reference_spirv[stage],
+                        stage + 1 == mesh_index ? mesh_replay.get() : nullptr);
                 }
             }
+            mesh_replay.reset();
             auto completed_pools = std::move(job->pools);
             job.reset();
             completed_pools->ReleaseContents();
@@ -2005,7 +2116,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
     }
     ShaderPools& pools = emit_pools ? *emit_pools : main_pools;
     auto pipeline{CreateGraphicsPipeline(pools, graphics_key, environments.Span(), nullptr, true,
-                                         std::move(emit_pools), std::move(reservation))};
+                                         std::move(emit_pools), std::move(reservation),
+                                         &environments)};
     if (!pipeline || pipeline_cache_filename.empty()) {
         return pipeline;
     }
