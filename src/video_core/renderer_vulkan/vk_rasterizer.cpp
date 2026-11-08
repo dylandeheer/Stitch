@@ -55,6 +55,7 @@
 #include "video_core/renderer_vulkan/vk_query_cache.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/texture_cache/clear_discard.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/renderer_vulkan/vk_state_tracker.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
@@ -1575,6 +1576,9 @@ void RasterizerVulkan::DrawTexture() {
 }
 
 void RasterizerVulkan::Clear(u32 layer_count) {
+    if (!layer_count) {
+        return;
+    }
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Clear};
     if (Tegra::Engines::g_nx2_trace_draws_after_upscale > 0) {
         const auto& regs = maxwell3d->regs;
@@ -1703,7 +1707,9 @@ void RasterizerVulkan::Clear(u32 layer_count) {
         clear_rect.rect.offset.x == 0 && clear_rect.rect.offset.y == 0 &&
         clear_rect.rect.extent.width >= render_area.width &&
         clear_rect.rect.extent.height >= render_area.height;
-    const bool can_defer_clear = ENABLE_DEFERRED_CLEAR && (!regs.clear_control.use_scissor || clear_covers_render_area) &&
+    // Attachment load ops execute even when a GPU condition would skip vkCmdClearAttachments.
+    const bool can_defer_clear = ENABLE_DEFERRED_CLEAR && VideoCommon::UnconditionalClear(regs) &&
+                                 (!regs.clear_control.use_scissor || clear_covers_render_area) &&
                                  clear_layers.covers_all_layers &&
                                  !scheduler.IsRenderPassActive() &&
                                  (!use_color || color_full_channels) && ds_deferrable;

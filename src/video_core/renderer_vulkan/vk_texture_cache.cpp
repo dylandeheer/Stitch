@@ -455,7 +455,8 @@ constexpr std::array<VkFormat, 2> OpaqueAstcViewFormats{VK_FORMAT_BC1_RGBA_UNORM
                                   const ImageInfo& info, std::span<const VkFormat> view_formats,
                                   std::optional<VkFormat> format_override = {},
                                   bool unbacked = false, bool aliased = false,
-                                  bool may_fail = false) {
+                                  bool may_fail = false,
+                                  std::unique_ptr<RetiredImageTicket>* recycle_ticket = nullptr) {
     if (info.type == ImageType::Buffer) {
         return vk::Image{};
     }
@@ -488,7 +489,9 @@ constexpr std::array<VkFormat, 2> OpaqueAstcViewFormats{VK_FORMAT_BC1_RGBA_UNORM
             return image;
         }
     }
-    return may_fail ? allocator.TryCreateImage(image_ci) : allocator.CreateImage(image_ci);
+    // Sparse and fallback images never enter the retired-target pool.
+    return may_fail ? allocator.TryCreateImage(image_ci, false, unbacked ? nullptr : recycle_ticket)
+                    : allocator.CreateImage(image_ci);
 }
 
 [[nodiscard]] vk::ImageView MakeStorageView(const vk::Device& device, u32 level, VkImage image,
@@ -2886,7 +2889,7 @@ void TextureCacheRuntime::TickFrame() {
 }
 
 Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu_addr_,
-             VAddr cpu_addr_)
+             VAddr cpu_addr_, bool full_clear)
     : VideoCommon::ImageBase(info_, gpu_addr_, cpu_addr_), scheduler{&runtime_.scheduler},
       runtime{&runtime_},
       original_image(MakeImage(runtime_.device, runtime_.memory_allocator,
@@ -2902,7 +2905,9 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
                                    IsUnwrittenSparse(runtime_.device, info, gpu_addr_),
                                UsesSparseTiles(runtime_.device, info, gpu_addr_) &&
                                    SparseTilesModeOf(runtime_.device) == SparseTilesMode::Aliased,
-                               true)),
+                               true, full_clear && info.native_tiling && !info.is_sparse &&
+                                             !runtime_.resolution.active
+                                         ? &recycle_ticket : nullptr)),
       aspect_mask(ImageAspectMask(info.format)) {
     if (OutOfMemory()) {
         return;
@@ -2976,6 +2981,16 @@ Image::~Image() {
         if (scaled_image) {
             runtime->EraseResolveShadow(*scaled_image);
         }
+    }
+}
+
+void Image::RecycleRetiredTarget(u64 view_rings_clear_by) {
+    if (recycle_ticket && !HasScaled() && !scaled_image && !sparse_layers.allocator &&
+        False(flags & (ImageFlagBits::Sparse | ImageFlagBits::Unbacked | ImageFlagBits::TrimmedLevels))) {
+        if (ENABLE_MSAA_RESOLVE_CONSUME) {
+            runtime->EraseResolveShadow(*original_image);
+        }
+        runtime->memory_allocator.RecycleRetiredImage(*recycle_ticket, original_image, view_rings_clear_by);
     }
 }
 

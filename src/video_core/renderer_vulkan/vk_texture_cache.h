@@ -101,6 +101,10 @@ public:
 
     u64 GetDeviceMemoryUsage() const;
 
+    bool UpdateImagePool(u64 frame, bool pressure) {
+        return memory_allocator.UpdateImagePool(frame, pressure);
+    }
+
     /// GPU progress: the texture cache frees a deleted image once the GPU is past its last use.
     [[nodiscard]] u64 CurrentTick() const noexcept;
 
@@ -469,10 +473,13 @@ private:
 class Image : public VideoCommon::ImageBase {
 public:
     explicit Image(TextureCacheRuntime&, const VideoCommon::ImageInfo& info, GPUVAddr gpu_addr,
-                   VAddr cpu_addr);
+                   VAddr cpu_addr, bool full_clear = false);
     explicit Image(const VideoCommon::NullImageParams&);
 
     ~Image();
+
+    /// Called only on an unreferenced texture whose last submission completed.
+    void RecycleRetiredTarget(u64 view_rings_clear_by);
 
     Image(const Image&) = delete;
     Image& operator=(const Image&) = delete;
@@ -668,6 +675,7 @@ private:
     /// Records a clear of the whole image to zero.
     void ClearTiles();
 
+    std::unique_ptr<RetiredImageTicket> recycle_ticket;
     vk::Image original_image;
     vk::Image scaled_image;
 

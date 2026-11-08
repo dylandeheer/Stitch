@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "common/common_types.h"
+#include "video_core/vulkan_common/retired_image_pool.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 #include "video_core/vulkan_common/vma.h"
@@ -111,7 +112,12 @@ namespace Vulkan {
         vk::Image CreateImage(const VkImageCreateInfo &ci, bool dedicated = false) const;
 
         /// CreateImage, but a null image instead of an exception when there is no memory for it.
-        vk::Image TryCreateImage(const VkImageCreateInfo &ci, bool dedicated = false) const;
+        vk::Image TryCreateImage(const VkImageCreateInfo &ci, bool dedicated = false,
+                                 std::unique_ptr<RetiredImageTicket>* ticket = nullptr) const;
+
+        void RecycleRetiredImage(RetiredImageTicket& ticket, vk::Image& image,
+                                 u64 view_rings_clear_by) const;
+        bool UpdateImagePool(u64 frame, bool pressure);
 
         /// A sparse resident image with nothing bound (reads return zero, writes are dropped), or
         /// a null image when the device can't make one.
@@ -173,7 +179,22 @@ namespace Vulkan {
         }
 
         /// CreateImage's fallbacks; the image is left null when the result is an error.
-        VkResult AllocateImage(const VkImageCreateInfo &ci, bool dedicated, vk::Image &image) const;
+        VkResult AllocateImage(const VkImageCreateInfo &ci, bool dedicated, vk::Image &image,
+                               std::unique_ptr<RetiredImageTicket>* ticket = nullptr) const;
+
+        struct PoolState;
+        std::unique_ptr<PoolState> image_pool;
+
+        template <class Allocate>
+        VkResult AllocateWithinBudget(Allocate&& allocate) const {
+            const VkResult result = allocate();
+            if ((result == VK_ERROR_OUT_OF_DEVICE_MEMORY || result == VK_ERROR_OUT_OF_HOST_MEMORY) &&
+                image_pool && DrainImagePool()) {
+                return allocate();
+            }
+            return result;
+        }
+        bool DrainImagePool() const;
 
         const Device &device;                              ///< Device handle.
         VmaAllocator allocator;                           ///< VMA allocator.

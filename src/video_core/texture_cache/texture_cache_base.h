@@ -518,6 +518,7 @@ private:
 
     /// Returns true if the current clear parameters clear the whole image of a given image view
     [[nodiscard]] bool IsFullClear(ImageViewId id);
+    [[nodiscard]] bool CanDiscardForClear(const ImageInfo& info, GPUVAddr address) const;
 
     /// Returns true if the current clear's render area and scissor cover a width x height image
     [[nodiscard]] bool ClearCovers(u32 width, u32 height) const;

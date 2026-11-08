@@ -7,6 +7,8 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <chrono>
+#include <filesystem>
 #include <limits>
 #include <optional>
 #include <type_traits>
@@ -182,12 +184,90 @@ void MemoryCommit::Release() {
     size = 0;
 }
 
+struct MemoryAllocator::PoolState {
+    using Clock = std::chrono::steady_clock;
+    std::mutex mutex;
+    RetiredImagePool<vk::Image> ready;
+    u64 frame{};
+    u64 cooldown_until{};
+    bool baseline = true;
+    bool pressure = true;
+    struct Counters {
+        u64 created{}, hits{}, kept{}, destroyed{}, create_ns{}, destroy_ns{}, pressure_drains{};
+    } stats;
+
+    size_t Trim(bool all) {
+        const auto start = Clock::now();
+        const size_t count = ready.Trim(frame, all);
+        if (count) {
+            stats.destroyed += count;
+            stats.destroy_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                Clock::now() - start).count();
+        }
+        return count;
+    }
+};
+
+bool MemoryAllocator::DrainImagePool() const {
+    std::scoped_lock lock{image_pool->mutex};
+    image_pool->pressure = true;
+    image_pool->cooldown_until = image_pool->frame + 60;
+    const size_t count = image_pool->Trim(true);
+    image_pool->stats.pressure_drains += count != 0;
+    return count != 0;
+}
+
+bool MemoryAllocator::UpdateImagePool(u64 frame, bool pressure) {
+    if (!image_pool) {
+        return false;
+    }
+    auto& pool = *image_pool;
+    std::scoped_lock lock{pool.mutex};
+    pool.frame = frame;
+    pool.pressure = pressure || frame < pool.cooldown_until;
+    bool baseline = pool.baseline;
+    if (frame % 16 == 0) {
+        std::error_code error;
+        baseline = std::filesystem::exists(ImagePoolBaselineFile(), error) || error;
+    }
+    if (frame % 120 == 0 || baseline != pool.baseline) {
+        const auto& s = pool.stats;
+        LOG_INFO(Render_Vulkan,
+                 "Retired image pool: frame={} prior_mode={} created={} hits={} kept={} "
+                 "destroyed={} create_bind_us={} destroy_us={} resident_bytes={} "
+                 "pressure={} oom_drains={}", frame, pool.baseline ? "baseline" : "reuse",
+                 s.created, s.hits, s.kept, s.destroyed, s.create_ns / 1000,
+                 s.destroy_ns / 1000, pool.ready.Bytes(), pool.pressure, s.pressure_drains);
+        pool.stats = {};
+    }
+    pool.baseline = baseline;
+    return pool.Trim(baseline || pool.pressure) != 0;
+}
+
+void MemoryAllocator::RecycleRetiredImage(RetiredImageTicket& ticket, vk::Image& image,
+                                         u64 view_rings_clear_by) const {
+    auto& pool = *image_pool;
+    std::scoped_lock lock{pool.mutex};
+    if (!pool.baseline && !pool.pressure && pool.ready.Put(ticket, image, pool.frame, view_rings_clear_by)) {
+        ++pool.stats.kept;
+        return;
+    }
+    const auto start = PoolState::Clock::now();
+    image.reset();
+    ++pool.stats.destroyed;
+    pool.stats.destroy_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+        PoolState::Clock::now() - start).count();
+}
+
 MemoryAllocator::MemoryAllocator(const Device &device_)
         : device{device_}, allocator{device.GetAllocator()},
             properties{device_.GetPhysical().GetMemoryProperties().memoryProperties},
             buffer_image_granularity{
                     device_.GetPhysical().GetProperties().limits.bufferImageGranularity} {
 
+    if (ImagePoolBaselineFile() && device.CanReportMemoryUsage()) {
+        image_pool = std::make_unique<PoolState>();
+    }
     // Preserve the previous "RenderDoc small heap" trimming behavior that we had in original vma minus the heap bug
     if (device.HasDebuggingToolAttached())
     {
@@ -213,9 +293,10 @@ vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicat
     return image;
 }
 
-vk::Image MemoryAllocator::TryCreateImage(const VkImageCreateInfo &ci, bool dedicated) const {
+vk::Image MemoryAllocator::TryCreateImage(const VkImageCreateInfo &ci, bool dedicated,
+                                         std::unique_ptr<RetiredImageTicket>* ticket) const {
     vk::Image image;
-    const VkResult result = AllocateImage(ci, dedicated, image);
+    const VkResult result = AllocateImage(ci, dedicated, image, ticket);
     if (result != VK_ERROR_OUT_OF_DEVICE_MEMORY && result != VK_ERROR_OUT_OF_HOST_MEMORY) {
         vk::Check(result);
     }
@@ -223,7 +304,8 @@ vk::Image MemoryAllocator::TryCreateImage(const VkImageCreateInfo &ci, bool dedi
 }
 
 VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedicated,
-                                        vk::Image &image) const {
+                                        vk::Image &image,
+                                        std::unique_ptr<RetiredImageTicket>* ticket) const {
     const VmaAllocationCreateInfo alloc_ci = {
             // Best fit: images freed by the thousand leave holes in the blocks, which new ones
             // should fill before VMA takes another block.
@@ -243,13 +325,42 @@ VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedica
     VkImage handle{};
     VmaAllocation allocation{};
     VmaAllocationInfo alloc_info{};
+    std::optional<RetiredImageKey> key;
+    if (ticket && image_pool) {
+        key = RetiredImageKey::From(ci, dedicated);
+    }
+    std::unique_ptr<RetiredImageTicket> candidate;
+    if (key) {
+        candidate = std::make_unique<RetiredImageTicket>(RetiredImageTicket{std::move(*key), 0});
+        std::scoped_lock lock{image_pool->mutex};
+        if (!image_pool->baseline && !image_pool->pressure) {
+            image = image_pool->ready.Take(*candidate, image_pool->frame);
+            if (image) {
+                ++image_pool->stats.hits;
+                *ticket = std::move(candidate);
+                return VK_SUCCESS;
+            }
+        }
+    }
     // Images this large (title 1's sparse texture arrays reach 4.5G texels, ~23 GB) are never
     // backed: VMA would quietly place them in system memory once VRAM is full. They take the
     // unbacked sparse fallback below.
     const u64 texels = u64{ci.extent.width} * ci.extent.height * ci.extent.depth * ci.arrayLayers;
     const bool huge = texels > (u64{1} << 28);
-    VkResult result = huge ? VK_ERROR_OUT_OF_DEVICE_MEMORY
-                           : vmaCreateImage(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info);
+    const auto start = candidate ? PoolState::Clock::now() : PoolState::Clock::time_point{};
+    VkResult result = huge ? VK_ERROR_OUT_OF_DEVICE_MEMORY : AllocateWithinBudget([&] {
+        return vmaCreateImage(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info);
+    });
+    if (candidate && result == VK_SUCCESS &&
+        (properties.memoryTypes[alloc_info.memoryType].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
+        candidate->bytes = alloc_info.size;
+        *ticket = std::move(candidate);
+        const auto elapsed = PoolState::Clock::now() - start;
+        std::scoped_lock lock{image_pool->mutex};
+        ++image_pool->stats.created;
+        image_pool->stats.create_ns +=
+            std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count();
+    }
     if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !huge) {
         // Over the device memory budget (Switch 2 titles fill 8 GB cards): let the driver page
         // it out rather than failing the draw and aborting.
@@ -377,7 +488,9 @@ VmaAllocation MemoryAllocator::AllocateSparseMemory(const VkMemoryRequirements &
             }
         }
     }
-    if (vmaAllocateMemory(allocator, &requirements, &alloc_ci, &allocation, &info) != VK_SUCCESS) {
+    if (AllocateWithinBudget([&] {
+            return vmaAllocateMemory(allocator, &requirements, &alloc_ci, &allocation, &info);
+        }) != VK_SUCCESS) {
         return VK_NULL_HANDLE;
     }
     memory = info.deviceMemory;
@@ -446,7 +559,9 @@ vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsa
     VkMemoryPropertyFlags property_flags{};
 
     if (!CreateBufferInSeparatePool(ci, usage, alloc_ci, handle, allocation, alloc_info)) {
-        vk::Check(vmaCreateBuffer(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info));
+        vk::Check(AllocateWithinBudget([&] {
+            return vmaCreateBuffer(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info);
+        }));
     }
     vmaGetAllocationMemoryProperties(allocator, allocation, &property_flags);
 
@@ -503,8 +618,10 @@ vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsa
     VmaAllocation allocation{};
     VkMemoryPropertyFlags property_flags{};
 
-    vk::Check(vmaCreateBufferWithAlignment(allocator, &ci, &alloc_ci, min_alignment, &handle,
-                                           &allocation, &alloc_info));
+    vk::Check(AllocateWithinBudget([&] {
+        return vmaCreateBufferWithAlignment(allocator, &ci, &alloc_ci, min_alignment, &handle,
+                                            &allocation, &alloc_info);
+    }));
     vmaGetAllocationMemoryProperties(allocator, allocation, &property_flags);
 
     u8 *data = reinterpret_cast<u8 *>(alloc_info.pMappedData);
@@ -536,7 +653,9 @@ MemoryCommit MemoryAllocator::Commit(const VkMemoryRequirements &reqs, MemoryUsa
     VmaAllocation a{};
     VmaAllocationInfo info{};
 
-    VkResult res = vmaAllocateMemory(allocator, &reqs, &ci, &a, &info);
+    VkResult res = AllocateWithinBudget([&] {
+        return vmaAllocateMemory(allocator, &reqs, &ci, &a, &info);
+    });
 
     if (res != VK_SUCCESS) {
         // Relax 1: drop budget constraint
@@ -575,7 +694,9 @@ MemoryCommit MemoryAllocator::Commit(const vk::Buffer &buffer, MemoryUsage usage
     VmaAllocationInfo info{};
 
     // Let VMA infer memory requirements from the buffer
-    VkResult res = vmaAllocateMemoryForBuffer(allocator, raw, &ci, &a, &info);
+    VkResult res = AllocateWithinBudget([&] {
+        return vmaAllocateMemoryForBuffer(allocator, raw, &ci, &a, &info);
+    });
 
     if (res != VK_SUCCESS) {
         auto ci2 = ci;

@@ -35,8 +35,10 @@
 #include "video_core/guest_memory.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/texture_cache/alias_copy.h"
+#include "video_core/texture_cache/clear_discard.h"
 #include "video_core/texture_cache/image_view_base.h"
 #include "video_core/texture_cache/conversion.h"
+#include "video_core/texture_cache/retire_completed_images.h"
 #include "video_core/texture_cache/samples_helper.h"
 #include "video_core/texture_cache/texture_cache_base.h"
 #include "video_core/texture_cache/util.h"
@@ -478,15 +480,18 @@ void TextureCache<P>::TickFrame() {
         }
     }
     if constexpr (requires { runtime.CurrentTick(); }) {
-        while (!gpu_sentenced_images.empty() &&
-               runtime.IsFree(gpu_sentenced_images.front().tick)) {
-            gpu_sentenced_bytes -= gpu_sentenced_images.front().bytes;
-            gpu_sentenced_images.pop_front();
-        }
+        // From this frame, one whole rotation also releases every retired view/framebuffer.
+        RetireCompletedImages(gpu_sentenced_images, runtime, gpu_sentenced_bytes,
+                              frame_tick + static_cast<u64>(TICKS_TO_DESTROY));
     }
     // If we can obtain the memory info, use it instead of the estimate.
     if (runtime.CanReportMemoryUsage()) {
         total_used_memory = runtime.GetDeviceMemoryUsage();
+        if constexpr (requires { runtime.UpdateImagePool(frame_tick, false); }) {
+            if (runtime.UpdateImagePool(frame_tick, total_used_memory >= expected_memory)) {
+                total_used_memory = runtime.GetDeviceMemoryUsage();
+            }
+        }
         // Images the collector deleted keep their memory for TICKS_TO_DESTROY frames: counting
         // it kept the collector in aggressive mode, deleting 40+ images a frame for frames after
         // it had freed enough (title 1: frames over 100 ms for seconds at a time).
@@ -2900,7 +2905,16 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             }
         }
     }
-    const ImageId new_image_id = slot_images.insert(runtime, new_info, gpu_addr, cpu_addr);
+    const bool full_clear = clearing_render_targets && join_copies_to_do.empty() &&
+                            CanDiscardForClear(new_info, gpu_addr);
+    const ImageId new_image_id = [&] {
+        if constexpr (std::is_constructible_v<Image, Runtime&, const ImageInfo&, GPUVAddr, VAddr,
+                                              bool>) {
+            return slot_images.insert(runtime, new_info, gpu_addr, cpu_addr, full_clear);
+        } else {
+            return slot_images.insert(runtime, new_info, gpu_addr, cpu_addr);
+        }
+    }();
     if constexpr (requires(const Image& image) { image.OutOfMemory(); }) {
         if (slot_images[new_image_id].OutOfMemory()) {
             // Left out of the cache: lookups see no image (a null view) and make it again once
@@ -2950,57 +2964,6 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         DeleteImage(overlap_id);
     }
 
-    // A new render target that the clear binding it overwrites whole (every channel, the whole
-    // image) needs no upload from guest memory first: Ocarina of Time creates ~4 such targets a
-    // frame outdoors, and uploading them was ~15% of the GPU back thread.
-    const auto overwritten_by_clear = [&] {
-        if (!clearing_render_targets || !join_copies_to_do.empty() ||
-            new_info.type != ImageType::e2D || new_info.resources.levels != 1 ||
-            new_info.resources.layers != 1 || new_info.num_samples != 1) {
-            return false;
-        }
-        const auto& regs = maxwell3d->regs;
-        const auto& surface = regs.clear_surface;
-        if (surface.layer != 0) {
-            return false;
-        }
-        const u32 width = new_info.size.width;
-        const u32 height = new_info.size.height;
-        if (!ClearCovers(width, height)) {
-            return false;
-        }
-        // The clear covers the framebuffer's render area, the smallest bound target.
-        for (u32 index = 0; index < regs.rt_control.count && index < NUM_RT; ++index) {
-            const auto& rt = regs.rt[index];
-            if (rt.Address() != 0 && rt.format != Tegra::RenderTargetFormat::NONE &&
-                (rt.width < width || rt.height < height)) {
-                return false;
-            }
-        }
-        if (regs.zeta_enable && regs.zeta.Address() != 0 &&
-            (regs.zeta_size.width < width || regs.zeta_size.height < height)) {
-            return false;
-        }
-        const bool is_depth_target = regs.zeta_enable && regs.zeta.Address() == gpu_addr;
-        const bool full_stencil = surface.S && regs.stencil_front_mask == 0xFF;
-        switch (VideoCore::Surface::GetFormatType(new_info.format)) {
-        case VideoCore::Surface::SurfaceType::ColorTexture: {
-            // OpenGL clears draw buffer RT, which writes target rt_control.Map(RT).
-            const u32 index = surface.RT;
-            return surface.R && surface.G && surface.B && surface.A && index < NUM_RT &&
-                   index < regs.rt_control.count && regs.rt_control.Map(index) == index &&
-                   regs.rt[index].Address() == gpu_addr;
-        }
-        case VideoCore::Surface::SurfaceType::Depth:
-            return is_depth_target && surface.Z;
-        case VideoCore::Surface::SurfaceType::Stencil:
-            return is_depth_target && full_stencil;
-        case VideoCore::Surface::SurfaceType::DepthStencil:
-            return is_depth_target && surface.Z && full_stencil;
-        default:
-            return false;
-        }
-    };
     static const char* const baseline_file = std::getenv("EDEN_NX2_JOIN_UPLOAD_BASELINE_FILE");
     if (baseline_file && (join_baseline_checks++ % 64) == 0) {
         std::error_code error;
@@ -3014,7 +2977,7 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
     // every texel. Decide immediately before that copy so it cannot be invalidated in between.
     bool upload_pending = !join_upload_baseline && Tegra::g_nx2_ampere.load(std::memory_order_relaxed) &&
                           !can_rescale && new_info.type == ImageType::e2D && !join_copies_to_do.empty();
-    if (overwritten_by_clear()) {
+    if (full_clear) {
         // Stays CpuModified: UpdateRenderTargets' PrepareImage drops the upload only when
         // IsFullClear agrees the clear covers the whole image, and uploads it otherwise.
         runtime.TransitionImageLayout(new_image);
@@ -4213,13 +4176,47 @@ bool TextureCache<P>::IsFullClear(ImageViewId id) {
     }
     const ImageViewBase& image_view = slot_image_views[id];
     const ImageBase& image = slot_images[image_view.image_id];
-    const Extent3D size = image_view.size;
-    if (image.info.resources.levels > 1 || image.info.resources.layers > 1) {
-        // Images with multiple resources can't be cleared in a single call
+    if (image_view.range.base.level != 0 || image_view.range.base.layer != 0 ||
+        image_view.format != image.info.format || image_view.size.width != image.info.size.width ||
+        image_view.size.height != image.info.size.height) {
         return false;
     }
-    // Make sure the clear covers all texels in the subresource
-    return ClearCovers(size.width, size.height);
+    return CanDiscardForClear(image.info, image.gpu_addr);
+}
+
+template <class P>
+bool TextureCache<P>::CanDiscardForClear(const ImageInfo& info, GPUVAddr address) const {
+    const auto& regs = maxwell3d->regs;
+    if (info.type != ImageType::e2D || info.resources.levels != 1 || info.resources.layers != 1 ||
+        info.num_samples != 1 || Settings::values.resolution_info.active ||
+        !ClearCovers(info.size.width, info.size.height)) {
+        return false;
+    }
+    if constexpr (requires { runtime.device.GetMaxFramebufferWidth(); }) {
+        if (info.size.width > runtime.device.GetMaxFramebufferWidth() ||
+            info.size.height > runtime.device.GetMaxFramebufferHeight()) {
+            return false;
+        }
+    }
+    const auto kind = VideoCore::Surface::GetFormatType(info.format);
+    const bool depth = kind != SurfaceType::ColorTexture;
+    if (!SoleClearAttachment(regs, address, info.size.width, info.size.height, depth)) {
+        return false;
+    }
+    if (!depth) {
+        return info.format == VideoCore::Surface::PixelFormatFromRenderTargetFormat(
+                                  regs.rt[regs.clear_surface.RT].format);
+    }
+    if (info.format != VideoCore::Surface::PixelFormatFromDepthFormat(regs.zeta.format)) {
+        return false;
+    }
+    const bool stencil = regs.clear_surface.S && regs.stencil_front_mask == 0xff;
+    switch (kind) {
+    case SurfaceType::Depth: return regs.clear_surface.Z;
+    case SurfaceType::Stencil: return stencil;
+    case SurfaceType::DepthStencil: return regs.clear_surface.Z && stencil;
+    default: return false;
+    }
 }
 
 template <class P>

@@ -154,6 +154,9 @@ void RasterizerOpenGL::LoadDiskResources(u64 title_id, std::stop_token stop_load
 }
 
 void RasterizerOpenGL::Clear(u32 layer_count) {
+    if (!layer_count) {
+        return;
+    }
     gpu_memory->FlushCaching();
     const auto& regs = maxwell3d->regs;
     bool use_color{};
