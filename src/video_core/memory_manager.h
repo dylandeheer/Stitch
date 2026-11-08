@@ -220,6 +220,8 @@ private:
     };
 
     /// Rebuilds the runs through the big pages a page table operation touched.
+    void BeginMappingUpdate();
+    void FinishMappingUpdate(GPUVAddr address, size_t size);
     void UpdateContinuousRuns(GPUVAddr gpu_addr, size_t size);
     const MappingSnapshot& CurrentSnapshot() const;
 
@@ -287,6 +289,7 @@ private:
     boost::container::small_vector<std::pair<DAddr, std::size_t>, 32> page_stash2{};
 
     bool native_tiling{};
+    u32 mapping_writers{}; ///< Protected by runs_guard; includes callbacks before run publication.
     mutable std::mutex guard;
     /// Bumped after each page table change; readers keep their MappingSnapshot until then.
     std::atomic<u64> map_serial{};

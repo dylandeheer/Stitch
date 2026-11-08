@@ -118,6 +118,18 @@ inline void MemoryManager::SetBigPageContinuous(size_t big_page_index, bool valu
         (~(1ULL << sub_index) & continuous_mask) | (value ? 1ULL << sub_index : 0);
 }
 
+void MemoryManager::BeginMappingUpdate() {
+    std::scoped_lock lock{runs_guard};
+    ++mapping_writers;
+}
+
+void MemoryManager::FinishMappingUpdate(GPUVAddr address, size_t size) {
+    UpdateContinuousRuns(address, size);
+    std::scoped_lock lock{runs_guard};
+    map_serial.fetch_add(1, std::memory_order_release);
+    --mapping_writers;
+}
+
 /// Maps, reserves, or frees small pages in [gpu_addr, +size). A range that does not lie
 /// entirely in the address space is left unchanged.
 GPUVAddr MemoryManager::PageTableOp(GPUVAddr gpu_addr, [[maybe_unused]] DAddr dev_addr, size_t size, PTEKind kind, MemoryManager::EntryType entry_type) {
@@ -126,6 +138,7 @@ GPUVAddr MemoryManager::PageTableOp(GPUVAddr gpu_addr, [[maybe_unused]] DAddr de
                   gpu_addr, size, address_space_size);
         return gpu_addr;
     }
+    BeginMappingUpdate();
     [[maybe_unused]] u64 remaining_size{size};
     if (entry_type == EntryType::Mapped) {
         page_table.ReserveRange(gpu_addr, size);
@@ -165,8 +178,7 @@ GPUVAddr MemoryManager::PageTableOp(GPUVAddr gpu_addr, [[maybe_unused]] DAddr de
         std::unique_lock<std::mutex> lock(guard);
         kind_map.Map(gpu_addr, gpu_addr + size, kind);
     }
-    UpdateContinuousRuns(gpu_addr, size);
-    map_serial.fetch_add(1, std::memory_order_release);
+    FinishMappingUpdate(gpu_addr, size);
     return gpu_addr;
 }
 
@@ -178,6 +190,7 @@ GPUVAddr MemoryManager::BigPageTableOp(GPUVAddr gpu_addr, [[maybe_unused]] DAddr
                   gpu_addr, size, address_space_size);
         return gpu_addr;
     }
+    BeginMappingUpdate();
     [[maybe_unused]] u64 remaining_size{size};
     GPUVAddr modified_start{};
     u64 modified_size{};
@@ -229,8 +242,7 @@ GPUVAddr MemoryManager::BigPageTableOp(GPUVAddr gpu_addr, [[maybe_unused]] DAddr
         std::unique_lock<std::mutex> lock(guard);
         kind_map.Map(gpu_addr, gpu_addr + size, kind);
     }
-    UpdateContinuousRuns(gpu_addr, size);
-    map_serial.fetch_add(1, std::memory_order_release);
+    FinishMappingUpdate(gpu_addr, size);
     return gpu_addr;
 }
 
@@ -301,14 +313,17 @@ std::optional<DAddr> MemoryManager::GpuToCpuAddress(GPUVAddr addr, std::size_t s
 }
 
 bool MemoryManager::TrySnapshotTextureRun(GPUVAddr address, std::span<u8> output) const {
-    // MapInOrder drains the GPU split at changes. Hold the published GPU range and the actual
-    // device-to-physical mappings only for this foreground copy, never for the decoder or driver.
+    // MapBufferEx/Remap can change live PTEs before notifying the renderer and publishing runs.
+    // A writer announces itself before its first mutation and releases this lock for callbacks.
     constexpr size_t max_copy = 4 * 1024 * 1024;
     if (output.empty() || output.size() > max_copy || address >= address_space_size ||
         output.size() > address_space_size - address) {
         return false;
     }
     std::scoped_lock lock{runs_guard};
+    if (mapping_writers != 0) {
+        return false;
+    }
     const auto next = continuous_runs.upper_bound(address);
     if (next == continuous_runs.begin()) {
         return false;

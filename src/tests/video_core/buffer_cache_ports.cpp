@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <barrier>
+#include <condition_variable>
 #include <cstring>
 #include <functional>
 #include <memory>
@@ -395,6 +396,67 @@ TEST_CASE("Bulk texture snapshots use current contiguous GPU and physical mappin
     REQUIRE_FALSE(f.memory->TrySnapshotTextureRun(va, std::span<u8>{}));
     std::vector<u8> over_limit(4 * 1024 * 1024 + 1);
     REQUIRE_FALSE(f.memory->TrySnapshotTextureRun(va, over_limit));
+}
+
+TEST_CASE("An atlas snapshot declines live GMMU PTE updates before run publication",
+          "[atlas_snapshot][atlas_mapping_writer]") {
+    Fixture f;
+    const bool big = GENERATE(false, true);
+    constexpr GPUVAddr va = 0x180000;
+    const size_t bytes = big ? 0x10000 : 0x1000;
+    f.memory->Map(va, 0x20000, bytes, Tegra::PTEKind::PITCH, big);
+    f.bytes[0x10000] = 0xa3;
+    f.bytes[0x20000] = 0x56;
+    std::array<u8, 16> dest{}, reference{};
+    REQUIRE(f.memory->TrySnapshotTextureRun(va, dest));
+    REQUIRE(dest.front() == 0xa3);
+
+    class PausedMapper : public Null::RasterizerNull {
+    public:
+        using Null::RasterizerNull::RasterizerNull;
+        void ModifyGPUMemory(size_t, GPUVAddr, u64) override {
+            std::unique_lock lock{mutex};
+            entered = true;
+            cv.notify_all();
+            timed_out = !cv.wait_for(lock, std::chrono::seconds{5}, [&] { return resume; });
+        }
+        std::mutex mutex;
+        std::condition_variable cv;
+        bool entered{}, resume{}, timed_out{};
+    } callback{f.gpu};
+
+    f.memory->BindRasterizer(&callback);
+    SCOPE_EXIT { f.memory->BindRasterizer(&f.rasterizer); };
+    std::thread mapper{[&] { f.memory->MapSparse(va, bytes, big); }};
+    bool entered;
+    {
+        std::unique_lock lock{callback.mutex};
+        entered = callback.cv.wait_for(lock, std::chrono::seconds{5}, [&] { return callback.entered; });
+    }
+    dest.fill(0xfe);
+    // Callback is after SetEntry(Reserved) and before UpdateContinuousRuns. The original
+    // walker must now see zeros; the optimization may not copy the old physical page.
+    bool copied = false;
+    if (entered) {
+        copied = f.memory->TrySnapshotTextureRun(va, dest);
+        f.memory->ReadBlockUnsafe(va, reference.data(), reference.size());
+    }
+    {
+        std::scoped_lock lock{callback.mutex};
+        callback.resume = true;
+        callback.cv.notify_all();
+    }
+    mapper.join();
+    REQUIRE(entered);
+    REQUIRE_FALSE(callback.timed_out); // Reader did not wait for the callback to return.
+    REQUIRE_FALSE(copied);
+    REQUIRE(std::ranges::all_of(dest, [](u8 x) { return x == 0xfe; }));
+    REQUIRE(std::ranges::all_of(reference, [](u8 x) { return x == 0; }));
+    REQUIRE_FALSE(f.memory->TrySnapshotTextureRun(va, dest));
+    f.memory->BindRasterizer(&f.rasterizer);
+    f.memory->Map(va, 0x30000, bytes, Tegra::PTEKind::PITCH, big);
+    REQUIRE(f.memory->TrySnapshotTextureRun(va, dest));
+    REQUIRE(dest.front() == 0x56);
 }
 
 TEST_CASE("Storage binding cache preserves native and table size policies", "[buffer_ports]") {
