@@ -45,11 +45,17 @@ public:
             return;
         }
         if (address < last && (address >= first || size > first - address)) {
+            waits.fetch_add(1, std::memory_order_relaxed);
             sequence.wait(active, std::memory_order_acquire);
         }
     }
 
+    [[nodiscard]] u64 WaitCount() const {
+        return waits.load(std::memory_order_relaxed);
+    }
+
 private:
+    mutable std::atomic<u64> waits{};
     std::atomic<u64> sequence{};
     std::atomic<DAddr> begin{};
     std::atomic<DAddr> end{};

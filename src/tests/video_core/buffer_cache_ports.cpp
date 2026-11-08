@@ -14,6 +14,7 @@
 #include "common/page_table.h"
 #include "core/core.h"
 #include "core/device_memory.h"
+#include "core/gpu_dirty_memory_manager.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/kernel.h"
 #include "core/memory.h"
@@ -658,4 +659,82 @@ TEST_CASE("A synchronous GPU download keeps CPU writes completed during its wait
     REQUIRE(f.bytes[0x100ff] == 0x71);
     REQUIRE(std::all_of(f.bytes + 0x10100, f.bytes + 0x10140, [](u8 b) { return b == 0xe3; }));
     REQUIRE(f.bytes[0x10140] == 0x71);
+}
+
+TEST_CASE("A reconstructed manager reads the new backing at a cached device address",
+          "[memory_manager][download_landing]") {
+    Fixture f;
+    std::optional<Tegra::MaxwellDeviceMemoryManager> slot;
+    constexpr DAddr address = 0x60000;
+    f.bytes[0x10000] = 0x51;
+    f.bytes[0x20000] = 0xa9;
+    const auto read = [&](VAddr backing) {
+        auto& manager = slot.emplace(f.physical);
+        manager.BindInterface(&f.rasterizer);
+        const auto asid = manager.RegisterProcess(&f.process->GetMemory());
+        manager.Map(address, backing, 0x1000, asid);
+        u8 result{};
+        manager.ReadBlockUnsafe(address, &result, sizeof(result));
+        manager.Unmap(address, 0x1000);
+        manager.UnregisterProcess(asid);
+        slot.reset();
+        return result;
+    };
+    REQUIRE(read(0x20000) == 0x51);
+    REQUIRE(read(0x30000) == 0xa9);
+}
+
+TEST_CASE("A CPU store published after the GPU landing snapshot keeps the newest bytes",
+          "[buffer_ports][download_landing]") {
+    Fixture f;
+    constexpr DAddr alias = 0x60000;
+    constexpr DAddr original = 0x20000;
+    const bool aliased = GENERATE(false, true);
+    const bool gate_enabled = GENERATE(false, true); // Negative control reproduces the lost store.
+    CAPTURE(aliased, gate_enabled);
+    const DAddr landing_address = aliased ? alias : original;
+    if (aliased) f.device.Map(alias, original, 0x1000, f.asid);
+    const auto id = Access::Add(*f.cache, landing_address, 0x1000);
+    std::ranges::fill(Access::Get(*f.cache, id).bytes, 0x56);
+    Access::Dirty(*f.cache, landing_address, 0x1000);
+    const auto before = f.device.download_landing.WaitCount();
+    Core::GPUDirtyMemoryManager collected;
+    std::atomic<bool> go{}, stored{};
+    bool writer_entered = false;
+    size_t aliases_seen{};
+    std::thread writer{[&] {
+        go.wait(false);
+        Common::ScratchBuffer<u32> aliases;
+        u8* dest = f.bytes + 0x10100;
+        f.device.ApplyOpOnPointer(dest, aliases, [&](DAddr address) {
+            ++aliases_seen;
+            collected.Collect(address, 16);
+            if (gate_enabled) f.device.download_landing.Await(address, 16);
+        });
+        std::fill_n(dest, 16, 0xe1);
+        stored.store(true);
+    }};
+    f.cache->SetPendingCpuWrites([&](const std::function<void(DAddr, size_t)>& visit) {
+        collected.ForEachPending(visit);
+        go.store(true);
+        go.notify_one();
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{5};
+        while (!stored.load() && f.device.download_landing.WaitCount() == before &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::yield();
+        }
+        writer_entered = stored.load() || f.device.download_landing.WaitCount() != before;
+    });
+    f.cache->DownloadMemory(landing_address, 0x1000);
+    writer.join();
+    f.cache->SetPendingCpuWrites({});
+    REQUIRE(writer_entered);
+    REQUIRE(aliases_seen == (aliased ? 2 : 1));
+    REQUIRE(f.device.download_landing.WaitCount() - before == (gate_enabled ? 1 : 0));
+    const u8 expected = gate_enabled ? 0xe1 : 0x56;
+    REQUIRE(std::all_of(f.bytes + 0x10100, f.bytes + 0x10110,
+                        [expected](u8 value) { return value == expected; }));
+    REQUIRE(f.bytes[0x100ff] == 0x56);
+    REQUIRE(f.bytes[0x10110] == 0x56);
+    if (aliased) f.device.Unmap(alias, 0x1000);
 }
