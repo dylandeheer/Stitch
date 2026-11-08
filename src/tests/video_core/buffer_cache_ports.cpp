@@ -205,6 +205,9 @@ struct BufferCacheTestAccess {
         cache.committed_gpu_modified_ranges.emplace_back().Add(address, size);
         cache.pending_download_ranges.emplace_back().Add(address, size);
     }
+    static bool CoarseGpuDirty(Cache& cache, DAddr address) {
+        return cache.memory_tracker.IsRegionGpuModified(address, 1);
+    }
     static bool Pending(Cache& cache, DAddr address, u64 size) {
         if (cache.gpu_modified_ranges.Intersects(address, size) ||
             cache.uncommitted_gpu_modified_ranges.Intersects(address, size)) {
@@ -897,11 +900,11 @@ TEST_CASE("Clean optional read hints preserve page-level GPU ownership",
     const std::array<std::pair<DAddr, u64>, 1> claimed{{{hint, 0x1000}}};
     f.cache->ClaimCpuWrites(claimed);
     REQUIRE_FALSE(Access::Pending(*f.cache, hint, 0x1000));
-    REQUIRE(f.cache->OnCPUWrite(hint, 1));
+    REQUIRE(Access::CoarseGpuDirty(*f.cache, hint));
     f.cache->DownloadMemory(demand, 0x1000);
     REQUIRE(f.bytes[0x10000] == 0xa5);
     REQUIRE(f.bytes[0x11000] == 0);
-    REQUIRE(f.cache->OnCPUWrite(hint, 1));
+    REQUIRE(Access::CoarseGpuDirty(*f.cache, hint));
 }
 
 TEST_CASE("Bounded buffer readback lands full demand and leaves cold GPU data pending",
