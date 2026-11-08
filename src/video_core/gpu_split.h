@@ -8,6 +8,7 @@
 #include <cstring>
 #include <functional>
 #include <memory>
+#include <span>
 #include <thread>
 #include <type_traits>
 
@@ -184,6 +185,12 @@ public:
     void Publish();
     /// Waits until the back executed everything sent so far.
     void Drain(DrainSite site = DrainSite::Other);
+    [[nodiscard]] bool MacroDmaTraceActive() const;
+    void BeginMacroDmaTrace(s32 channel, u64 as_id, u32 method, u32 start, const void* owner,
+                            u64 generation, std::span<const u32> code, bool fifo, u32 words,
+                            size_t parameters, bool pending, bool instance, bool sink, u32 shadow,
+                            u32 render_mode, u64& seen);
+    void EndMacroDmaTrace();
 
     /// Compute or copy work was just sent: what can write GPU-written command lists.
     void NoteWriter() {
@@ -191,7 +198,15 @@ public:
     }
     /// Waits until the back executed the compute and copy work sent so far (not what came after).
     /// Returns whether any of it was still queued.
-    bool WaitForWriters();
+    enum class ListWriterSite : u32 {
+        FreshHeader,
+        ContinuedData,
+        ResumedEntry,
+        KnownGpuPage,
+        Count
+    };
+    bool WaitForWriters(ListWriterSite site = ListWriterSite::FreshHeader);
+    void NoteListRecheck(ListWriterSite site, bool became_gpu_written);
     /// A host-level wait was just sent (a syncpoint acquire, a host WFI, a GP entry with its sync
     /// bit; semaphore acquires drain): the guest's GPU work before it is complete before the
     /// commands after it are fetched.
