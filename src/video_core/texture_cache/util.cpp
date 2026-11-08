@@ -9,6 +9,9 @@
 // A copy of the code can be obtained from https://github.com/Ryujinx/Ryujinx
 // The sections using code from Ryujinx are marked with a link to the original version
 
+#ifdef __linux__
+#include <sys/resource.h>
+#endif
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -1266,7 +1269,7 @@ UnswizzlePlan PlanUnswizzleImageRows(
 }
 
 void ExecuteUnswizzlePlan(Tegra::MemoryManager& gpu_memory, const UnswizzlePlan& plan,
-                         std::span<u8> output, UnswizzleTimings* timings) {
+                         std::span<u8> output, UnswizzleTimings* timings, bool bulk_snapshot) {
     using Clock = std::chrono::steady_clock;
     const auto now = [&] { return timings ? Clock::now() : Clock::time_point{}; };
     const auto elapsed = [](auto start, auto end) {
@@ -1277,13 +1280,30 @@ void ExecuteUnswizzlePlan(Tegra::MemoryManager& gpu_memory, const UnswizzlePlan&
         const auto began = now();
         run.resize(r.guest_bytes);
         const auto allocated = now();
-        gpu_memory.ReadBlockUnsafe(r.src_addr, run.data(), r.guest_bytes);
+#ifdef __linux__
+        rusage before{}, after{};
+        const bool sampled = timings && getrusage(RUSAGE_THREAD, &before) == 0;
+#endif
+        const bool bulk = bulk_snapshot && gpu_memory.TrySnapshotTextureRun(r.src_addr, run);
+        if (!bulk) {
+            gpu_memory.ReadBlockUnsafe(r.src_addr, run.data(), r.guest_bytes);
+        }
+#ifdef __linux__
+        if (sampled && getrusage(RUSAGE_THREAD, &after) == 0) {
+            ++timings->sampled_reads;
+            timings->read_minor_faults += after.ru_minflt - before.ru_minflt;
+            timings->read_major_faults += after.ru_majflt - before.ru_majflt;
+        }
+#endif
         const auto read = now();
         Tegra::Texture::UnswizzleTexture(output.subspan(r.host_offset, r.host_bytes),
                                          run, 1U << plan.bpp_log2, r.run_tiles, r.tile_rows, 1,
                                          r.block.height, r.block.depth, r.run_alignment,
                                          gpu_memory.UsesNativeTiling());
         if (timings) {
+            if (bulk) {
+                timings->bulk_bytes += r.guest_bytes;
+            }
             timings->allocation_ns += elapsed(began, allocated);
             timings->read_ns += elapsed(allocated, read);
             timings->detile_ns += elapsed(read, Clock::now());

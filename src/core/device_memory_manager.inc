@@ -388,6 +388,31 @@ void DeviceMemoryManager<Traits>::TrackContinuityImpl(DAddr address, VAddr virtu
     }
 }
 template <typename Traits>
+bool DeviceMemoryManager<Traits>::TrySnapshotContiguous(DAddr address, std::span<u8> output) {
+    if (output.empty() || address >= device_as_size || output.size() > device_as_size - address) {
+        return false;
+    }
+    std::scoped_lock lock{mapping_guard};
+    const size_t page = address >> page_bits;
+    const u32 first = tracked_entries[page].compressed_physical_ptr;
+    if (!first) {
+        return false;
+    }
+    const size_t last = (address + output.size() - 1) >> page_bits;
+    if (last - page > tracked_entries[page].continuity_tracker) {
+        // A valid mapping may have been created with track=false. Verify every physical page,
+        // including the middle, before copying any bytes.
+        for (size_t i = page + 1; i <= last; ++i) {
+            if (tracked_entries[i].compressed_physical_ptr != u64{first} + (i - page)) {
+                return false;
+            }
+        }
+    }
+    std::memcpy(output.data(), GetPointer<u8>(address), output.size());
+    return true;
+}
+
+template <typename Traits>
 u8* DeviceMemoryManager<Traits>::GetSpan(const DAddr src_addr, const std::size_t size) {
     size_t page_index = src_addr >> page_bits;
     size_t subbits = src_addr & page_mask;

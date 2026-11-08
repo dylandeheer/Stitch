@@ -72,6 +72,8 @@ public:
 
     [[nodiscard]] std::optional<DAddr> GpuToCpuAddress(GPUVAddr addr, std::size_t size) const;
 
+    bool TrySnapshotTextureRun(GPUVAddr address, std::span<u8> output) const;
+
     [[nodiscard]] u64 DeviceMappingGeneration() const { return memory.MappingGeneration(); }
 
     /// Copies the same words as Read<u32> only if their physical pages have unique device

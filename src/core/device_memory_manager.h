@@ -162,6 +162,8 @@ public:
     template <typename T>
     T Read(DAddr address) const;
 
+    // Completes the memcpy while Map/Unmap cannot replace the host pages. No pointer escapes.
+    bool TrySnapshotContiguous(DAddr address, std::span<u8> output);
     u8* GetSpan(const DAddr src_addr, const std::size_t size);
     const u8* GetSpan(const DAddr src_addr, const std::size_t size) const;
 

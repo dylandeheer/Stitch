@@ -2014,6 +2014,11 @@ bool TextureCache<P>::UploadInChunks(Image& image) {
         return std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
     };
     const auto timing_begin = now();
+    static const char* const snapshot_marker = std::getenv("STITCH_ATLAS_SNAPSHOT_BASELINE_FILE");
+    std::error_code ec;
+    const bool bulk = snapshot_marker && *snapshot_marker && image.info.native_tiling &&
+                      image.info.format == PixelFormat::D16_UNORM &&
+                      !std::filesystem::exists(snapshot_marker, ec) && !ec;
     u64 plan_ns{}, staging_ns{}, record_ns{}, chunks{};
     UnswizzleTimings unswizzle;
     for (u64 offset = 0; offset < image.guest_size_bytes; offset += chunk_size) {
@@ -2034,7 +2039,7 @@ bool TextureCache<P>::UploadInChunks(Image& image) {
         }
         auto staging = runtime.UploadStagingBuffer(plan.total_host_bytes);
         const auto staged = now();
-        ExecuteUnswizzlePlan(*gpu_memory, plan, staging.mapped_span, timed ? &unswizzle : nullptr);
+        ExecuteUnswizzlePlan(*gpu_memory, plan, staging.mapped_span, timed ? &unswizzle : nullptr, bulk);
         const auto decoded = now();
         image.UploadMemory(staging, plan.copies);
         staging_ns += elapsed(planned, staged);
@@ -2053,11 +2058,14 @@ bool TextureCache<P>::UploadInChunks(Image& image) {
                  "Chunk upload phases: frame={} device_address={:#x} footprint_bytes={} "
                  "chunks={} runs={} guest_read_bytes={} block_height={} plan_ms={:.3f} "
                  "staging_ms={:.3f} scratch_ms={:.3f} read_ms={:.3f} detile_ms={:.3f} "
-                 "record_cpu_ms={:.3f} total_ms={:.3f} residual_ms={:.3f}",
+                 "record_cpu_ms={:.3f} total_ms={:.3f} residual_ms={:.3f} bulk={} bulk_bytes={} "
+                 "read_samples={} read_minor={} read_major={}",
                  frame_tick, image.cpu_addr, image.guest_size_bytes, chunks, unswizzle.runs,
                  unswizzle.guest_bytes, image.info.block.height, plan_ns / 1.e6, staging_ns / 1.e6,
                  unswizzle.allocation_ns / 1.e6, unswizzle.read_ns / 1.e6,
-                 unswizzle.detile_ns / 1.e6, record_ns / 1.e6, total_ns / 1.e6, residual_ns / 1.e6);
+                 unswizzle.detile_ns / 1.e6, record_ns / 1.e6, total_ns / 1.e6, residual_ns / 1.e6,
+                 bulk, unswizzle.bulk_bytes, unswizzle.sampled_reads, unswizzle.read_minor_faults,
+                 unswizzle.read_major_faults);
     }
     return true;
 }

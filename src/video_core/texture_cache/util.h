@@ -101,11 +101,13 @@ struct UnswizzlePlan {
 
 struct UnswizzleTimings {
     u64 allocation_ns{}, read_ns{}, detile_ns{}, runs{}, guest_bytes{};
+    u64 bulk_bytes{}, read_minor_faults{}, read_major_faults{}, sampled_reads{};
 };
 
 /// Executes a precalculated unswizzle plan directly into destination memory (e.g. mapped staging span).
 void ExecuteUnswizzlePlan(Tegra::MemoryManager& gpu_memory, const UnswizzlePlan& plan,
-                         std::span<u8> output, UnswizzleTimings* timings = nullptr);
+                         std::span<u8> output, UnswizzleTimings* timings = nullptr,
+                         bool bulk_snapshot = false);
 
 [[nodiscard]] boost::container::small_vector<BufferImageCopy, 16> UnswizzleImage(
     Tegra::MemoryManager& gpu_memory, GPUVAddr gpu_addr, const ImageInfo& info,

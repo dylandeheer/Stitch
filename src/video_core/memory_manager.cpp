@@ -300,6 +300,26 @@ std::optional<DAddr> MemoryManager::GpuToCpuAddress(GPUVAddr addr, std::size_t s
     return std::nullopt;
 }
 
+bool MemoryManager::TrySnapshotTextureRun(GPUVAddr address, std::span<u8> output) const {
+    // MapInOrder drains the GPU split at changes. Hold the published GPU range and the actual
+    // device-to-physical mappings only for this foreground copy, never for the decoder or driver.
+    constexpr size_t max_copy = 4 * 1024 * 1024;
+    if (output.empty() || output.size() > max_copy || address >= address_space_size ||
+        output.size() > address_space_size - address) {
+        return false;
+    }
+    std::scoped_lock lock{runs_guard};
+    const auto next = continuous_runs.upper_bound(address);
+    if (next == continuous_runs.begin()) {
+        return false;
+    }
+    const auto& [begin, run] = *std::prev(next);
+    if (address >= run.end || output.size() > run.end - address) {
+        return false;
+    }
+    return memory.TrySnapshotContiguous(run.device_addr + (address - begin), output);
+}
+
 bool MemoryManager::TryReadUniqueWords(GPUVAddr address, std::span<u32> dest, u64 generation) const {
     constexpr size_t max_words = 0x1000; // MME DMA limit
     constexpr u64 mask = Core::DEVICE_PAGEMASK;

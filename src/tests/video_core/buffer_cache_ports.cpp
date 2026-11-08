@@ -347,6 +347,50 @@ TEST_CASE("Storage binding cache tracks map changes and descriptor dependencies"
     REQUIRE(f.Bind().size == 0);
 }
 
+TEST_CASE("Bulk texture snapshots use current contiguous GPU and physical mappings",
+          "[atlas_snapshot]") {
+    Fixture f;
+    constexpr GPUVAddr va = 0x180000;
+    f.memory->Map(va, 0x20000, 0x3000, Tegra::PTEKind::PITCH, false);
+    for (size_t i = 0; i < 0x40000; ++i) {
+        f.bytes[i] = static_cast<u8>((i * 37) ^ (i >> 12));
+    }
+    std::array<u8, 0x2200> dest{}, expected{};
+    const auto compare = [&](bool should_copy) {
+        dest.fill(0xde);
+        const auto previous = dest;
+        const bool copied = f.memory->TrySnapshotTextureRun(va + 0x100, dest);
+        REQUIRE(copied == should_copy);
+        f.memory->ReadBlockUnsafe(va + 0x100, expected.data(), expected.size());
+        if (copied) {
+            REQUIRE(dest == expected);
+        } else {
+            REQUIRE(dest == previous);
+        }
+    };
+    compare(true); // fixture's device mapping defaults to track=false
+    f.device.Unmap(0x21000, 0x1000);
+    compare(false); // reject interior physical hole; scalar reference supplies zero
+    REQUIRE(expected[0xf00] == 0);
+    f.device.Map(0x21000, 0x20000, 0x1000, f.asid);
+    compare(false); // middle page aliases the first physical page
+    f.device.Unmap(0x21000, 0x1000);
+    f.device.Map(0x21000, 0x21000, 0x1000, f.asid);
+    compare(true);
+    f.memory->Map(va + 0x1000, 0x30000, 0x1000, Tegra::PTEKind::PITCH, false);
+    compare(false); // GPU virtual pages no longer consecutive in device space
+    f.memory->MapSparse(va + 0x1000, 0x1000, false);
+    compare(false);
+    f.memory->Map(va, 0x30000, 0x3000, Tegra::PTEKind::PITCH, false);
+    compare(true); // address reused, new backing
+    REQUIRE(dest[0] == f.bytes[0x20100]);
+    std::array<u8, 2> small{};
+    REQUIRE_FALSE(f.memory->TrySnapshotTextureRun(~GPUVAddr{0}, small));
+    REQUIRE_FALSE(f.memory->TrySnapshotTextureRun(va, std::span<u8>{}));
+    std::vector<u8> over_limit(4 * 1024 * 1024 + 1);
+    REQUIRE_FALSE(f.memory->TrySnapshotTextureRun(va, over_limit));
+}
+
 TEST_CASE("Storage binding cache preserves native and table size policies", "[buffer_ports]") {
     Fixture f;
     constexpr GPUVAddr base = 0x4000000;
