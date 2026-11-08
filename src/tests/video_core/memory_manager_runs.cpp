@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <exception>
 #include <limits>
+#include <optional>
 #include <random>
 #include <vector>
 #include <catch2/catch_test_macros.hpp>
@@ -256,4 +257,15 @@ TEST_CASE("Reads of GPU pages over unmapped device memory return zeros", "[memor
     std::ranges::fill(bytes, u8{0xcd});
     memory.ReadBlock(window, bytes.data(), size);
     REQUIRE(std::ranges::all_of(bytes, [](u8 value) { return value == 0; }));
+}
+
+
+TEST_CASE("Recreated device managers invalidate the thread's cached translations",
+          "[memory_manager][download_landing]") {
+    ScopedSystemTestContext context;
+    Core::DeviceMemory physical;
+    std::optional<Tegra::MaxwellDeviceMemoryManager> slot;
+    const auto generation = slot.emplace(physical).MappingGeneration();
+    slot.reset();
+    REQUIRE(slot.emplace(physical).MappingGeneration() != generation);
 }
