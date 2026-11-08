@@ -769,6 +769,9 @@ std::vector<u32> EmitSPIRV(const Profile& profile, const RuntimeInfo& runtime_in
     EmitContext ctx{profile, runtime_info, program, bindings};
     ctx.tensor_scratch_word = tensor_scratch_word;
     DefineSoftwareMatrixFunctions(ctx, program);
+    if (profile.bounded_mesh_task_lookup && Sirit::ValidId(ctx.mesh_group_index)) {
+        DefineMeshTaskLookup(ctx);
+    }
     const Id main{DefineMain(ctx, program)};
     DefineEntryPoint(program, ctx, main);
     if (profile.support_float_controls) {

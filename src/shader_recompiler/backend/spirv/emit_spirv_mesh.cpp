@@ -354,6 +354,58 @@ void EmitIsbeWriteMapU32(EmitContext& ctx, const IR::Value& address, Id value) {
     ctx.OpStore(ctx.mesh_primitive_count, value);
 }
 
+// Return (owning task, first group of that task) for one dispatched mesh workgroup.
+// Keeping the uniform loop in a helper preserves the guest entry block's phi predecessor.
+void DefineMeshTaskLookup(EmitContext& ctx) {
+    const Id u32_type = ctx.U32[1];
+    const Id pair_type = ctx.TypeVector(u32_type, 2);
+    ctx.mesh_task_lookup = ctx.OpFunction(pair_type, spv::FunctionControlMask::Pure,
+                                          ctx.TypeFunction(pair_type, u32_type, u32_type));
+    const Id group = ctx.OpFunctionParameter(u32_type);
+    const Id tasks = ctx.OpFunctionParameter(u32_type);
+    ctx.AddLabel();
+    const Id pointer = ctx.TypePointer(spv::StorageClass::Function, u32_type);
+    const auto local = [&] { return ctx.AddLocalVariable(pointer, spv::StorageClass::Function); };
+    const Id task_var = local();
+    const Id first_var = local();
+    const Id remaining_var = local();
+    const Id zero = ctx.u32_zero_value;
+    const Id one = ctx.Const(1U);
+    // The prefix producer writes offsets[0] = 0 before adding the first count.
+    ctx.OpStore(task_var, zero);
+    ctx.OpStore(first_var, zero);
+    ctx.OpStore(remaining_var, tasks);
+    const Id header = ctx.OpLabel();
+    const Id body = ctx.OpLabel();
+    const Id next = ctx.OpLabel();
+    const Id done = ctx.OpLabel();
+    ctx.OpBranch(header);
+    ctx.AddLabel(header);
+    const Id remaining = ctx.OpLoad(u32_type, remaining_var);
+    const Id more = ctx.OpUGreaterThan(ctx.U1, remaining, one);
+    ctx.OpLoopMerge(done, next, spv::LoopControlMask::DontUnroll);
+    ctx.OpBranchConditional(more, body, done);
+    ctx.AddLabel(body);
+    const Id task = ctx.OpLoad(u32_type, task_var);
+    const Id half = ctx.OpShiftRightLogical(u32_type, remaining, one);
+    const Id middle =
+        ctx.OpUMin(u32_type, ctx.OpIAdd(u32_type, task, half), ctx.OpISub(u32_type, tasks, one));
+    const Id offset = ctx.OpLoad(u32_type, BufferWord(ctx, ctx.mesh_task_offsets_buffer, middle));
+    // Equal offsets are zero-fanout tasks: keep the rightmost accepted prefix.
+    const Id accepted = ctx.OpULessThanEqual(ctx.U1, offset, group);
+    ctx.OpStore(task_var, ctx.OpSelect(u32_type, accepted, middle, task));
+    ctx.OpStore(first_var,
+                ctx.OpSelect(u32_type, accepted, offset, ctx.OpLoad(u32_type, first_var)));
+    ctx.OpStore(remaining_var, ctx.OpISub(u32_type, remaining, half));
+    ctx.OpBranch(next);
+    ctx.AddLabel(next);
+    ctx.OpBranch(header);
+    ctx.AddLabel(done);
+    ctx.OpReturnValue(ctx.OpCompositeConstruct(pair_type, ctx.OpLoad(u32_type, task_var),
+                                               ctx.OpLoad(u32_type, first_var)));
+    ctx.OpFunctionEnd();
+}
+
 void EmitMeshPrologue(EmitContext& ctx) {
     // No branches here: the entry block's label is a phi predecessor for later blocks.
     const bool as_compute{ctx.runtime_info.mesh_as_compute};
@@ -381,21 +433,31 @@ void EmitMeshPrologue(EmitContext& ctx) {
             const Id global{WorkgroupX(ctx)};
             const Id tasks{ctx.OpLoad(ctx.U32[1], BufferWord(ctx, ctx.mesh_task_args_buffer,
                                                              ctx.Const(MESH_EMULATION_ARGS_TASKS)))};
-            const Id last_task{ctx.OpISub(ctx.U32[1], ctx.OpUMax(ctx.U32[1], tasks, ctx.Const(1U)),
-                                          ctx.Const(1U))};
-            Id task{ctx.u32_zero_value};
-            Id remaining{tasks};
-            for (u32 step_index = 0; step_index < MESH_EMULATION_TASK_SEARCH_STEPS; ++step_index) {
-                const Id half{ctx.OpShiftRightLogical(ctx.U32[1], remaining, ctx.Const(1U))};
-                const Id middle{ctx.OpUMin(ctx.U32[1], ctx.OpIAdd(ctx.U32[1], task, half), last_task)};
-                const Id first{ctx.OpLoad(ctx.U32[1],
-                                          BufferWord(ctx, ctx.mesh_task_offsets_buffer, middle))};
-                task = ctx.OpSelect(ctx.U32[1], ctx.OpULessThanEqual(ctx.U1, first, global), middle,
-                                    task);
-                remaining = ctx.OpISub(ctx.U32[1], remaining, half);
+            Id task, first_group;
+            if (Sirit::ValidId(ctx.mesh_task_lookup)) {
+                const Id owner = ctx.OpFunctionCall(ctx.TypeVector(ctx.U32[1], 2),
+                                                    ctx.mesh_task_lookup, global, tasks);
+                task = ctx.OpCompositeExtract(ctx.U32[1], owner, 0U);
+                first_group = ctx.OpCompositeExtract(ctx.U32[1], owner, 1U);
+            } else {
+                const Id last_task{ctx.OpISub(
+                    ctx.U32[1], ctx.OpUMax(ctx.U32[1], tasks, ctx.Const(1U)), ctx.Const(1U))};
+                task = ctx.u32_zero_value;
+                Id remaining{tasks};
+                for (u32 step_index = 0; step_index < MESH_EMULATION_TASK_SEARCH_STEPS;
+                     ++step_index) {
+                    const Id half{ctx.OpShiftRightLogical(ctx.U32[1], remaining, ctx.Const(1U))};
+                    const Id middle{
+                        ctx.OpUMin(ctx.U32[1], ctx.OpIAdd(ctx.U32[1], task, half), last_task)};
+                    const Id first{ctx.OpLoad(
+                        ctx.U32[1], BufferWord(ctx, ctx.mesh_task_offsets_buffer, middle))};
+                    task = ctx.OpSelect(ctx.U32[1], ctx.OpULessThanEqual(ctx.U1, first, global),
+                                        middle, task);
+                    remaining = ctx.OpISub(ctx.U32[1], remaining, half);
+                }
+                first_group =
+                    ctx.OpLoad(ctx.U32[1], BufferWord(ctx, ctx.mesh_task_offsets_buffer, task));
             }
-            const Id first_group{
-                ctx.OpLoad(ctx.U32[1], BufferWord(ctx, ctx.mesh_task_offsets_buffer, task))};
             ctx.OpStore(ctx.mesh_group_index, ctx.OpISub(ctx.U32[1], global, first_group));
             // The task wrote stride words; words past them (a larger mesh region) read zero.
             const u32 stride{(std::max)(ctx.runtime_info.mesh_task_payload_stride, 1U)};

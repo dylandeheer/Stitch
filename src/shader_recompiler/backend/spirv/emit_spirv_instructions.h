@@ -74,6 +74,7 @@ Id EmitIsbeRead(EmitContext& ctx, Id address);
 void EmitIsbeWriteAttribute(EmitContext& ctx, Id address, Id value);
 void EmitIsbeWriteMapU8(EmitContext& ctx, Id address, Id value);
 void EmitIsbeWriteMapU32(EmitContext& ctx, const IR::Value& address, Id value);
+void DefineMeshTaskLookup(EmitContext& ctx);
 void EmitMeshPrologue(EmitContext& ctx);
 void EmitMeshEpilogue(EmitContext& ctx);
 void EmitSetFragColor(EmitContext& ctx, u32 index, u32 component, Id value);

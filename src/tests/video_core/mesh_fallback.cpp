@@ -175,9 +175,10 @@ Profile MakeProfile() {
 
 // A one-triangle mesh program (or the task program launching it), as the frontend lowers them.
 std::vector<u32> EmitProgram(Stage stage, bool fallback, bool with_task,
-                             const MeshInfo& mesh = TriangleMesh()) {
+                             const MeshInfo& mesh = TriangleMesh(), bool bounded = false,
+                             bool lookup_fixture = false) {
     ObjectPool<IR::Inst> pool;
-    IR::Block block{pool};
+    IR::Block block{pool}, branch{pool}, merge{pool}, writer{pool}, exit{pool};
     IR::Program program;
     program.stage = stage;
     program.workgroup_size = {mesh.primitive_lines.empty() ? 32U : 1U, 1, 1};
@@ -201,6 +202,47 @@ std::vector<u32> EmitProgram(Stage stage, bool fallback, bool with_task,
         ir.SetFragColor(0, 1, ir.GetAttribute(IR::Attribute::Generic2Y));
         ir.SetFragColor(0, 2, ir.Imm32(0.0f));
         ir.SetFragColor(0, 3, ir.Imm32(1.0f));
+    } else if (lookup_fixture && stage == Stage::Mesh) {
+        // A single lane owns every output word. Give each task a distinguishable payload and
+        // expose both guest ways of reading its local mesh workgroup index.
+        block.AppendNewInst(IR::Opcode::WorkgroupId, {});
+        const auto group_id = ir.CompositeExtract(IR::Value{&block.back()}, 0);
+        const auto local = ir.IsbeRead(ir.Imm32(0));
+        const auto tag = ir.IsbeRead(ir.Imm32(8));
+        const auto condition = ir.IEqual(local, ir.Imm32(0));
+        IR::IREmitter extra{branch};
+        const auto bumped = extra.IAdd(tag, ir.Imm32(1));
+        using Node = IR::AbstractSyntaxNode;
+        merge.AppendNewInst(IR::Opcode::Phi, {});
+        auto& phi = merge.back();
+        phi.SetFlags(IR::Type::U32);
+        phi.AddPhiOperand(&block, tag);
+        phi.AddPhiOperand(&branch, bumped);
+        IR::IREmitter merged{merge}, out{writer}, end{exit};
+        const auto leader = merged.IEqual(merged.LocalInvocationIdX(), merged.Imm32(0));
+        program.blocks = {&block, &branch, &merge, &writer, &exit};
+        program.post_order_blocks = {&exit, &writer, &merge, &branch, &block};
+        program.syntax_list = {{{.block = &block}, Node::Type::Block},
+                               {{.if_node = {condition, &branch, &merge}}, Node::Type::If},
+                               {{.block = &branch}, Node::Type::Block},
+                               {{.end_if = {&merge}}, Node::Type::EndIf},
+                               {{.block = &merge}, Node::Type::Block},
+                               {{.if_node = {leader, &writer, &exit}}, Node::Type::If},
+                               {{.block = &writer}, Node::Type::Block},
+                               {{.end_if = {&exit}}, Node::Type::EndIf},
+                               {{.block = &exit}, Node::Type::Block},
+                               {{}, Node::Type::Return}};
+        const std::array<IR::Value, 4> columns{IR::Value{&phi}, local, group_id,
+                                               out.IsbeRead(ir.Imm32(4))};
+        for (u32 vertex = 0; vertex < 3; ++vertex) {
+            for (u32 line = 0; line < columns.size(); ++line) {
+                out.IsbeWriteAttribute(ir.Imm32(4U * (vertex + 32U * line)),
+                                       IR::U32{columns[line]});
+            }
+            out.IsbeWriteMapU8(ir.Imm32(4U + vertex), ir.Imm32(vertex));
+        }
+        out.IsbeWriteMapU32(ir.Imm32(3), ir.Imm32(1));
+        end.Epilogue();
     } else if (stage == Stage::Mesh && !mesh.primitive_lines.empty()) {
         WritePrimitiveColors(ir);
     } else if (stage == Stage::Mesh) {
@@ -211,7 +253,8 @@ std::vector<u32> EmitProgram(Stage stage, bool fallback, bool with_task,
     } else {
         ir.IsbeWriteAttribute(ir.Imm32(4), ir.Imm32(1)); // one mesh workgroup
     }
-    ir.Epilogue();
+    if (!lookup_fixture)
+        ir.Epilogue();
 
     RuntimeInfo runtime_info;
     if (stage == Stage::Fragment) {
@@ -229,7 +272,9 @@ std::vector<u32> EmitProgram(Stage stage, bool fallback, bool with_task,
         runtime_info.mesh_task_payload_stride = program.mesh.payload_words;
     }
     Backend::Bindings bindings;
-    return SPIRV::EmitSPIRV(MakeProfile(), runtime_info, program, bindings);
+    auto profile = MakeProfile();
+    profile.bounded_mesh_task_lookup = bounded;
+    return SPIRV::EmitSPIRV(profile, runtime_info, program, bindings);
 }
 
 bool LocationHasDecoration(const std::vector<u32>& code, u32 location, spv::Decoration decoration) {
@@ -383,4 +428,28 @@ TEST_CASE("Mesh fallback checks implicit shared arrays for each compute pass",
     // attribute words, 103 index-map bytes stored individually as words, and one count.
     REQUIRE(SPIRV::MeshEmulationSharedBytes(mesh, Stage::Task) == 32 * sizeof(u32));
     REQUIRE(SPIRV::MeshEmulationSharedBytes(mesh, Stage::Mesh) == 392 * sizeof(u32));
+}
+
+TEST_CASE("Bounded task ownership lookup only changes task-fed compute mesh shaders",
+          "[video_core][spirv][mesh_fallback]") {
+    for (Stage stage : {Stage::Task, Stage::Mesh}) {
+        for (bool fallback : {false, true}) {
+            for (bool task : {false, true}) {
+                if (stage == Stage::Task && fallback && !task)
+                    continue;
+                const auto old = EmitProgram(stage, fallback, task);
+                const auto bounded = EmitProgram(stage, fallback, task, TriangleMesh(), true);
+                if (stage == Stage::Mesh && fallback && task) {
+                    REQUIRE(old != bounded);
+                    REQUIRE(Bindings(old) == Bindings(bounded));
+                } else {
+                    REQUIRE(old == bounded);
+                }
+            }
+        }
+    }
+    const auto baseline = EmitProgram(Stage::Mesh, true, true, TriangleMesh(), false, true);
+    const auto bounded = EmitProgram(Stage::Mesh, true, true, TriangleMesh(), true, true);
+    Dump(baseline, "owner-lookup-baseline");
+    Dump(bounded, "owner-lookup-bounded");
 }

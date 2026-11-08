@@ -583,6 +583,8 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
         .min_ssbo_alignment = device.GetStorageBufferAlignment(),
         .max_user_clip_distances = device.GetMaxUserClipDistances()
     };
+    const char* mesh_lookup = std::getenv("STITCH_BOUNDED_MESH_TASK_LOOKUP");
+    profile.bounded_mesh_task_lookup = mesh_lookup && std::string_view{mesh_lookup} == "1";
     profile.support_cooperative_hmma =
         device.IsCooperativeHmmaSupported() && TestCooperativeHmma(device);
     profile.support_cooperative_hmma_16x16x16 =

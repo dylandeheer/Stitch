@@ -437,6 +437,8 @@ public:
     bool uses_nonuniform_storage_image{};
     bool uses_nonuniform_uniform_texel_buffer{};
     bool uses_nonuniform_storage_texel_buffer{};
+    /// Only emitted for a task-fed mesh running as a compute shader.
+    Id mesh_task_lookup{};
 
 private:
     void DefineCommonTypes(const Info& info);
