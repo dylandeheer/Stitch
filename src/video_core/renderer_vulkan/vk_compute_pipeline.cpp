@@ -193,9 +193,10 @@ void TraceUpscalerDispatch(UpscalerTrace& trace, const Shader::Info& info, u64 s
 }
 } // namespace
 
-void TensorPipelineMode::Initialize(bool supported, const char* setting,
-                                   const char* baseline_file) {
+void TensorPipelineMode::Initialize(bool supported, const char* setting, const char* baseline_file,
+                                    const char* reuse_setting) {
     enabled = supported && setting && std::string_view{setting} == "1";
+    compare_reuse = enabled && reuse_setting && std::string_view{reuse_setting} == "1";
     if (enabled) {
         marker = baseline_file ? baseline_file : "";
         paired.store(ReadMarker(), std::memory_order_relaxed);
@@ -210,6 +211,24 @@ bool TensorPipelineMode::ReadMarker() const {
     return !std::filesystem::exists(marker, error) && !error;
 }
 
+TensorVariant TensorPipelineMode::ForMarker(bool experimental) const {
+    if (compare_reuse) {
+        return experimental ? TensorVariant::Reuse : TensorVariant::Paired;
+    }
+    return experimental ? TensorVariant::Paired : TensorVariant::Original;
+}
+
+TensorVariant TensorPipelineMode::Available(TensorVariant request, bool paired_ready,
+                                            bool reuse_ready) {
+    if (request == TensorVariant::Reuse && reuse_ready) {
+        return TensorVariant::Reuse;
+    }
+    if (request != TensorVariant::Original && paired_ready) {
+        return TensorVariant::Paired;
+    }
+    return TensorVariant::Original;
+}
+
 void TensorPipelineMode::TickFrame(u64 frame) {
     if (!enabled) {
         return;
@@ -217,26 +236,47 @@ void TensorPipelineMode::TickFrame(u64 frame) {
     const bool previous = Paired();
     const bool active = frame % 16 == 0 ? ReadMarker() : previous;
     if (previous != active || frame % 120 == 0 || frame == 1) {
+        const auto name = [&](bool experimental) {
+            if (compare_reuse)
+                return experimental ? "reuse" : "paired";
+            return experimental ? "paired" : "baseline";
+        };
         LOG_INFO(Render_Vulkan,
                  "Tensor variant frame={} prior={} next={} eligible_builds={} ready_builds={} "
-                 "baseline_binds={} paired_binds={}", frame, previous ? "paired" : "baseline",
-                 active ? "paired" : "baseline", eligible_builds.load(std::memory_order_relaxed),
+                 "baseline_binds={} paired_binds={} reuse_ready_builds={} reuse_binds={}",
+                 frame, name(previous), name(active),
+                 eligible_builds.load(std::memory_order_relaxed),
                  ready_builds.load(std::memory_order_relaxed),
                  baseline_binds.exchange(0, std::memory_order_relaxed),
-                 paired_binds.exchange(0, std::memory_order_relaxed));
+                 paired_binds.exchange(0, std::memory_order_relaxed),
+                 reuse_ready_builds.load(std::memory_order_relaxed),
+                 reuse_binds.exchange(0, std::memory_order_relaxed));
         paired.store(active, std::memory_order_relaxed);
     }
 }
 
-void TensorPipelineMode::Built(bool success) {
+void TensorPipelineMode::Built(bool paired_ready, bool reuse_ready) {
     eligible_builds.fetch_add(1, std::memory_order_relaxed);
-    if (success) {
+    if (paired_ready) {
         ready_builds.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (reuse_ready) {
+        reuse_ready_builds.fetch_add(1, std::memory_order_relaxed);
     }
 }
 
-void TensorPipelineMode::Bound(bool paired_variant) {
-    (paired_variant ? paired_binds : baseline_binds).fetch_add(1, std::memory_order_relaxed);
+void TensorPipelineMode::Bound(TensorVariant actual) {
+    switch (actual) {
+    case TensorVariant::Original:
+        baseline_binds.fetch_add(1, std::memory_order_relaxed);
+        break;
+    case TensorVariant::Paired:
+        paired_binds.fetch_add(1, std::memory_order_relaxed);
+        break;
+    case TensorVariant::Reuse:
+        reuse_binds.fetch_add(1, std::memory_order_relaxed);
+        break;
+    }
 }
 
 void ComputePipeline::TickUpscalerTrace() {
@@ -249,20 +289,19 @@ void ComputePipeline::TickUpscalerTrace() {
     }
 }
 
-ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk::PipelineCache& pipeline_cache_,
-                                 DescriptorPool& descriptor_pool,
-                                 GuestDescriptorQueue& guest_descriptor_queue_,
-                                 DescriptorBufferRing& descriptor_buffer_ring_,
-                                 Common::ThreadWorker* thread_worker,
-                                 PipelineStatistics* pipeline_statistics,
-                                 VideoCore::ShaderNotify* shader_notify, const Shader::Info& info_,
-                                 vk::ShaderModule spv_module_, u64 shader_hash_,
-                                 vk::ShaderModule paired_spv_module_, TensorPipelineMode* tensor_mode_)
-    : device{device_},
-      pipeline_cache(pipeline_cache_), guest_descriptor_queue{guest_descriptor_queue_},
-      descriptor_buffer_ring{descriptor_buffer_ring_}, info{info_},
-      shader_hash{shader_hash_}, spv_module(std::move(spv_module_)),
-      paired_spv_module{std::move(paired_spv_module_)}, tensor_mode{tensor_mode_} {
+ComputePipeline::ComputePipeline(
+    const Device& device_, Scheduler& scheduler, vk::PipelineCache& pipeline_cache_,
+    DescriptorPool& descriptor_pool, GuestDescriptorQueue& guest_descriptor_queue_,
+    DescriptorBufferRing& descriptor_buffer_ring_, Common::ThreadWorker* thread_worker,
+    PipelineStatistics* pipeline_statistics, VideoCore::ShaderNotify* shader_notify,
+    const Shader::Info& info_, vk::ShaderModule spv_module_, u64 shader_hash_,
+    vk::ShaderModule paired_spv_module_, TensorPipelineMode* tensor_mode_,
+    vk::ShaderModule reuse_spv_module_)
+    : device{device_}, pipeline_cache(pipeline_cache_),
+      guest_descriptor_queue{guest_descriptor_queue_},
+      descriptor_buffer_ring{descriptor_buffer_ring_}, info{info_}, shader_hash{shader_hash_},
+      spv_module(std::move(spv_module_)), paired_spv_module{std::move(paired_spv_module_)},
+      reuse_spv_module{std::move(reuse_spv_module_)}, tensor_mode{tensor_mode_} {
     if (shader_notify) {
         shader_notify->MarkShaderBuilding();
     }
@@ -366,21 +405,39 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
             return;
         }
 
-        if (paired_spv_module) {
-            auto paired_ci = compute_ci;
-            paired_ci.stage.module = *paired_spv_module;
-            try {
-                paired_pipeline = device.GetLogical().CreateComputePipeline(paired_ci, *pipeline_cache);
-            } catch (const vk::Exception& exception) {
-                LOG_WARNING(Render_Vulkan, "Paired compute pipeline {:016x} unavailable: {}",
-                            shader_hash, exception.what());
+        if (tensor_mode) {
+            const auto build_variant = [&](const vk::ShaderModule& module, const char* name) {
+                auto ci = compute_ci;
+                ci.stage.module = *module;
+                try {
+                    return device.GetLogical().CreateComputePipeline(ci, *pipeline_cache);
+                } catch (const vk::Exception& exception) {
+                    LOG_WARNING(Render_Vulkan, "{} compute pipeline {:016x} unavailable: {}", name,
+                                shader_hash, exception.what());
+                    return vk::Pipeline{};
+                }
+            };
+            if (paired_spv_module) {
+                paired_pipeline = build_variant(paired_spv_module, "Paired");
             }
-            tensor_mode->Built(static_cast<bool>(paired_pipeline));
-            if (paired_pipeline) {
+            // When paired SPIR-V equals original, the original already provides that baseline.
+            // If the driver rejected a distinct paired module, keep this entry on original.
+            if (reuse_spv_module && (!paired_spv_module || paired_pipeline)) {
+                reuse_pipeline = build_variant(reuse_spv_module, "Reuse");
+            }
+            tensor_mode->Built(static_cast<bool>(paired_pipeline),
+                               static_cast<bool>(reuse_pipeline));
+            if (!tensor_mode->CompareReuse() && paired_pipeline) {
                 LOG_INFO(Render_Vulkan, "Original and paired compute pipelines ready for {:016x}",
                          shader_hash);
+            } else if (paired_pipeline || reuse_pipeline) {
+                LOG_INFO(Render_Vulkan,
+                         "Tensor pipelines ready for {:016x}: original=true paired={} reuse={}",
+                         shader_hash, static_cast<bool>(paired_pipeline),
+                         static_cast<bool>(reuse_pipeline));
             }
             paired_spv_module.reset();
+            reuse_spv_module.reset();
         }
 
         // Log compute pipeline creation
@@ -723,7 +780,7 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     const bool is_rescaling = !info.texture_descriptors.empty() || !info.image_descriptors.empty();
     scheduler.Record([this, descriptor_data, is_rescaling, descriptor_buffer_offset,
                       descriptor_buffer_chunk, bind_descriptor_buffer,
-                      want_paired = tensor_mode && tensor_mode->Paired(),
+                      request = tensor_mode ? tensor_mode->Requested() : TensorVariant::Original,
                       rescaling_data = rescaling.Data()](vk::CommandBuffer cmdbuf) {
         if (bind_descriptor_buffer) {
             const VkDescriptorBufferBindingInfoEXT binding_info{
@@ -733,11 +790,17 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
         if (!pipeline) {
             return;
         }
-        const bool bind_paired = want_paired && paired_pipeline;
-        cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, bind_paired ? *paired_pipeline : *pipeline);
+        VkPipeline handle = *pipeline;
         if (tensor_mode) {
-            tensor_mode->Bound(bind_paired);
+            const auto actual = TensorPipelineMode::Available(
+                request, static_cast<bool>(paired_pipeline), static_cast<bool>(reuse_pipeline));
+            if (actual == TensorVariant::Reuse)
+                handle = *reuse_pipeline;
+            else if (actual == TensorVariant::Paired)
+                handle = *paired_pipeline;
+            tensor_mode->Bound(actual);
         }
+        cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, handle);
         if (!descriptor_set_layout) {
             return;
         }

@@ -121,6 +121,7 @@ struct Profile {
 
     u64 min_ssbo_alignment{};
     u32 max_user_clip_distances{};
+    bool reuse_cooperative_hmma_operands{};
 
     bool SupportsSubgroupStage(Stage stage) const {
         return (supported_subgroup_stages & (1u << static_cast<u32>(stage))) != 0;

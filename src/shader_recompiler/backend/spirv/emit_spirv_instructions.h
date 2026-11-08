@@ -650,8 +650,10 @@ Id EmitDPdyFine(EmitContext& ctx, Id op_a);
 Id EmitDPdxCoarse(EmitContext& ctx, Id op_a);
 Id EmitDPdyCoarse(EmitContext& ctx, Id op_a);
 
+struct TensorOperandCache;
+void EmitSingleTensorWithReuse(EmitContext& ctx, IR::Inst& inst, TensorOperandCache& cache);
 void EmitTensorColumnPair(EmitContext& ctx, IR::Inst& first, IR::Inst& second, Id upper_b,
-                          Id upper_c);
+                          Id upper_c, TensorOperandCache* cache);
 Id EmitTensorMulAdd(EmitContext& ctx, IR::Inst* inst, Id a, Id b, Id c);
 void DefineSoftwareMatrixFunctions(EmitContext& ctx, const IR::Program& program);
 void PatchCooperativeHmma(std::vector<u32>& code, const CooperativeHmmaTypes& types);

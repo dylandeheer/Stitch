@@ -587,9 +587,9 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
         device.IsCooperativeHmmaSupported() && TestCooperativeHmma(device);
     profile.support_cooperative_hmma_16x16x16 =
         !profile.support_cooperative_hmma && device.IsCooperativeHmma16x16x16Supported();
-    tensor_mode.Initialize(profile.support_cooperative_hmma_16x16x16,
-                           std::getenv("STITCH_PAIR_TENSOR_COLUMNS"),
-                           std::getenv("STITCH_TENSOR_BASELINE_FILE"));
+    tensor_mode.Initialize(
+        profile.support_cooperative_hmma_16x16x16, std::getenv("STITCH_PAIR_TENSOR_COLUMNS"),
+        std::getenv("STITCH_TENSOR_BASELINE_FILE"), std::getenv("STITCH_REUSE_TENSOR_OPERANDS"));
     if (profile.support_cooperative_hmma_16x16x16) {
         LOG_INFO(Render_Vulkan, "Guest tensor operations run on 16x16x16 cooperative matrices");
     }
@@ -2106,11 +2106,11 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
     device.SaveShader(code);
     vk::ShaderModule spv_module{BuildShader(device, code)};
 
-    vk::ShaderModule paired_module;
+    vk::ShaderModule paired_module, reuse_module;
     if (tensor_mode.Enabled() && program.info.uses_cooperative_matrix) {
         // The emitter consumes IR pseudo-instructions and extends the workgroup scratch area.
         // Replay a fresh translation for each module, using only captured environment values.
-        const auto emit_variant = [&](Shader::Environment& captured, bool pair_columns) {
+        const auto emit_variant = [&](Shader::Environment& captured, TensorVariant variant_kind) {
             ShaderPools replay;
             Shader::Maxwell::Flow::CFG variant_cfg{captured, replay.flow_block, captured.StartAddress()};
             auto variant = TranslateProgram(replay.inst, replay.block, captured, variant_cfg, host_info);
@@ -2118,7 +2118,8 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
                 variant.shared_memory_size = (std::min)(variant.shared_memory_size, max_shared_memory);
             }
             auto variant_profile = profile;
-            variant_profile.pair_cooperative_hmma_columns = pair_columns;
+            variant_profile.pair_cooperative_hmma_columns = variant_kind != TensorVariant::Original;
+            variant_profile.reuse_cooperative_hmma_operands = variant_kind == TensorVariant::Reuse;
             return EmitSPIRV(variant_profile, variant);
         };
         try {
@@ -2134,20 +2135,27 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
                     stream.seekg(0);
                     snapshot.Deserialize(stream);
                     captured = &snapshot;
-                    exact = emit_variant(*captured, false) == code;
+                    exact = emit_variant(*captured, TensorVariant::Original) == code;
                 }
             }
             if (!exact) {
                 LOG_INFO(Render_Vulkan, "Keeping original tensor pipeline {:016x}: live environment "
                          "cannot reproduce the original shader", key.unique_hash);
             } else {
-                const auto paired = emit_variant(*captured, true);
+                const auto paired = emit_variant(*captured, TensorVariant::Paired);
                 if (paired != code) {
                     paired_module = BuildShader(device, paired);
                 }
+                // Keep the prepared paired module if building the further experimental arm fails.
+                if (tensor_mode.CompareReuse()) {
+                    const auto reused = emit_variant(*captured, TensorVariant::Reuse);
+                    if (reused != paired) {
+                        reuse_module = BuildShader(device, reused);
+                    }
+                }
             }
         } catch (const std::exception& exception) {
-            LOG_WARNING(Render_Vulkan, "Paired compute replay {:016x} unavailable: {}",
+            LOG_WARNING(Render_Vulkan, "Optional tensor replay {:016x} incomplete: {}",
                         key.unique_hash, exception.what());
         }
     }
@@ -2182,11 +2190,12 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
         pools.block.Free();
         pools.inst.Free();
     }
-    auto* const mode = paired_module ? &tensor_mode : nullptr;
+    auto* const mode = paired_module || reuse_module ? &tensor_mode : nullptr;
     return {.pipeline = std::make_unique<ComputePipeline>(
                 device, scheduler, vulkan_pipeline_cache, descriptor_pool, guest_descriptor_queue,
                 descriptor_buffer_ring, thread_worker, statistics, &shader_notify, info,
-                std::move(spv_module), key.unique_hash, std::move(paired_module), mode),
+                std::move(spv_module), key.unique_hash, std::move(paired_module), mode,
+                std::move(reuse_module)),
             .null_pointer_slots = env.IsNativeProgram() ? env.NullStoragePointerSlots()
                                                         : std::vector<std::pair<u32, u32>>{},
             .mapped_pointers =

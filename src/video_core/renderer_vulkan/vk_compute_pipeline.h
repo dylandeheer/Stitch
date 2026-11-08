@@ -36,35 +36,47 @@ class Device;
 class PipelineStatistics;
 class Scheduler;
 
+enum class TensorVariant { Original, Paired, Reuse };
+
 // Recording snapshots the marker; commands already enqueued keep their selected variant.
 class TensorPipelineMode {
 public:
-    void Initialize(bool supported, const char* setting, const char* baseline_file);
+    void Initialize(bool supported, const char* setting, const char* baseline_file,
+                    const char* reuse_setting = nullptr);
     void TickFrame(u64 frame);
     [[nodiscard]] bool Enabled() const { return enabled; }
     [[nodiscard]] bool Paired() const { return paired.load(std::memory_order_relaxed); }
-    void Built(bool success);
-    void Bound(bool paired_variant);
+    [[nodiscard]] bool CompareReuse() const {
+        return compare_reuse;
+    }
+    [[nodiscard]] TensorVariant Requested() const {
+        return ForMarker(Paired());
+    }
+    [[nodiscard]] static TensorVariant Available(TensorVariant request, bool paired_ready,
+                                                 bool reuse_ready);
+    void Built(bool paired_ready, bool reuse_ready);
+    void Bound(TensorVariant actual);
 
 private:
+    [[nodiscard]] TensorVariant ForMarker(bool experimental) const;
     [[nodiscard]] bool ReadMarker() const;
     std::filesystem::path marker;
-    bool enabled{};
+    bool enabled{}, compare_reuse{};
     std::atomic_bool paired{};
-    std::atomic<u64> eligible_builds{}, ready_builds{}, baseline_binds{}, paired_binds{};
+    std::atomic<u64> eligible_builds{}, ready_builds{}, reuse_ready_builds{}, baseline_binds{},
+        paired_binds{}, reuse_binds{};
 };
 
 class ComputePipeline {
 public:
-    explicit ComputePipeline(const Device& device, Scheduler& scheduler, vk::PipelineCache& pipeline_cache,
-                             DescriptorPool& descriptor_pool,
-                             GuestDescriptorQueue& guest_descriptor_queue,
-                             DescriptorBufferRing& descriptor_buffer_ring,
-                             Common::ThreadWorker* thread_worker,
-                             PipelineStatistics* pipeline_statistics,
-                             VideoCore::ShaderNotify* shader_notify, const Shader::Info& info,
-                             vk::ShaderModule spv_module, u64 shader_hash,
-                             vk::ShaderModule paired_spv_module = {}, TensorPipelineMode* tensor_mode = nullptr);
+    explicit ComputePipeline(
+        const Device& device, Scheduler& scheduler, vk::PipelineCache& pipeline_cache,
+        DescriptorPool& descriptor_pool, GuestDescriptorQueue& guest_descriptor_queue,
+        DescriptorBufferRing& descriptor_buffer_ring, Common::ThreadWorker* thread_worker,
+        PipelineStatistics* pipeline_statistics, VideoCore::ShaderNotify* shader_notify,
+        const Shader::Info& info, vk::ShaderModule spv_module, u64 shader_hash,
+        vk::ShaderModule paired_spv_module = {}, TensorPipelineMode* tensor_mode = nullptr,
+        vk::ShaderModule reuse_spv_module = {});
 
     ComputePipeline& operator=(ComputePipeline&&) noexcept = delete;
     ComputePipeline(ComputePipeline&&) noexcept = delete;
@@ -128,6 +140,7 @@ private:
 
     vk::ShaderModule spv_module;
     vk::ShaderModule paired_spv_module;
+    vk::ShaderModule reuse_spv_module;
     TensorPipelineMode* tensor_mode{};
     vk::DescriptorSetLayout descriptor_set_layout;
     bool uses_push_descriptor{false};
@@ -138,6 +151,7 @@ private:
     vk::DescriptorUpdateTemplate descriptor_update_template;
     vk::Pipeline pipeline;
     vk::Pipeline paired_pipeline;
+    vk::Pipeline reuse_pipeline;
 
     std::function<void()> build_task;
     std::atomic_bool build_claimed{false};

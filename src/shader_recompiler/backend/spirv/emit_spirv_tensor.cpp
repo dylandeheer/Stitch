@@ -7,10 +7,11 @@
 #include <span>
 #include <vector>
 
+#include "common/common_types.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
-#include "common/common_types.h"
+#include "shader_recompiler/backend/spirv/tensor_operand_cache.h"
 #include "shader_recompiler/frontend/ir/program.h"
 
 namespace Shader::Backend::SPIRV {
@@ -116,13 +117,61 @@ void SubgroupBarrier(EmitContext& ctx) {
     ctx.OpControlBarrier(scope, scope, ctx.Const(SubgroupBarrierSemantics));
 }
 
+// Only expand an ordinary vector construction. Re-reading a register or a shared
+// address is a distinct SSA definition; equal source addresses never establish equality here.
+template <size_t N>
+std::optional<std::array<IR::Value, N>> TensorWords(const IR::Value& value) {
+    const auto* vector = value.TryInstRecursive();
+    constexpr auto opcode =
+        N == 4 ? IR::Opcode::CompositeConstructU32x4 : IR::Opcode::CompositeConstructU32x2;
+    if (!vector || vector->GetOpcode() != opcode) {
+        return std::nullopt;
+    }
+    std::array<IR::Value, N> words;
+    for (size_t i = 0; i < N; ++i) {
+        words[i] = vector->Arg(i).Resolve();
+    }
+    return words;
+}
+
+bool IsPositiveZeroAccumulator(const IR::Value& value) {
+    const auto words = TensorWords<2>(value);
+    return words && std::ranges::all_of(*words, [](const IR::Value& word) {
+               return word.IsImmediate() && word.Type() == IR::Type::U32 && word.U32() == 0;
+           });
+}
+
+struct TensorReuse {
+    TensorOperandCache& cache;
+    std::optional<TensorOperandCache::Words> a;
+    std::optional<TensorOperandCache::Words> b;
+    bool reuse_a{};
+    bool reuse_b{};
+    bool zero_c{};
+
+    TensorReuse(TensorOperandCache& cache_, const IR::Inst& first, const IR::Inst* upper)
+        : cache{cache_}, a{TensorWords<4>(first.Arg(0))} {
+        const auto low_b = TensorWords<2>(first.Arg(1));
+        const auto upper_b =
+            upper ? TensorWords<2>(upper->Arg(1)) : std::optional{std::array<IR::Value, 2>{}};
+        if (low_b && upper_b) {
+            b = TensorOperandCache::Words{(*low_b)[0], (*low_b)[1], (*upper_b)[0], (*upper_b)[1]};
+        }
+        reuse_a = a && cache.a.words == a;
+        reuse_b = b && cache.b.words == b && cache.paired_b == (upper != nullptr);
+        zero_c = IsPositiveZeroAccumulator(first.Arg(2)) &&
+                 (!upper || IsPositiveZeroAccumulator(upper->Arg(2)));
+        cache.paired_b = upper != nullptr;
+    }
+};
+
 // One HMMA.16816.F16 (or .1688 with zero upper halves) of a 32-lane warp on 16x16x16 matrices: the
 // NVIDIA fragments go to row-major A, column-major B and row-major C tiles in
 // shared memory, one cooperative-matrix multiply-add replaces the per-lane emulation, and each lane
 // reads its two D words back from where it wrote C.
 Id EmitCooperativeTensorMulAdd(EmitContext& ctx, const CooperativeHmmaTypes& types,
                                u32 scratch_word, Id a, Id b, Id c, Id upper_b = {}, Id upper_c = {},
-                               Id* upper_d = nullptr) {
+                               Id* upper_d = nullptr, TensorReuse* reuse = nullptr) {
     const Id u32ty = ctx.U32[1];
     const auto imm = [&](u32 value) { return ctx.Const(value); };
     const auto add = [&](Id lhs, Id rhs) { return ctx.OpIAdd(u32ty, lhs, rhs); };
@@ -141,34 +190,51 @@ Id EmitCooperativeTensorMulAdd(EmitContext& ctx, const CooperativeHmmaTypes& typ
     const auto store = [&](Id tile, Id word, Id value) {
         ctx.OpStore(SharedWord(ctx, add(tile, word)), value);
     };
-    store(tile_a, row_lo, ctx.OpCompositeExtract(u32ty, a, 0));
-    store(tile_a, row_hi, ctx.OpCompositeExtract(u32ty, a, 1));
-    store(tile_a, add(row_lo, imm(4)), ctx.OpCompositeExtract(u32ty, a, 2));
-    store(tile_a, add(row_hi, imm(4)), ctx.OpCompositeExtract(u32ty, a, 3));
-    // B column g holds k pairs t (b0) and t+4 (b1).
-    store(tile_b, row_lo, ctx.OpCompositeExtract(u32ty, b, 0));
-    store(tile_b, add(row_lo, imm(4)), ctx.OpCompositeExtract(u32ty, b, 1));
+    if (!reuse || !reuse->reuse_a) {
+        store(tile_a, row_lo, ctx.OpCompositeExtract(u32ty, a, 0));
+        store(tile_a, row_hi, ctx.OpCompositeExtract(u32ty, a, 1));
+        store(tile_a, add(row_lo, imm(4)), ctx.OpCompositeExtract(u32ty, a, 2));
+        store(tile_a, add(row_hi, imm(4)), ctx.OpCompositeExtract(u32ty, a, 3));
+    }
+    if (!reuse || !reuse->reuse_b) {
+        store(tile_b, row_lo, ctx.OpCompositeExtract(u32ty, b, 0));
+        store(tile_b, add(row_lo, imm(4)), ctx.OpCompositeExtract(u32ty, b, 1));
+    }
     if (upper_d) {
-        // B is column-major (8 words per column); C and D are row-major (two fp16s per word).
-        store(tile_b, add(row_lo, imm(64)), ctx.OpCompositeExtract(u32ty, upper_b, 0));
-        store(tile_b, add(row_lo, imm(68)), ctx.OpCompositeExtract(u32ty, upper_b, 1));
-        store(tile_c, add(row_lo, imm(4)), ctx.OpCompositeExtract(u32ty, upper_c, 0));
-        store(tile_c, add(row_hi, imm(4)), ctx.OpCompositeExtract(u32ty, upper_c, 1));
-    } else {
+        if (!reuse || !reuse->reuse_b) {
+            store(tile_b, add(row_lo, imm(64)), ctx.OpCompositeExtract(u32ty, upper_b, 0));
+            store(tile_b, add(row_lo, imm(68)), ctx.OpCompositeExtract(u32ty, upper_b, 1));
+        }
+        if (!reuse || !reuse->zero_c) {
+            store(tile_c, add(row_lo, imm(4)), ctx.OpCompositeExtract(u32ty, upper_c, 0));
+            store(tile_c, add(row_hi, imm(4)), ctx.OpCompositeExtract(u32ty, upper_c, 1));
+        }
+    } else if (!reuse || !reuse->reuse_b) {
         store(tile_b, add(lane, imm(64)), ctx.u32_zero_value);
         store(tile_b, add(lane, imm(96)), ctx.u32_zero_value);
     }
-    store(tile_c, row_lo, ctx.OpCompositeExtract(u32ty, c, 0));
-    store(tile_c, row_hi, ctx.OpCompositeExtract(u32ty, c, 1));
+    if (!reuse || !reuse->zero_c) {
+        store(tile_c, row_lo, ctx.OpCompositeExtract(u32ty, c, 0));
+        store(tile_c, row_hi, ctx.OpCompositeExtract(u32ty, c, 1));
+    }
     SubgroupBarrier(ctx);
     const Id stride = imm(8);
     // OpCooperativeMatrixLoadKHR %type %pointer %layout %stride after PatchCooperativeHmma.
     const auto load = [&](Id type, Id tile, u32 layout) {
         return ctx.OpBitFieldUExtract(type, SharedWord(ctx, tile), imm(layout), stride);
     };
-    const Id matrix_a = load(types.matrix_a, tile_a, LayoutRowMajor);
-    const Id matrix_b = load(types.matrix_b, tile_b, LayoutColumnMajor);
-    const Id matrix_c = load(types.matrix_c, tile_c, LayoutRowMajor);
+    const Id matrix_a = reuse && reuse->reuse_a ? reuse->cache.a.matrix
+                                                : load(types.matrix_a, tile_a, LayoutRowMajor);
+    const Id matrix_b = reuse && reuse->reuse_b ? reuse->cache.b.matrix
+                                                : load(types.matrix_b, tile_b, LayoutColumnMajor);
+    const Id matrix_c =
+        reuse && reuse->zero_c
+            ? ctx.OpCompositeConstruct(types.matrix_c, ctx.ConstantNull(types.float16))
+            : load(types.matrix_c, tile_c, LayoutRowMajor);
+    if (reuse) {
+        reuse->cache.a = {reuse->a, matrix_a};
+        reuse->cache.b = {reuse->b, matrix_b};
+    }
     // OpCooperativeMatrixMulAddKHR and OpCooperativeMatrixStoreKHR %pointer %object %layout
     // %stride after PatchCooperativeHmma.
     const Id matrix_d = ctx.OpSelect(types.matrix_c, matrix_a, matrix_b, matrix_c);
@@ -364,13 +430,26 @@ void DefineSoftwareMatrixFunctions(EmitContext& ctx, const IR::Program& program)
 }
 
 void EmitTensorColumnPair(EmitContext& ctx, IR::Inst& first, IR::Inst& second, Id upper_b,
-                          Id upper_c) {
+                          Id upper_c, TensorOperandCache* cache) {
+    std::optional<TensorReuse> reuse;
+    if (cache) {
+        reuse.emplace(*cache, first, &second);
+    }
     Id upper_d;
     const Id lower_d = EmitCooperativeTensorMulAdd(
         ctx, *ctx.cooperative_hmma, *ctx.tensor_scratch_word, ctx.Def(first.Arg(0)),
-        ctx.Def(first.Arg(1)), ctx.Def(first.Arg(2)), upper_b, upper_c, &upper_d);
+        ctx.Def(first.Arg(1)), ctx.Def(first.Arg(2)), upper_b, upper_c, &upper_d,
+        reuse ? &*reuse : nullptr);
     first.SetDefinition(lower_d);
     second.SetDefinition(upper_d);
+}
+
+void EmitSingleTensorWithReuse(EmitContext& ctx, IR::Inst& inst, TensorOperandCache& cache) {
+    TensorReuse reuse{cache, inst, nullptr};
+    const Id result = EmitCooperativeTensorMulAdd(
+        ctx, *ctx.cooperative_hmma, *ctx.tensor_scratch_word, ctx.Def(inst.Arg(0)),
+        ctx.Def(inst.Arg(1)), ctx.Def(inst.Arg(2)), {}, {}, nullptr, &reuse);
+    inst.SetDefinition(result);
 }
 
 Id EmitTensorMulAdd(EmitContext& ctx, IR::Inst* inst, Id a, Id b, Id c) {

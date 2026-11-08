@@ -16,6 +16,7 @@
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
+#include "shader_recompiler/backend/spirv/tensor_operand_cache.h"
 #include "shader_recompiler/frontend/ir/basic_block.h"
 #include "shader_recompiler/frontend/ir/program.h"
 
@@ -165,7 +166,7 @@ Id TypeId(const EmitContext& ctx, IR::Type type) {
 // Two independent 16x8 products sharing A can occupy the lower and upper columns of one
 // 16x16 cooperative matrix. Stay inside one IR block; predicate regions are separate blocks.
 IR::Inst* TryEmitTensorColumnPair(EmitContext& ctx, IR::Block::iterator first,
-                                  IR::Block::iterator end) {
+                                  IR::Block::iterator end, TensorOperandCache* cache) {
     using Op = IR::Opcode;
     if (first->Flags<u32>() != 16) {
         return nullptr;
@@ -226,7 +227,7 @@ IR::Inst* TryEmitTensorColumnPair(EmitContext& ctx, IR::Block::iterator first,
         return ctx.OpCompositeConstruct(ctx.U32[2], ctx.Def(v->Arg(0).Resolve()),
                                         ctx.Def(v->Arg(1).Resolve()));
     };
-    EmitTensorColumnPair(ctx, *first, *second, form(second->Arg(1)), form(second->Arg(2)));
+    EmitTensorColumnPair(ctx, *first, *second, form(second->Arg(1)), form(second->Arg(2)), cache);
     return &*second;
 }
 
@@ -242,6 +243,10 @@ void Traverse(EmitContext& ctx, IR::Program& program) {
             current_block = node.data.block;
             ctx.AddLabel(label);
             if (ctx.tensor_scratch_word && ctx.profile.pair_cooperative_hmma_columns) {
+                TensorOperandCache last{};
+                TensorOperandCache* const cache =
+                    ctx.profile.reuse_cooperative_hmma_operands ? &last : nullptr;
+                unsigned packing_gap{};
                 IR::Inst* paired_second{};
                 for (auto it = current_block->begin(); it != current_block->end(); ++it) {
                     if (&*it == paired_second) {
@@ -249,9 +254,27 @@ void Traverse(EmitContext& ctx, IR::Program& program) {
                         continue;
                     }
                     if (it->GetOpcode() == IR::Opcode::TensorMulAdd) {
-                        paired_second = TryEmitTensorColumnPair(ctx, it, current_block->end());
+                        packing_gap = 0;
+                        paired_second =
+                            TryEmitTensorColumnPair(ctx, it, current_block->end(), cache);
                         if (paired_second) {
                             continue;
+                        }
+                        if (cache && it->Flags<u32>() == 16) {
+                            EmitSingleTensorWithReuse(ctx, *it, *cache);
+                            continue;
+                        }
+                    }
+                    if (cache) {
+                        // End live ranges across control, memory, arithmetic and long packing gaps.
+                        using Op = IR::Opcode;
+                        const Op op = it->GetOpcode();
+                        const bool packing =
+                            op == Op::Identity || op == Op::CompositeConstructU32x4 ||
+                            op == Op::CompositeConstructU32x2 || op == Op::CompositeExtractU32x2;
+                        if (!packing || ++packing_gap > 32) {
+                            *cache = {};
+                            packing_gap = 0;
                         }
                     }
                     EmitInst(ctx, &*it);
