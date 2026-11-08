@@ -45,6 +45,10 @@ public:
     /// Whether an empty draw can begin its next samples query without changing render passes.
     [[nodiscard]] bool CanBeginSamplesQueryInPass() const;
 
+    /// Reproduces the samples boundary of a deferred-clear pass transition inside the pass.
+    /// Returns false when the caller must perform the original full transition.
+    bool TryContinueClearPass();
+
     void EndHostConditionalRendering();
 
     void PauseHostConditionalRendering();

@@ -390,6 +390,8 @@ void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass
     const VkFramebuffer framebuffer_handle = framebuffer->Handle();
     const VkExtent2D render_area = framebuffer->RenderArea();
     state.renderpass = renderpass;
+    state.clear_boundary_pending = renderpass != framebuffer->RenderPass();
+    render_pass_has_xfb = false;
     state.framebuffer = framebuffer_handle;
     state.render_area = render_area;
 
@@ -514,17 +516,18 @@ void Scheduler::RequestRenderpass(const Framebuffer* framebuffer, std::source_lo
     const VkRenderPass renderpass = framebuffer->RenderPass();
     const VkFramebuffer framebuffer_handle = framebuffer->Handle();
     const VkExtent2D render_area = framebuffer->RenderArea();
-    // A draw continues the active pass whenever the same framebuffer and area are bound. The
-    // render-pass *variant* (a deferred clear's loadOp=CLEAR form) is only meaningful at begin -
-    // loadOps are applied once, and the base/variant passes are render-pass-compatible (only
-    // loadOp/storeOp differ). Comparing the exact handle here made every draw after a deferred
-    // clear restart the pass and re-LOAD what was just CLEARed (~118 MB of attachment traffic per
-    // world-target turn). The framebuffer handle already fixes the attachment structure and key,
-    // so it is the correct identity to compare.
     if (state.renderpass && framebuffer_handle == state.framebuffer &&
         render_area.width == state.render_area.width &&
         render_area.height == state.render_area.height) {
-        return;
+        // The first request for the base pass used to end the clear variant. Consume that
+        // boundary once, even when the draw has sampling disabled.
+        if (!std::exchange(state.clear_boundary_pending, false)) {
+            return;
+        }
+        if (!render_pass_has_xfb && !RenderPassHasStores() && !HasFragmentBarrier() &&
+            query_runtime && query_runtime->TryContinueClearPass()) {
+            return;
+        }
     }
     if (state.renderpass) {
         CountRenderPassEnd(location.file_name(), location.line());

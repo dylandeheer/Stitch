@@ -42,6 +42,7 @@ class Device;
 class Framebuffer;
 class GraphicsPipeline;
 class StateTracker;
+class QueryCacheRuntime;
 
 struct QueryCacheParams;
 
@@ -187,8 +188,10 @@ public:
     void InvalidateState();
 
     /// Assigns the query cache.
-    void SetQueryCache(VideoCommon::QueryCacheBase<QueryCacheParams>& query_cache_) {
+    void SetQueryCache(VideoCommon::QueryCacheBase<QueryCacheParams>& query_cache_,
+                       QueryCacheRuntime& query_runtime_) {
         query_cache = &query_cache_;
+        query_runtime = &query_runtime_;
     }
 
     // Registers a callback to perform on queue submission.
@@ -418,6 +421,7 @@ private:
 
     struct State {
         VkRenderPass renderpass{};
+        bool clear_boundary_pending{};
         VkFramebuffer framebuffer{};
         VkExtent2D render_area = {0, 0};
         GraphicsPipeline* graphics_pipeline = nullptr;
@@ -525,6 +529,7 @@ private:
     bool trace_gpu_failed{};
 
     VideoCommon::QueryCacheBase<QueryCacheParams>* query_cache = nullptr;
+    QueryCacheRuntime* query_runtime{};
 
     vk::CommandBuffer current_cmdbuf;
     vk::CommandBuffer current_upload_cmdbuf;

@@ -25,6 +25,7 @@
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_compute_pass.h"
 #include "video_core/renderer_vulkan/vk_query_cache.h"
+#include "video_core/texture_cache/clear_discard.h"
 #include "video_core/renderer_vulkan/vk_resource_pool.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
@@ -168,6 +169,10 @@ public:
     }
 
     ~SamplesStreamer() = default;
+
+    [[nodiscard]] bool IsStarted() const {
+        return has_started;
+    }
 
     [[nodiscard]] bool CanReserveInCurrentBank() const {
         // Reserving a new bank can require a query-pool reset outside the render pass.
@@ -1500,6 +1505,26 @@ void QueryCacheRuntime::View3DRegs(Func&& func) {
 bool QueryCacheRuntime::CanBeginSamplesQueryInPass() const {
     return impl->scheduler.IsRenderPassActive() && !impl->hcr_is_set &&
            impl->sample_streamer.CanReserveInCurrentBank();
+}
+
+bool QueryCacheRuntime::TryContinueClearPass() {
+    if (!impl->maxwell3d || impl->hcr_is_set || impl->is_hcr_running) {
+        return false;
+    }
+    const auto& regs = impl->maxwell3d->regs;
+    if (regs.transform_feedback_enabled || !VideoCommon::UnconditionalClear(regs)) {
+        return false;
+    }
+    const bool started = impl->sample_streamer.IsStarted();
+    if ((started || regs.zpass_pixel_count_enable) && !CanBeginSamplesQueryInPass()) {
+        return false;
+    }
+    // Draw/clear setup will restart sampling if enabled. Starting here would invent a slot
+    // for a disabled counter or enclose an internal operation in a guest query.
+    if (started) {
+        impl->sample_streamer.PauseCounter();
+    }
+    return true;
 }
 
 void QueryCacheRuntime::EndHostConditionalRendering() {
