@@ -1056,6 +1056,7 @@ struct Maxwell3D::FrontState {
         u64 generation{};
         u32 start{};
         std::optional<VideoCommon::OrderedFifoMacro> compiled;
+        bool verified{};
     };
     std::array<FifoProgram, 16> programs{};
     bool mode_pending{};
@@ -1186,7 +1187,7 @@ void Maxwell3D::ReconcileOrderedMode(VideoCommon::GpuSplit& split, FrontState& f
         return;
     // Prior callbacks own only this mode register and its tracked shadow. All front readers
     // of them pass here before reading, overwriting, replaying or checking the mirror.
-    split.Drain(VideoCommon::DrainSite::Other);
+    split.Drain(VideoCommon::DrainSite::FifoPublication);
     constexpr u32 mode = MAXWELL3D_REG_INDEX(render_enable.mode);
     fs.regs[mode] = regs.reg_array[mode];
     fs.shadow[mode] = shadow_state.reg_array[mode];
@@ -1439,8 +1440,10 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
         // other entry contexts too; those stay entirely on the original path.
         const Plan* plan{};
         Plan::Params input{};
-        const Mode operation =
-            split.OrderedFifoConfigured() ? split.SelectOrderedFifoMode() : Mode::Off;
+        Mode operation = split.OrderedFifoConfigured() ? split.SelectOrderedFifoMode() : Mode::Off;
+        if (operation != Mode::On && fs.mode_pending)
+            ReconcileOrderedMode(split, fs);
+        FrontState::FifoProgram* checking{};
         auto& counts = split.OrderedFifoStats();
         if (operation != Mode::Off && parameter_count == 3 && fs.parameters[0] <= 1 &&
             fs.parameters[1] <= 0x1ffffff && !entry_pending && !entry_instance && !entry_sink &&
@@ -1463,17 +1466,27 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
             if (slot.compiled) {
                 std::copy_n(fs.parameters.begin(), input.size(), input.begin());
                 const auto source = (GPUVAddr{input[1]} << 32) | input[2];
-                if (memory_manager.IsUniqueQueryFifoSource(source)) {
+                ++counts.considered;
+                if (!split.OwnedFifoCommands()) {
+                    // Live commands after this call may themselves be written by publication.
+                    ++counts.borrowed;
+                } else if (memory_manager.IsUniqueQueryFifoSource(source)) {
+                    ++counts.admitted;
                     plan = &*slot.compiled;
-                    if ((++counts.admitted & 0xffff) == 0)
-                        LOG_INFO(HW_GPU,
-                                 "Ordered FIFO admitted={} checked={} deferred={} "
-                                 "reconciled={} mismatches={} uncertain_source={}",
-                                 counts.admitted, counts.checked, counts.deferred,
-                                 counts.reconciled, counts.mismatches, counts.uncertain_source);
+                    if (!slot.verified)
+                        operation = Mode::Verify;
+                    if (operation == Mode::Verify)
+                        checking = &slot;
                 } else {
                     ++counts.uncertain_source;
                 }
+                if ((counts.considered & 0xffff) == 0)
+                    LOG_INFO(HW_GPU,
+                             "Ordered FIFO considered={} admitted={} checked={} deferred={} "
+                             "reconciled={} mismatches={} uncertain_source={} borrowed={}",
+                             counts.considered, counts.admitted, counts.checked, counts.deferred,
+                             counts.reconciled, counts.mismatches, counts.uncertain_source,
+                             counts.borrowed);
             }
         }
         if (plan && operation == Mode::On) {
@@ -1496,7 +1509,11 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
                 ConsumeSink(*system_ptr);
                 CallMethod(*system_ptr, render, recipe.Result(input, words), true);
             });
-            split.NoteWriter(); // Publication may change a later fetched command list.
+            split.NoteOrderedFifoWriter();
+            VideoCommon::Nx2Profile::CountDmaRead(method);
+            if (VideoCommon::Nx2Profile::Enabled())
+                VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::DmaReadBytes,
+                                             sizeof(Plan::Data));
             fs.mode_pending = true;
             fs.sink_pending = false;
             ++counts.deferred;
@@ -1552,6 +1569,7 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
                                          {render, plan->recipe.Result(input, returned)}}};
             if (result.success && result.consumed == 9 && emits == expected.size() &&
                 collected == 1 && observed == expected) {
+                checking->verified = true;
                 ++counts.checked;
             } else {
                 ++counts.mismatches;

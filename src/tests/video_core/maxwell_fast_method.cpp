@@ -5,6 +5,8 @@
 #include <array>
 #include <chrono>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <functional>
 #include <memory>
 #include <random>
@@ -13,7 +15,9 @@
 
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
+#include "tests/video_core/dma_pusher_test_access.h"
 #include "tests/video_core/ordered_fifo_program.h"
+#include "video_core/control/channel_state.h"
 
 #include "common/page_table.h"
 #include "common/scope_exit.h"
@@ -69,8 +73,14 @@ struct GpuSplitTestAccess {
         return split.front_waiting.load(std::memory_order_seq_cst);
     }
 
+    static void FifoMarker(GpuSplit& split, const char* path) {
+        split.ordered_fifo_marker = path;
+        split.ordered_fifo_polls = 0;
+    }
     static void OrderedMode(GpuSplit& split, GpuSplit::OrderedFifoMode mode) {
         split.ordered_fifo_mode = mode;
+        split.ordered_fifo_marker = nullptr;
+        split.front_macros = true;
     }
 
     static void EnableWriterFrontier(GpuSplit& split, bool verify = false) {
@@ -1317,6 +1327,9 @@ TEST_CASE("Ordered FIFO macros preserve report order, tracked state and captured
         Candidate,
         StopHandoff,
         ObserveDirect,
+        BorrowedWord,
+        DeferredRefresh,
+        SuspensionRefresh,
         PendingSink,
         Instance,
         Alias,
@@ -1324,7 +1337,8 @@ TEST_CASE("Ordered FIFO macros preserve report order, tracked state and captured
     };
     const auto route = GENERATE(Route::Original, Route::Verify, Route::Candidate,
                                 Route::PendingSink, Route::Instance, Route::Alias, Route::Replay,
-                                Route::StopHandoff, Route::ObserveDirect);
+                                Route::StopHandoff, Route::ObserveDirect, Route::BorrowedWord,
+                                Route::DeferredRefresh, Route::SuspensionRefresh);
     const bool deferred =
         route == Route::Candidate || route == Route::StopHandoff || route == Route::ObserveDirect;
     CAPTURE(static_cast<int>(route));
@@ -1358,9 +1372,13 @@ TEST_CASE("Ordered FIFO macros preserve report order, tracked state and captured
             if (at != device || bytes != 24)
                 return;
             events.push_back(2);
+            // Completing a query fence may also publish a different query-only command word.
+            if (command_word)
+                *command_word = 0x531;
             const std::array<u32, 6> equal{19, 23, 61, 71, 19, 23};
             std::memcpy(dest, equal.data(), 24);
         }
+        u32* command_word{};
         u8* dest;
         std::vector<u32> events;
     } reports{f.gpu, backing + 0x20};
@@ -1372,7 +1390,9 @@ TEST_CASE("Ordered FIFO macros preserve report order, tracked state and captured
         f.device_memory.Unmap(0x10000, 0x1000);
         f.device_memory.UnregisterProcess(asid);
     };
-    Split split;
+    auto& split = Split::Get();
+    split.OrderedFifoStats() = {};
+    Access::OrderedMode(split, Split::OrderedFifoMode::Off);
     Access::Start(split, f.system);
     SCOPE_EXIT {
         split.Stop();
@@ -1410,9 +1430,114 @@ TEST_CASE("Ordered FIFO macros preserve report order, tracked state and captured
     REQUIRE(reports.events == std::vector<u32>{1, 2});
     REQUIRE(engine.regs.reg_array[render] == 0);
     reports.events.clear();
+    Access::OrderedMode(split, Split::OrderedFifoMode::Verify);
+    const auto init_scope = split.EnterFifoCommandScope(Split::CommandBacking::Owned);
+    call(0); // Every new exact code image must match its original call before it may move.
+    split.LeaveFifoCommandScope(init_scope);
+    split.Drain();
+    REQUIRE(split.OrderedFifoStats().checked == 1);
+    reports.events.clear();
     Access::OrderedMode(split, route == Route::Original ? Split::OrderedFifoMode::Off
                                : route == Route::Verify ? Split::OrderedFifoMode::Verify
                                                         : Split::OrderedFifoMode::On);
+    if (route == Route::BorrowedWord || route == Route::DeferredRefresh ||
+        route == Route::SuspensionRefresh) {
+        using namespace Tegra;
+        Control::ChannelState channel{1};
+        channel.memory_manager = &f.memory;
+        DmaPusher parser{f.system, f.memory, channel};
+        parser.BindRasterizer(&reports);
+        parser.BindSubchannel(&engine, 0, Engines::EngineTypes::Maxwell3D);
+        const auto header = [](u32 method, u32 count, SubmissionMode mode) {
+            CommandHeader h{};
+            h.method.Assign(method);
+            h.method_count.Assign(count);
+            h.mode.Assign(mode);
+            return h;
+        };
+        const auto list = [](GPUVAddr address, u32 count) {
+            CommandList out;
+            CommandListHeader entry{};
+            entry.addr.Assign(address);
+            entry.size.Assign(count);
+            out.command_lists.push_back(entry);
+            return out;
+        };
+        constexpr GPUVAddr commands_address = 0x100300;
+        auto* live = reinterpret_cast<CommandHeader*>(backing + 0x300);
+        const std::array words{header(0xe00, 3, SubmissionMode::IncreaseOnce),
+                               CommandHeader{.argument = 1},
+                               CommandHeader{.argument = 0},
+                               CommandHeader{.argument = static_cast<u32>(word)},
+                               header(witness, 1, SubmissionMode::NonIncreasing),
+                               CommandHeader{.argument = 0}};
+        std::copy(words.begin(), words.end(), live);
+        reports.command_word = &live[5].argument;
+        const bool borrowed = route == Route::BorrowedWord;
+        auto first = list(commands_address, borrowed ? 6 : 4);
+        if (!borrowed) {
+            first.submitted_offsets = {0};
+            first.submitted_words.assign(words.begin(), words.begin() + 4);
+        }
+        parser.Push(std::move(first));
+        std::atomic<bool> entered{}, release{}, returned{};
+        split.Defer([&] {
+            entered.store(true, std::memory_order_release);
+            while (!release.load(std::memory_order_acquire))
+                std::this_thread::yield();
+        });
+        split.Publish();
+        while (!entered.load(std::memory_order_acquire))
+            std::this_thread::yield();
+        u32 refreshed{};
+        std::thread front([&] {
+            DmaPusherTestAccess::Step(parser);
+            if (!borrowed) {
+                auto following = list(commands_address + 16, 2);
+                following.submitted_offsets = {0};
+                following.submitted_words.resize(2);
+                if (route == Route::DeferredRefresh)
+                    following.deferred_entries = {0};
+                else
+                    following.snapshot_suspensions = 2;
+                parser.Push(std::move(following));
+                refreshed = parser.dma_pushbuffer.back().submitted_words[1].argument;
+            }
+            returned.store(true, std::memory_order_release);
+        });
+        SCOPE_EXIT {
+            release.store(true, std::memory_order_release);
+            if (front.joinable())
+                front.join();
+            split.Drain();
+        };
+        const auto limit = std::chrono::steady_clock::now() + std::chrono::seconds{5};
+        while (!returned.load(std::memory_order_acquire) && !Access::FrontWaits(split) &&
+               std::chrono::steady_clock::now() < limit)
+            std::this_thread::yield();
+        REQUIRE(Access::FrontWaits(split));
+        REQUIRE_FALSE(returned.load(std::memory_order_acquire));
+        release.store(true, std::memory_order_release);
+        front.join();
+        split.Drain();
+        REQUIRE(reports.events == std::vector<u32>{1, 2});
+        REQUIRE(split.OrderedFifoStats().deferred == (borrowed ? 0U : 1U));
+        if (borrowed) {
+            REQUIRE(split.OrderedFifoStats().borrowed == 1);
+            // Sunk state writes become architectural values when consumed.
+            split.Run([&] { engine.ConsumeSink(f.system); });
+            REQUIRE(engine.regs.reg_array[witness] == 0x531);
+        } else {
+            REQUIRE(refreshed == 0x531);
+            REQUIRE(split.OrderedFifoStats().groups == 1);
+            REQUIRE(split.OrderedFifoStats().waited_groups == 1);
+        }
+        return;
+    }
+    const auto scope = split.EnterFifoCommandScope(Split::CommandBacking::Owned);
+    SCOPE_EXIT {
+        split.LeaveFifoCommandScope(scope);
+    };
     if (route == Route::Alias)
         f.device_memory.Map(0x20000, cpu, 0x1000, asid);
     SCOPE_EXIT {
@@ -1477,7 +1602,7 @@ TEST_CASE("Ordered FIFO macros preserve report order, tracked state and captured
     REQUIRE(reports.events == std::vector<u32>{1, 2}); // VERIFY cannot run either effect twice.
     REQUIRE(engine.regs.reg_array[render] == (route == Route::Replay ? 0 : 1));
     REQUIRE(split.OrderedFifoStats().deferred == (deferred ? 1U : 0U));
-    REQUIRE(split.OrderedFifoStats().checked == (route == Route::Verify ? 1U : 0U));
+    REQUIRE(split.OrderedFifoStats().checked == (route == Route::Verify ? 2U : 1U));
     REQUIRE(split.OrderedFifoStats().mismatches == 0);
     if (deferred) {
         REQUIRE(seen_by_following_work == 1);
@@ -1511,4 +1636,45 @@ TEST_CASE("Ordered FIFO macros preserve report order, tracked state and captured
         split.Drain();
         REQUIRE(engine.regs.reg_array[render] == 0);
     }
+}
+
+TEST_CASE("Ordered FIFO mode file requires explicit verified promotion and fails to baseline",
+          "[video_core][ordered_fifo_ring]") {
+    using Split = VideoCommon::GpuSplit;
+    using Mode = Split::OrderedFifoMode;
+    using Access = VideoCommon::GpuSplitTestAccess;
+    Split split;
+    Access::OrderedMode(split, Mode::Verify);
+    REQUIRE(split.SelectOrderedFifoMode() == Mode::Verify);
+    const auto directory =
+        std::filesystem::temp_directory_path() /
+        ("ordered-fifo-marker-" +
+         std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    REQUIRE(std::filesystem::create_directory(directory));
+    SCOPE_EXIT {
+        std::error_code ec;
+        std::filesystem::remove_all(directory, ec);
+    };
+    const auto path = (directory / "mode").string();
+    const auto select = [&] {
+        Access::FifoMarker(split, path.c_str());
+        return split.SelectOrderedFifoMode();
+    };
+    REQUIRE(select() == Mode::Off);
+    std::ofstream(path) << "candidate\n";
+    REQUIRE(select() == Mode::Verify);
+    split.OrderedFifoStats().checked = 1;
+    REQUIRE(select() == Mode::On);
+    std::ofstream(path) << "baseline\n";
+    REQUIRE(split.SelectOrderedFifoMode() == Mode::On); // sampled mode captured until next poll
+    REQUIRE(select() == Mode::Off);
+    std::ofstream(path) << "verify\n";
+    REQUIRE(select() == Mode::Verify);
+    std::ofstream(path) << "candidate\npartial";
+    REQUIRE(select() == Mode::Off);
+    std::filesystem::remove(path);
+    REQUIRE(select() == Mode::Off);
+    std::ofstream(path) << "candidate";
+    split.RejectOrderedFifo();
+    REQUIRE(select() == Mode::Off);
 }

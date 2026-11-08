@@ -14,16 +14,7 @@
 #include "video_core/macro.h"
 #include "video_core/memory_manager.h"
 
-namespace Tegra {
-
-struct DmaPusherTestAccess {
-    static bool IsMemoryWriter(const Engines::EngineInterface& engine, Engines::EngineTypes type,
-                               u32 method) {
-        return DmaPusher::IsMemoryWriter(engine, type, method);
-    }
-};
-
-} // namespace Tegra
+#include "tests/video_core/dma_pusher_test_access.h"
 
 TEST_CASE("Command writer classification excludes only plain compute and DMA state",
           "[video_core][command_writer]") {
