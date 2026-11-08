@@ -816,6 +816,32 @@ TEST_CASE("Readback tracing recognizes exact page reuse after compute storage wr
 }
 
 
+TEST_CASE("Clean optional read hints preserve page-level GPU ownership",
+          "[buffer_ports][bounded_clean_hint]") {
+    Fixture f;
+    const bool bounded = GENERATE(false, true);
+    constexpr DAddr demand = 0x20000;
+    constexpr DAddr hint = 0x21000;
+    const auto id = Access::Add(*f.cache, demand, 0x2000);
+    std::ranges::fill(Access::Get(*f.cache, id).bytes, 0xa5);
+    const bool old = Tegra::g_nx2_ampere.exchange(true);
+    SCOPE_EXIT { Tegra::g_nx2_ampere = old; };
+    Access::Dirty(*f.cache, demand, 0x2000);
+    Access::DemandBatch(*f.cache, 1, bounded);
+    REQUIRE_FALSE(f.cache->GetFlushArea(hint, 4)->preemtive);
+    REQUIRE_FALSE(f.cache->GetFlushArea(demand, 4)->preemtive);
+    // The CPU owns all exact bytes on this hinted page, while page-level tracking
+    // still routes new CPU writes through the GPU dirty-write collector.
+    const std::array<std::pair<DAddr, u64>, 1> claimed{{{hint, 0x1000}}};
+    f.cache->ClaimCpuWrites(claimed);
+    REQUIRE_FALSE(Access::Pending(*f.cache, hint, 0x1000));
+    REQUIRE(f.cache->OnCPUWrite(hint, 1));
+    f.cache->DownloadMemory(demand, 0x1000);
+    REQUIRE(f.bytes[0x10000] == 0xa5);
+    REQUIRE(f.bytes[0x11000] == 0);
+    REQUIRE(f.cache->OnCPUWrite(hint, 1));
+}
+
 TEST_CASE("Bounded buffer readback lands full demand and leaves cold GPU data pending",
           "[buffer_ports][bounded_read_batch]") {
     Fixture f;

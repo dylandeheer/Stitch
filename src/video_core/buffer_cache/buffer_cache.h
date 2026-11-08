@@ -352,7 +352,13 @@ void BufferCache<P>::DownloadMemory(DAddr device_addr, u64 size) {
                 std::array<DAddr, RecentReadPages::Capacity> extra{};
                 size_t count = 0;
                 recent_read_pages.ForEachExtra(device_addr, size, frame_tick,
-                                               [&](DAddr start, u64) { extra[count++] = start; });
+                                               [&](DAddr start, u64 bytes) {
+                    // Like historical batching, never consume coarse GPU tracker bits for a
+                    // hint whose exact GPU-written bytes have already been claimed.
+                    if (gpu_modified_ranges.Intersects(start, bytes)) {
+                        extra[count++] = start;
+                    }
+                });
                 if (count != 0) {
                     const auto pages = std::span{extra}.first(count);
                     device_memory.WithUniquePhysicalPages(pages, recent_read_generation, [&] {
