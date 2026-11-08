@@ -4,7 +4,11 @@
 // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <array>
+#include <vector>
 #include <catch2/catch_test_macros.hpp>
+#include "tests/common/host_memory_test_access.h"
 
 #ifndef _WIN32
 #include <unistd.h>
@@ -255,4 +259,42 @@ TEST_CASE("HostMemory: Partial sparse middle unmap and check bindings", "[common
 
     REQUIRE(ptr[0x0000] == 19);
     REQUIRE(ptr[0x3fff] == 12);
+}
+
+TEST_CASE("Bounded backing file reads preserve data across aliases and holes", "[atlas_pread]") {
+    HostMemory mem(8_MiB, 16_MiB);
+    REQUIRE(mem.BackingBasePointer());
+    std::array<u8, 0x2200> scratch{};
+    REQUIRE_FALSE(mem.TryReadBacking(8_MiB, scratch));
+    REQUIRE_FALSE(mem.TryReadBacking(8_MiB - 4, scratch));
+    REQUIRE_FALSE(mem.TryReadBacking(~size_t{}, scratch));
+    REQUIRE_FALSE(mem.TryReadBacking(0, std::span<u8>{}));
+    std::vector<u8> huge(4_MiB + 1);
+    REQUIRE_FALSE(mem.TryReadBacking(0, huge));
+#ifdef __linux__
+    if (!MapsSingleGuestPages() || !mem.VirtualBasePointer()) SKIP("requires a shared 4 KiB fastmem mapping");
+    mem.Map(0x10000, 0x8000, 0x3000, PERMS, HEAP);
+    mem.Map(0x20000, 0x8000, 0x3000, PERMS, HEAP);
+    auto* const alias = mem.VirtualBasePointer() + 0x10000;
+    auto* const mirror = mem.VirtualBasePointer() + 0x20000;
+    for (size_t i = 0; i < 4096; ++i) alias[i] = static_cast<u8>((i * 37) ^ 0xbc);
+    std::fill_n(mirror + 0x2000, 0x1000, 0x5a);
+    mem.Protect(0x10000, 0x3000, static_cast<Common::MemoryPermission>(0));
+    REQUIRE(mem.TryReadBacking(0x8100, scratch));
+    REQUIRE(std::equal(scratch.begin(), scratch.end(), mirror + 0x100));
+    REQUIRE(std::all_of(scratch.begin()+0xf00, scratch.begin()+0x1f00, [](u8 b){ return b == 0; }));
+    mirror[0x123] = 0xde;
+    REQUIRE(mem.TryReadBacking(0x8123, std::span{scratch}.first(1)));
+    REQUIRE(scratch.front() == 0xde);
+#else
+    REQUIRE_FALSE(mem.TryReadBacking(0, scratch));
+#endif
+}
+
+TEST_CASE("An anonymous physical fallback never reads a backing file", "[atlas_pread]") {
+    Common::HostMemoryTestAccess control(false);
+    HostMemory mem(0x10000, 0x400000);
+    REQUIRE(mem.BackingBasePointer());
+    std::array<u8, 32> scratch{};
+    REQUIRE_FALSE(mem.TryReadBacking(0, scratch));
 }

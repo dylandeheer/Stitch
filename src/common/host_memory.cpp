@@ -543,6 +543,15 @@ public:
     {}
 
 #ifdef __linux__
+    bool ReadBacking(size_t offset, std::span<u8> output) const {
+        if (!shared_file_backing) return false;
+        ssize_t n;
+        do {
+            n = pread(fd, output.data(), output.size(), static_cast<off_t>(offset));
+        } while (n < 0 && errno == EINTR);
+        return n >= 0 && static_cast<size_t>(n) == output.size();
+    }
+
     bool PunchHole(size_t offset, size_t length) {
         return fd >= 0 &&
                fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, static_cast<off_t>(offset),
@@ -622,6 +631,9 @@ public:
             }
         } else {
             backing_base = static_cast<u8*>(mmap(nullptr, backing_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_NOCORE, fd, 0));
+#ifdef __linux__
+            shared_file_backing = backing_base != MAP_FAILED;
+#endif
         }
         if (backing_base == MAP_FAILED) {
             LOG_CRITICAL(HW_Memory, "mmap failed: {}", strerror(errno));
@@ -927,6 +939,9 @@ private:
         apply(run_begin, end, run);
     }
 
+#ifdef __linux__
+    bool shared_file_backing{};
+#endif
     int fd{-1}; // memfd file descriptor, -1 is the error value of memfd_create
     FreeRegionManager free_manager{};
     size_t host_page_size{PageAlignment};
@@ -1075,6 +1090,19 @@ void HostMemory::HintCold(size_t physical_offset, size_t length,
     if (virtual_offset && virtual_base != nullptr && *virtual_offset + length <= virtual_size) {
         hint(virtual_base + *virtual_offset);
     }
+}
+
+bool HostMemory::TryReadBacking(size_t offset, std::span<u8> output) const {
+#ifdef __linux__
+    constexpr size_t max_bytes = 4 * 1024 * 1024;
+    if (!impl || fallback_buffer || !backing_base || output.empty() || output.size() > max_bytes ||
+        offset >= backing_size || output.size() > backing_size - offset) {
+        return false;
+    }
+    return impl->ReadBacking(offset, output);
+#else
+    return false;
+#endif
 }
 
 void HostMemory::ClearBackingRegion(size_t physical_offset, size_t length, u32 fill_value) {

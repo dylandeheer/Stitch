@@ -1269,7 +1269,7 @@ UnswizzlePlan PlanUnswizzleImageRows(
 }
 
 void ExecuteUnswizzlePlan(Tegra::MemoryManager& gpu_memory, const UnswizzlePlan& plan,
-                         std::span<u8> output, UnswizzleTimings* timings, bool bulk_snapshot) {
+                         std::span<u8> output, UnswizzleTimings* timings, bool bulk_snapshot, bool read_backing_file) {
     using Clock = std::chrono::steady_clock;
     const auto now = [&] { return timings ? Clock::now() : Clock::time_point{}; };
     const auto elapsed = [](auto start, auto end) {
@@ -1284,7 +1284,9 @@ void ExecuteUnswizzlePlan(Tegra::MemoryManager& gpu_memory, const UnswizzlePlan&
         rusage before{}, after{};
         const bool sampled = timings && getrusage(RUSAGE_THREAD, &before) == 0;
 #endif
-        const bool bulk = bulk_snapshot && gpu_memory.TrySnapshotTextureRun(r.src_addr, run);
+        bool file_read = false;
+        const bool bulk = bulk_snapshot && gpu_memory.TrySnapshotTextureRun(
+                                               r.src_addr, run, read_backing_file ? &file_read : nullptr);
         if (!bulk) {
             gpu_memory.ReadBlockUnsafe(r.src_addr, run.data(), r.guest_bytes);
         }
@@ -1303,6 +1305,7 @@ void ExecuteUnswizzlePlan(Tegra::MemoryManager& gpu_memory, const UnswizzlePlan&
         if (timings) {
             if (bulk) {
                 timings->bulk_bytes += r.guest_bytes;
+                if (file_read) timings->file_read_bytes += r.guest_bytes;
             }
             timings->allocation_ns += elapsed(began, allocated);
             timings->read_ns += elapsed(allocated, read);

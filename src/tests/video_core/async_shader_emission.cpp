@@ -169,32 +169,34 @@ TEST_CASE("Graphics IR survives transfer to the shader worker and emits identica
     const auto producer_thread = std::this_thread::get_id();
     std::promise<void> release;
     auto released = release.get_future().share();
-    Common::ThreadWorker workers{1, "TestPipelineBuilder"};
     auto job = std::make_shared<GraphicsPrograms>();
     const auto reference = job->Emit();
     std::weak_ptr<GraphicsPrograms> lifetime = job;
     std::promise<std::array<std::vector<u32>, 2>> result;
     auto emitted = result.get_future();
     std::thread::id build_thread;
-    workers.QueueWork([job = std::move(job), released, &result, &build_thread] {
-        released.wait();
-        build_thread = std::this_thread::get_id();
-        try {
-            result.set_value(job->Emit());
-        } catch (...) {
-            result.set_exception(std::current_exception());
-        }
-    });
-    const bool held_by_worker = !lifetime.expired();
-    const bool still_pending =
-        emitted.wait_for(std::chrono::seconds{0}) != std::future_status::ready;
-    release.set_value();
-    const auto actual = emitted.get();
-    workers.WaitForRequests();
-    REQUIRE(held_by_worker);
-    REQUIRE(still_pending);
-    REQUIRE(build_thread != producer_thread);
-    REQUIRE(actual == reference);
+    {
+        Common::ThreadWorker workers{1, "TestPipelineBuilder"};
+        workers.QueueWork([job = std::move(job), released, &result, &build_thread] {
+            released.wait();
+            build_thread = std::this_thread::get_id();
+            try {
+                result.set_value(job->Emit());
+            } catch (...) {
+                result.set_exception(std::current_exception());
+            }
+        });
+        const bool held_by_worker = !lifetime.expired();
+        const bool still_pending =
+            emitted.wait_for(std::chrono::seconds{0}) != std::future_status::ready;
+        release.set_value();
+        const auto actual = emitted.get();
+        workers.WaitForRequests();
+        REQUIRE(held_by_worker);
+        REQUIRE(still_pending);
+        REQUIRE(build_thread != producer_thread);
+        REQUIRE(actual == reference);
+    } // Join the worker before checking destruction of the queued callable's captures.
     REQUIRE(lifetime.expired());
 }
 

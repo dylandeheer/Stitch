@@ -1905,6 +1905,7 @@ void RasterizerVulkan::DispatchCompute() {
                 cmdbuf.DispatchIndirect(indirect_buffer, indirect_offset);
             });
         });
+        buffer_cache.RecordEarlyCpuReads();
         SubmitNx2ListCopies();
         return;
     }
@@ -1929,6 +1930,7 @@ void RasterizerVulkan::DispatchCompute() {
             TextureCacheRuntime::CopyByteAddressedShadow(cmdbuf, *byte_addressed_shadow, true);
         }
     });
+    buffer_cache.RecordEarlyCpuReads();
     SubmitNx2ListCopies();
 
     // Log compute dispatch
@@ -2004,7 +2006,20 @@ void RasterizerVulkan::FlushGpuWrittenCommandListPages(std::span<const DAddr> pa
     buffer_cache.Nx2FlushListPages(pages);
 }
 
+void RasterizerVulkan::FlushCpuRead(const VideoCore::RasterizerDownloadArea& area) {
+    const auto size = area.end_address - area.start_address;
+    const bool early =
+        Core::EarlyBufferReadsRequested() && area.source == VideoCore::DownloadSource::Buffer &&
+        size == Core::DEVICE_PAGESIZE && !query_cache.HoldsQueries(area.start_address, size);
+    FlushRegionImpl(area.start_address, size, VideoCommon::CacheType::All, early);
+}
+
 void RasterizerVulkan::FlushRegion(DAddr addr, u64 size, VideoCommon::CacheType which) {
+    FlushRegionImpl(addr, size, which, false);
+}
+
+void RasterizerVulkan::FlushRegionImpl(DAddr addr, u64 size, VideoCommon::CacheType which,
+                                       bool early_read) {
     if (addr == 0 || size == 0) {
         return;
     }
@@ -2021,7 +2036,9 @@ void RasterizerVulkan::FlushRegion(DAddr addr, u64 size, VideoCommon::CacheType 
     }
     if ((True(which & VideoCommon::CacheType::BufferCache))) {
         std::scoped_lock lock{buffer_cache.mutex};
-        buffer_cache.DownloadMemory(addr, size);
+        if (!early_read || !buffer_cache.TryEarlyCpuRead(addr, size)) {
+            buffer_cache.DownloadMemory(addr, size);
+        }
     }
     if ((True(which & VideoCommon::CacheType::QueryCache))) {
         query_cache.FlushRegion(addr, size);
@@ -2087,6 +2104,7 @@ void RasterizerVulkan::PrepareRegionWrite(DAddr addr, u64 size, VideoCommon::Cac
         return;
     }
     std::scoped_lock lock{buffer_cache.mutex};
+    buffer_cache.OutdateEarlyCpuReads(addr, size);
     buffer_cache.ClearDownload(addr, size);
 }
 

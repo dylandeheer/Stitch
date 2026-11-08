@@ -127,7 +127,7 @@ StagingBufferRef StagingBufferPool::Request(size_t size, MemoryUsage usage, bool
     return GetStagingBuffer(size, usage, deferred);
 }
 
-void StagingBufferPool::FreeDeferred(StagingBufferRef& ref) {
+StagingBufferPool::StagingBuffer& StagingBufferPool::FindLoan(const StagingBufferRef& ref) {
     auto& entries = GetCache(ref.usage)[ref.log2_level].entries;
     const auto is_this_one = [&ref](const StagingBuffer& entry) {
         return entry.index == ref.index;
@@ -135,8 +135,27 @@ void StagingBufferPool::FreeDeferred(StagingBufferRef& ref) {
     auto it = std::find_if(entries.begin(), entries.end(), is_this_one);
     ASSERT(it != entries.end());
     ASSERT(it->deferred);
-    it->tick = scheduler.CurrentTick();
-    it->deferred = false;
+    return *it;
+}
+
+void StagingBufferPool::FreeDeferred(StagingBufferRef& ref) {
+    ReleaseLoan(ref, scheduler.CurrentTick());
+}
+
+void StagingBufferPool::ReleaseLoan(StagingBufferRef& ref, u64 last_use) {
+    auto& loan = FindLoan(ref);
+    loan.tick = last_use;
+    loan.deferred = false;
+}
+
+bool StagingBufferPool::InvalidateLoan(StagingBufferRef& ref) {
+    if (ref.host_coherent)
+        return true;
+    const auto result = FindLoan(ref).buffer.InvalidateMappedAllocation();
+    if (result == VK_ERROR_OUT_OF_HOST_MEMORY || result == VK_ERROR_OUT_OF_DEVICE_MEMORY)
+        return false;
+    vk::Check(result);
+    return true;
 }
 
 void StagingBufferPool::TickFrame() {

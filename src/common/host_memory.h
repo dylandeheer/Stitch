@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <span>
 #include <atomic>
 #include <memory>
 #include <optional>
@@ -62,6 +63,10 @@ public:
     /// it needs RAM. The contents stay; using the pages brings them back.
     void HintCold(size_t physical_offset, size_t length,
                   std::optional<size_t> virtual_offset) const;
+    // Read the live bytes of a Linux shared physical backing file into owned storage.
+    // On failure the caller must overwrite the entire output using its normal read path.
+    [[nodiscard]] bool TryReadBacking(size_t offset, std::span<u8> output) const;
+
     /// Pages the kernel hands out (cleared or not).
     void MarkUsed(size_t physical_offset, size_t length);
 

@@ -65,6 +65,8 @@ MemoryManager::MemoryManager(Core::System& system_, u64 address_space_bits_, GPU
 {}
 
 void MemoryManager::SetNativeSyncpointShim(GPUVAddr address) {
+    if (address)
+        ExcludeEarlyReadReport(address, NumShimSyncpoints * sizeof(u32));
     native_syncpoint_shim.store(address, std::memory_order_release);
 }
 
@@ -125,6 +127,13 @@ void MemoryManager::BeginMappingUpdate() {
 
 void MemoryManager::FinishMappingUpdate(GPUVAddr address, size_t size) {
     UpdateContinuousRuns(address, size);
+    if (Core::EarlyBufferReadsRequested()) {
+        constexpr auto shim_size = NumShimSyncpoints * sizeof(u32);
+        const auto shim = native_syncpoint_shim.load(std::memory_order_acquire);
+        if (shim && address < shim + shim_size && shim < address + size) {
+            ExcludeEarlyReadReport(shim, shim_size);
+        }
+    }
     std::scoped_lock lock{runs_guard};
     map_serial.fetch_add(1, std::memory_order_release);
     --mapping_writers;
@@ -312,7 +321,29 @@ std::optional<DAddr> MemoryManager::GpuToCpuAddress(GPUVAddr addr, std::size_t s
     return std::nullopt;
 }
 
+void MemoryManager::ExcludeEarlyReadReport(GPUVAddr address, size_t size) const {
+    if (!Core::EarlyBufferReadsRequested() || size == 0 || address >= address_space_size ||
+        size > address_space_size - address)
+        return;
+    const auto end = address + size;
+    for (auto addr = address; addr < end;) {
+        const auto bytes =
+            std::min<u64>(end - addr, Core::DEVICE_PAGESIZE - (addr & Core::DEVICE_PAGEMASK));
+        if (const auto device = GpuToCpuAddress(addr)) {
+            // Also blacklist the contiguous physical tail if a scalar crosses the first GPU page.
+            memory.ExcludeEarlyReadReport(*device, addr == address ? size : bytes);
+        }
+        addr += bytes;
+    }
+}
+
 bool MemoryManager::TrySnapshotTextureRun(GPUVAddr address, std::span<u8> output) const {
+    return TrySnapshotTextureRun(address, output, nullptr);
+}
+
+bool MemoryManager::TrySnapshotTextureRun(GPUVAddr address, std::span<u8> output,
+                                         bool* file_read) const {
+    if (file_read) *file_read = false;
     // MapBufferEx/Remap can change live PTEs before notifying the renderer and publishing runs.
     // A writer announces itself before its first mutation and releases this lock for callbacks.
     constexpr size_t max_copy = 4 * 1024 * 1024;
@@ -332,7 +363,7 @@ bool MemoryManager::TrySnapshotTextureRun(GPUVAddr address, std::span<u8> output
     if (address >= run.end || output.size() > run.end - address) {
         return false;
     }
-    return memory.TrySnapshotContiguous(run.device_addr + (address - begin), output);
+    return memory.TrySnapshotContiguous(run.device_addr + (address - begin), output, file_read);
 }
 
 bool MemoryManager::TryReadUniqueWords(GPUVAddr address, std::span<u32> dest, u64 generation) const {
@@ -390,16 +421,19 @@ T MemoryManager::Read(GPUVAddr addr) const {
     return {};
 }
 
-template <typename T>
-void MemoryManager::Write(GPUVAddr addr, T data) {
+template <bool report, typename T>
+void MemoryManager::WriteScalar(GPUVAddr addr, T data) {
     if (auto page_pointer{GetPointer(addr)}; page_pointer) {
-        // NOTE: Avoid adding any extra logic to this fast-path block
+        if constexpr (report)
+            memory.ExcludeEarlyReadPointer(page_pointer, sizeof(T));
         std::memcpy(page_pointer, &data, sizeof(T));
         return;
     }
     // A Switch 2 sparse block nobody wrote yet gets its memory now.
     Tegra::Nx2BackSparseWrite(addr, sizeof(T), &data);
     if (auto page_pointer{GetPointer(addr)}; page_pointer) {
+        if constexpr (report)
+            memory.ExcludeEarlyReadPointer(page_pointer, sizeof(T));
         std::memcpy(page_pointer, &data, sizeof(T));
         return;
     }
@@ -407,10 +441,22 @@ void MemoryManager::Write(GPUVAddr addr, T data) {
     ASSERT(false);
 }
 
+template <typename T>
+void MemoryManager::Write(GPUVAddr addr, T data) {
+    WriteScalar<false>(addr, data);
+}
+
+template <typename T>
+void MemoryManager::WriteReport(GPUVAddr addr, T data) {
+    WriteScalar<true>(addr, data);
+}
+
 template u8 MemoryManager::Read<u8>(GPUVAddr addr) const;
 template u16 MemoryManager::Read<u16>(GPUVAddr addr) const;
 template u32 MemoryManager::Read<u32>(GPUVAddr addr) const;
 template u64 MemoryManager::Read<u64>(GPUVAddr addr) const;
+template void MemoryManager::WriteReport<u32>(GPUVAddr addr, u32 data);
+template void MemoryManager::WriteReport<u64>(GPUVAddr addr, u64 data);
 template void MemoryManager::Write<u8>(GPUVAddr addr, u8 data);
 template void MemoryManager::Write<u16>(GPUVAddr addr, u16 data);
 template void MemoryManager::Write<u32>(GPUVAddr addr, u32 data);

@@ -98,6 +98,7 @@ void KeplerCompute::ConsumeSinkImpl(Core::System& system) {
 void KeplerCompute::ProcessNativeReportSemaphore(u32 argument) {
     const GPUVAddr address = (GPUVAddr{native_registers[0x6c0] & 0x1ffffff} << 32) |
                              native_registers[0x6c1];
+    memory_manager.ExcludeEarlyReadReport(address, 16);
     const u32 payload = native_registers[0x6c2];
     const u32 operation = argument & 3;
     const bool one_word = (argument >> 28) & 1;
@@ -113,7 +114,7 @@ void KeplerCompute::ProcessNativeReportSemaphore(u32 argument) {
     if ((argument >> 3) & 1) {
         const u32 reduction = (argument >> 9) & 7;
         rasterizer->SignalFence([this, address, payload, reduction] {
-            memory_manager.Write<u32>(address, ReduceSemaphore(reduction, false,
+            memory_manager.WriteReport<u32>(address, ReduceSemaphore(reduction, false,
                                                                memory_manager.Read<u32>(address), payload));
         });
         return;
@@ -364,13 +365,14 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                 return true;
             },
             [&](u64 address, u32 payload, u32 flags) {
+                memory_manager.ExcludeEarlyReadReport(address, 16);
                 const bool four_words = (flags >> 30) == 0;
                 if (!memory_manager.IsFullyMappedRange(address, four_words ? 16 : sizeof(payload))) return false;
                 if (flags & (1U << 26)) {
                     rasterizer->SignalFence([this, address, payload, flags] {
                         const u32 value = ReduceSemaphore((flags >> 20) & 7, (flags >> 24) & 1,
                                                           memory_manager.Read<u32>(address), payload);
-                        memory_manager.Write<u32>(address, value);
+                        memory_manager.WriteReport<u32>(address, value);
                         if (const auto device = memory_manager.GpuToCpuAddress(address)) {
                             Tegra::Nx2SemaphoreWaiters::Get().OnWrite(*device, value);
                         }
@@ -394,7 +396,7 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                     // GEQ acquires waiting forever.
                     rasterizer->SignalFence([this, address, payload] {
                         const u32 value = (std::max)(memory_manager.Read<u32>(address), payload);
-                        memory_manager.Write<u32>(address, value);
+                        memory_manager.WriteReport<u32>(address, value);
                         if (const auto device = memory_manager.GpuToCpuAddress(address)) {
                             Tegra::Nx2SemaphoreWaiters::Get().OnWrite(*device, value);
                         }

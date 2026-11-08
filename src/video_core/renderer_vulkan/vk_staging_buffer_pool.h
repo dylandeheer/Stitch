@@ -27,6 +27,7 @@ struct StagingBufferRef {
     MemoryUsage usage;
     u32 log2_level;
     u64 index;
+    bool host_coherent{};
 };
 
 class StagingBufferPool {
@@ -39,6 +40,8 @@ public:
 
     StagingBufferRef Request(size_t size, MemoryUsage usage, bool deferred = false);
     void FreeDeferred(StagingBufferRef& ref);
+    void ReleaseLoan(StagingBufferRef& ref, u64 last_use);
+    bool InvalidateLoan(StagingBufferRef& ref);
 
     [[nodiscard]] VkBuffer StreamBuf() const noexcept {
         return *stream_buffer;
@@ -51,6 +54,9 @@ private:
         size_t upper_bound;
         u64 tick;
     };
+
+    struct StagingBuffer;
+    StagingBuffer& FindLoan(const StagingBufferRef& ref);
 
     struct StagingBuffer {
         vk::Buffer buffer;
@@ -71,6 +77,7 @@ private:
                 .usage = usage,
                 .log2_level = log2_level,
                 .index = index,
+                .host_coherent = buffer.IsHostCoherent(),
             };
         }
     };

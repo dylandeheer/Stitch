@@ -837,6 +837,7 @@ public:
     void Flush() const;
 
     void Invalidate() const;
+    [[nodiscard]] VkResult InvalidateMappedAllocation() const;
 
     void SetObjectNameEXT(const char* name) const;
 

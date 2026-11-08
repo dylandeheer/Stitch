@@ -476,6 +476,42 @@ u64 BufferCacheRuntime::CurrentTick() {
     return scheduler.CurrentTick();
 }
 
+std::optional<StagingBufferRef> BufferCacheRuntime::TryEarlyStaging(size_t bytes) {
+    try {
+        return DownloadStagingBuffer(bytes, true);
+    } catch (const vk::Exception& error) {
+        if (error.GetResult() != VK_ERROR_OUT_OF_DEVICE_MEMORY &&
+            error.GetResult() != VK_ERROR_OUT_OF_HOST_MEMORY)
+            throw;
+        return std::nullopt;
+    } catch (const std::bad_alloc&) {
+        return std::nullopt;
+    }
+}
+
+u64 BufferCacheRuntime::QueueEarlyHostRead() {
+    scheduler.RequestOutsideRenderPassOperationContext();
+    scheduler.Record(HostReadBarrier);
+    return scheduler.CurrentTick();
+}
+
+bool BufferCacheRuntime::EarlyTickSubmitted(u64 tick) const {
+    return scheduler.IsSubmitted(tick);
+}
+
+u64 BufferCacheRuntime::CompletedEarlyReadTick() {
+    auto& semaphore = scheduler.GetMasterSemaphore();
+    semaphore.Refresh();
+    return semaphore.KnownGpuTick();
+}
+
+bool BufferCacheRuntime::EarlyHostReadReady(u64 tick) {
+    auto& semaphore = scheduler.GetMasterSemaphore();
+    if (!semaphore.IsFree(tick))
+        semaphore.Refresh();
+    return semaphore.IsFree(tick);
+}
+
 bool BufferCacheRuntime::IsFree(u64 tick) {
     return scheduler.IsFree(tick);
 }

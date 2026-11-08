@@ -213,6 +213,7 @@ void Puller::ProcessFenceActionMethod(DmaPusher& dma_pusher) {
 
 void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
     const auto semaphoreOperationMask = 0xF;
+    dma_pusher.memory_manager.ExcludeEarlyReadReport(regs.semaphore_address.SemaphoreAddress(), 16);
     const auto op = GpuSemaphoreOperation(regs.semaphore_trigger & semaphoreOperationMask);
     // EDEN_NX2_SEM_WATCH=<gpu address>: log every release/acquire on the 16 bytes there.
     static const GPUVAddr watch = [] {
@@ -229,6 +230,7 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
     }
     if (op == GpuSemaphoreOperation::WriteLong) {
         const GPUVAddr sequence_address{regs.semaphore_address.SemaphoreAddress()};
+        dma_pusher.memory_manager.ExcludeEarlyReadReport(sequence_address, 16);
         const u32 payload = regs.semaphore_sequence;
         // RELEASE_SIZE (bit 24) set means a 4-byte release without the timestamp; writing 16
         // bytes there clobbers the words next to it (Switch 2 packs semaphores tightly).
@@ -307,6 +309,7 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
 
 void Puller::ProcessSemaphoreRelease(DmaPusher& dma_pusher) {
     const GPUVAddr sequence_address{regs.semaphore_address.SemaphoreAddress()};
+    dma_pusher.memory_manager.ExcludeEarlyReadReport(sequence_address, 16);
     const u32 payload = regs.semaphore_release;
     OnBack([rasterizer = dma_pusher.rasterizer, sequence_address, payload] {
         rasterizer->Query(sequence_address, VideoCommon::QueryType::Payload,

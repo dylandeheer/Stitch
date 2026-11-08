@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <array>
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <string_view>
@@ -47,6 +49,132 @@ void Pause() {
 #endif
 }
 
+// All counters belong to the split front. Stop reads them after the front has stopped.
+class FrontWaitProbe {
+    using Clock = std::chrono::steady_clock;
+
+    struct Counts {
+        u64 calls{}, blocked{}, words{}, max_words{}, wait_ns{}, max_ns{}, parks{}, park_ns{};
+        std::array<u64, 6> latency{};
+    };
+
+public:
+    static constexpr size_t RingSpace = drain_site_names.size();
+
+    bool Configured() const { return configured; }
+    bool Active() const { return active; }
+
+    void Start() {
+        const char* setting = std::getenv("STITCH_SPLIT_WAIT_TRACE");
+        configured = setting && std::string_view{setting} == "1";
+        if (!configured) {
+            return;
+        }
+        const char* file = std::getenv("STITCH_SPLIT_WAIT_TRACE_FILE");
+        marker = file ? file : "";
+        Poll(true);
+    }
+
+    void Poll(bool initial = false) {
+        if (!initial && ++checks < 64) {
+            return;
+        }
+        checks = 0;
+        const auto now = Clock::now();
+        if (now < next_poll) {
+            return;
+        }
+        next_poll = now + std::chrono::milliseconds{250};
+        std::error_code error;
+        const bool requested = marker.empty() || (std::filesystem::exists(marker, error) && !error);
+        if (active && (!requested || now >= deadline)) {
+            Report(now, requested ? "complete" : "marker-off");
+        }
+        if (requested && !latched) {
+            ++window;
+            counts = {};
+            begin = now;
+            deadline = now + std::chrono::seconds{10};
+            active = true;
+            LOG_INFO(HW_GPU, "Split front wait start window={} gpu_profile={}", window,
+                     Nx2Profile::Enabled());
+        }
+        latched = requested;
+    }
+
+    void Observe(size_t site, u64 pending_words) {
+        auto& row = counts[site];
+        ++row.calls;
+        if (pending_words != 0) {
+            ++row.blocked;
+            row.words += pending_words;
+            row.max_words = (std::max)(row.max_words, pending_words);
+            current = &row;
+            wait_start = Clock::now();
+        }
+    }
+
+    void FinishWait() {
+        const auto now = Clock::now();
+        const auto ns = Elapsed(wait_start, now);
+        current->wait_ns += ns;
+        current->max_ns = (std::max)(current->max_ns, ns);
+        constexpr std::array<u64, 5> limits{2000, 10000, 50000, 250000, 1000000};
+        const auto bin = std::upper_bound(limits.begin(), limits.end(), ns) - limits.begin();
+        ++current->latency[static_cast<size_t>(bin)];
+        current = nullptr;
+        if (now >= deadline) {
+            Report(now, "complete");
+        }
+    }
+
+    void BeginPark() { park_start = Clock::now(); }
+    void FinishPark() {
+        ++current->parks;
+        current->park_ns += Elapsed(park_start, Clock::now());
+    }
+
+    void Stop() {
+        if (active) {
+            Report(Clock::now(), "stop");
+        }
+        *this = {};
+    }
+
+private:
+    static u64 Elapsed(Clock::time_point first, Clock::time_point last) {
+        return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(last - first).count());
+    }
+
+    void Report(Clock::time_point now, const char* reason) {
+        active = false;
+        LOG_INFO(HW_GPU, "Split front wait end window={} wall_ns={} reason={}", window,
+                 Elapsed(begin, now), reason);
+        for (size_t i = 0; i < counts.size(); ++i) {
+            const auto& c = counts[i];
+            if (c.calls == 0) {
+                continue;
+            }
+            LOG_INFO(HW_GPU,
+                     "Split front wait window={} site='{}' calls={} blocked={} wait_ns={} "
+                     "max_ns={} pending_words={} max_words={} parks={} park_ns={} "
+                     "bins_lt_2_10_50_250_1000us_then_ge={},{},{},{},{},{}",
+                     window, i == RingSpace ? "ring space" : drain_site_names[i], c.calls,
+                     c.blocked, c.wait_ns, c.max_ns, c.words, c.max_words, c.parks, c.park_ns,
+                     c.latency[0], c.latency[1], c.latency[2], c.latency[3], c.latency[4], c.latency[5]);
+        }
+    }
+
+    std::array<Counts, RingSpace + 1> counts{};
+    Counts* current{};
+    std::filesystem::path marker;
+    Clock::time_point next_poll{}, begin{}, deadline{}, wait_start{}, park_start{};
+    u64 window{};
+    u32 checks{};
+    bool configured{}, active{}, latched{};
+};
+
+FrontWaitProbe front_wait_probe;
 [[maybe_unused]] std::atomic<u32> g_back_thread_id{};
 
 } // Anonymous namespace
@@ -91,6 +219,9 @@ void GpuSplit::CheckOwner(const char* where) {
 GpuSplit GpuSplit::instance;
 
 void GpuSplit::MaybeStart(Core::System& system_) {
+    if (active && front_wait_probe.Configured()) {
+        front_wait_probe.Poll();
+    }
     static const char mode = [] {
         const char* value = std::getenv("EDEN_NX2_SPLIT");
         return value != nullptr ? value[0] : '2';
@@ -119,6 +250,7 @@ void GpuSplit::MaybeStart(Core::System& system_) {
         const char* value = std::getenv(name);
         return value && std::string_view{value} == "1";
     };
+    front_wait_probe.Start();
     writer_requested = enabled("STITCH_WRITER_FRONTIER");
     writer_verify = enabled("STITCH_WRITER_VERIFY");
     writer_marker = std::getenv("STITCH_WRITER_FRONTIER_FILE");
@@ -141,6 +273,7 @@ void GpuSplit::Stop() {
     wake.fetch_add(1, std::memory_order_seq_cst);
     wake.notify_one();
     back_thread.join();
+    front_wait_probe.Stop();
     active = false;
     // The split is static and outlives the emulation session. The next session's back thread
     // starts reading at 0: with the old positions kept it skipped through the new, empty ring a
@@ -184,7 +317,11 @@ u64* GpuSplit::ReserveSlow(size_t words) {
 }
 
 void GpuSplit::WaitForSpace(size_t words) {
-    if (write_position + words - consumed_cache <= RingWords) {
+    const u64 needed = write_position + words - consumed_cache;
+    if (front_wait_probe.Active()) {
+        front_wait_probe.Observe(FrontWaitProbe::RingSpace, needed > RingWords ? needed - RingWords : 0);
+    }
+    if (needed <= RingWords) {
         return;
     }
     Publish();
@@ -192,6 +329,9 @@ void GpuSplit::WaitForSpace(size_t words) {
     for (u32 spins = 0;; ++spins) {
         consumed_cache = consumed.load(std::memory_order_acquire);
         if (write_position + words - consumed_cache <= RingWords) {
+            if (front_wait_probe.Active()) {
+                front_wait_probe.FinishWait();
+            }
             return;
         }
         if (spins < 4096) {
@@ -217,6 +357,9 @@ void GpuSplit::Publish() {
 
 void GpuSplit::Drain(DrainSite site) {
     consumed_cache = consumed.load(std::memory_order_acquire);
+    if (front_wait_probe.Active()) {
+        front_wait_probe.Observe(static_cast<size_t>(site), write_position - consumed_cache);
+    }
     if (consumed_cache == write_position) {
         return;
     }
@@ -227,6 +370,9 @@ void GpuSplit::Drain(DrainSite site) {
         consumed_cache = consumed.load(std::memory_order_acquire);
         if (consumed_cache == write_position) {
             publish_every = 8;
+            if (front_wait_probe.Active()) {
+                front_wait_probe.FinishWait();
+            }
             Nx2Profile::AddDrain(site, start);
             return;
         }
@@ -357,6 +503,9 @@ void GpuSplit::RejectWriterFrontier() {
 
 bool GpuSplit::WaitFor(u64 target, DrainSite site) {
     consumed_cache = consumed.load(std::memory_order_acquire);
+    if (front_wait_probe.Active()) {
+        front_wait_probe.Observe(static_cast<size_t>(site), target > consumed_cache ? target - consumed_cache : 0);
+    }
     if (consumed_cache >= target) {
         return false;
     }
@@ -368,6 +517,9 @@ bool GpuSplit::WaitFor(u64 target, DrainSite site) {
         consumed_cache = consumed.load(std::memory_order_acquire);
         if (consumed_cache >= target) {
             wait_target.store(~u64{0}, std::memory_order_relaxed);
+            if (front_wait_probe.Active()) {
+                front_wait_probe.FinishWait();
+            }
             Nx2Profile::AddDrain(site, start);
             return true;
         }
@@ -389,7 +541,13 @@ void GpuSplit::Backoff(u32 spins, u64 target) {
     front_waiting.store(true, std::memory_order_seq_cst);
     const u32 seen = front_wake.load(std::memory_order_seq_cst);
     if (consumed.load(std::memory_order_seq_cst) < target) {
+        if (front_wait_probe.Active()) {
+            front_wait_probe.BeginPark();
+        }
         front_wake.wait(seen, std::memory_order_seq_cst);
+        if (front_wait_probe.Active()) {
+            front_wait_probe.FinishPark();
+        }
     }
     front_waiting.store(false, std::memory_order_relaxed);
 }

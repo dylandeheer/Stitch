@@ -72,7 +72,11 @@ public:
 
     [[nodiscard]] std::optional<DAddr> GpuToCpuAddress(GPUVAddr addr, std::size_t size) const;
 
+    void ExcludeEarlyReadReport(GPUVAddr address, size_t size) const;
+
+    // A non-null file_read requests a shared backing file read and receives its success.
     bool TrySnapshotTextureRun(GPUVAddr address, std::span<u8> output) const;
+    bool TrySnapshotTextureRun(GPUVAddr address, std::span<u8> output, bool* file_read) const;
 
     [[nodiscard]] u64 DeviceMappingGeneration() const { return memory.MappingGeneration(); }
 
@@ -85,6 +89,9 @@ public:
 
     template <typename T>
     void Write(GPUVAddr addr, T data);
+
+    template <typename T>
+    void WriteReport(GPUVAddr addr, T data);
 
     [[nodiscard]] u8* GetPointer(GPUVAddr addr);
     [[nodiscard]] const u8* GetPointer(GPUVAddr addr) const;
@@ -220,6 +227,9 @@ private:
     };
 
     /// Rebuilds the runs through the big pages a page table operation touched.
+    template <bool report, typename T>
+    void WriteScalar(GPUVAddr addr, T data);
+
     void BeginMappingUpdate();
     void FinishMappingUpdate(GPUVAddr address, size_t size);
     void UpdateContinuousRuns(GPUVAddr gpu_addr, size_t size);

@@ -234,6 +234,7 @@ void QueryCacheBase<Traits>::BindToChannel(s32 id) {
 template <typename Traits>
 void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type,
                                            QueryPropertiesFlags flags, u32 payload, u32 subreport) {
+    gpu_memory->ExcludeEarlyReadReport(addr, 16);
     const bool has_timestamp = True(flags & QueryPropertiesFlags::HasTimeout);
     const bool is_fence = True(flags & QueryPropertiesFlags::IsAFence);
     const auto requested_type = counter_type;
@@ -282,6 +283,8 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
     };
     u8* pointer = impl->device_memory.template GetPointer<u8>(cpu_addr);
     u8* pointer_timestamp = impl->device_memory.template GetPointer<u8>(cpu_addr + 8);
+    impl->device_memory.ExcludeEarlyReadPointer(pointer, 8);
+    impl->device_memory.ExcludeEarlyReadPointer(pointer_timestamp, 8);
     bool is_synced = (Settings::IsGPUFenceBehaviorDefault() ? !Settings::IsGPULevelHigh() : !Settings::IsGPUFenceBehaviorBalanced() && !Settings::IsGPUFenceBehaviorAccurate()) && is_fence;
     std::function<void()> operation([this, is_synced, streamer, query_base = query, query_location,
                                      pointer, pointer_timestamp, cpu_addr, addr,
@@ -634,6 +637,7 @@ bool QueryCacheBase<Traits>::SemiFlushQueryDirty(QueryCacheBase<Traits>::QueryLo
     if (True(query_base->flags & QueryFlagBits::IsFinalValueSynced) &&
         False(query_base->flags & QueryFlagBits::IsGuestSynced)) {
         auto* ptr = impl->device_memory.template GetPointer<u8>(query_base->guest_address);
+        impl->device_memory.ExcludeEarlyReadPointer(ptr, 16);
         if (True(query_base->flags & QueryFlagBits::HasTimestamp)) {
             std::memcpy(ptr, &query_base->value, sizeof(query_base->value));
         } else {

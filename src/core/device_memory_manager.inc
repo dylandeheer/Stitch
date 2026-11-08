@@ -389,6 +389,13 @@ void DeviceMemoryManager<Traits>::TrackContinuityImpl(DAddr address, VAddr virtu
 }
 template <typename Traits>
 bool DeviceMemoryManager<Traits>::TrySnapshotContiguous(DAddr address, std::span<u8> output) {
+    return TrySnapshotContiguous(address, output, nullptr);
+}
+
+template <typename Traits>
+bool DeviceMemoryManager<Traits>::TrySnapshotContiguous(DAddr address, std::span<u8> output,
+                                                      bool* file_read) {
+    if (file_read) *file_read = false;
     if (output.empty() || address >= device_as_size || output.size() > device_as_size - address) {
         return false;
     }
@@ -406,6 +413,12 @@ bool DeviceMemoryManager<Traits>::TrySnapshotContiguous(DAddr address, std::span
             return false;
         }
     }
+    if (file_read) {
+        const size_t offset = (static_cast<size_t>(first - 1) << page_bits) + (address & page_mask);
+        *file_read = device_memory_ptr->buffer.TryReadBacking(offset, output);
+        if (*file_read) return true;
+    }
+    // A short/failed read may have modified a prefix. Replace it along with the rest.
     std::memcpy(output.data(), GetPointer<u8>(address), output.size());
     return true;
 }
