@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <chrono>
+#include <filesystem>
 #include <cstdlib>
 #include <memory>
 #include <algorithm>
@@ -113,7 +114,7 @@ Scheduler::Scheduler(const Device& device_, StateTracker& state_tracker_)
       master_semaphore{std::make_unique<MasterSemaphore>(device)},
       command_pool{std::make_unique<CommandPool>(*master_semaphore, device)} {
 
-    if (Common::DkbFrameTrace::Enabled()) {
+    if (Common::DkbFrameTrace::Enabled() || MeshPerfRequested()) {
         const auto physical = device.GetPhysical();
         trace_timestamp_bits =
             physical.GetQueueFamilyProperties()[device.GetGraphicsFamily()].timestampValidBits;
@@ -273,9 +274,32 @@ void Scheduler::WaitWorker() {
     std::scoped_lock el{execution_mutex};
 }
 
+bool Scheduler::MeshPerfRequested() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_MESH_PERF");
+        return value && std::string_view{value} == "1";
+    }();
+    return enabled;
+}
+
 void Scheduler::MarkFrameEnd(u64 frame) {
-    if (Common::DkbFrameTrace::Enabled()) {
-        Record([this, frame](vk::CommandBuffer) { trace_frame_end = frame; });
+    const bool previous = MeshPerfActive();
+    bool active = previous;
+    if (MeshPerfRequested() && (frame == 1 || frame % 30 == 0)) {
+        static const char* const marker = std::getenv("EDEN_NX2_MESH_PERF_FILE");
+        std::error_code error;
+        active = !marker || std::filesystem::exists(marker, error);
+        if (frame == 1 || active != previous) {
+            LOG_INFO(Render_Vulkan, "Mesh performance sampling {} at frame {}", active, frame);
+        }
+        mesh_perf_active.store(active, std::memory_order_relaxed);
+    }
+    const bool capture = active || Common::DkbFrameTrace::Enabled();
+    if (capture || previous) {
+        Record([this, frame, capture](vk::CommandBuffer) {
+            trace_frame_end = frame;
+            trace_allow_next_frame = capture;
+        });
     }
 }
 
@@ -594,7 +618,7 @@ void Scheduler::TraceShader(u64 hash, u32 stage) {
 }
 
 void Scheduler::TraceGraphicsPipeline(const std::array<u64, 6>& hashes) {
-    if (!trace_query_pool) {
+    if (!trace_query_pool || !Common::DkbFrameTrace::Enabled()) {
         return;
     }
     Record([this, hashes](vk::CommandBuffer) {
@@ -609,7 +633,7 @@ void Scheduler::TraceGraphicsPipeline(const std::array<u64, 6>& hashes) {
 }
 
 void Scheduler::TraceComputePipeline(u64 hash) {
-    if (!trace_query_pool) {
+    if (!trace_query_pool || !Common::DkbFrameTrace::Enabled()) {
         return;
     }
     Record([this, hash](vk::CommandBuffer) {
@@ -646,6 +670,7 @@ void Scheduler::ReportWorkTimes() {
     };
     std::map<std::pair<u64, u64>, Totals> by_shaders;
     double total_ms{};
+    std::array<Totals, 3> by_kind{};
     for (u32 i = 0; i < count; ++i) {
         if (results[i * 2].available == 0 || results[i * 2 + 1].available == 0) {
             continue;
@@ -655,6 +680,9 @@ void Scheduler::ReportWorkTimes() {
                               trace_timestamp_bits)) *
                           trace_timestamp_period / 1e6;
         const WorkTrace& item = trace_work_items[i];
+        auto& kind = by_kind[static_cast<size_t>(item.kind)];
+        kind.total_ms += ms;
+        ++kind.count;
         Totals& totals = by_shaders[{item.hash, item.fragment_hash}];
         totals.total_ms += ms;
         ++totals.count;
@@ -663,6 +691,14 @@ void Scheduler::ReportWorkTimes() {
             totals.max_size = item.size;
         }
         total_ms += ms;
+    }
+    if (MeshPerfRequested()) {
+        const auto& compute = by_kind[static_cast<size_t>(WorkKind::MeshCompute)];
+        const auto& graphics = by_kind[static_cast<size_t>(WorkKind::MeshGraphics)];
+        LOG_INFO(Render_Vulkan, "Mesh GPU sample frame={} compute_ms={:.3f} chains={} "
+                 "graphics_ms={:.3f} draws={} timestamp_capacity_reached={}",
+                 trace_sample_frame, compute.total_ms, compute.count, graphics.total_ms,
+                 graphics.count, count == TraceMaxWork);
     }
     std::vector<std::pair<std::pair<u64, u64>, Totals>> sorted(by_shaders.begin(),
                                                                by_shaders.end());
@@ -836,7 +872,7 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
                 trace_gpu_pending = true;
                 trace_gpu_sampling = false;
             }
-            if (trace_query_pool && !trace_gpu_failed && !trace_gpu_pending &&
+            if (trace_allow_next_frame && trace_query_pool && !trace_gpu_failed && !trace_gpu_pending &&
                 trace_gpu_rate.Ready(std::chrono::steady_clock::now())) {
                 trace_sample_frame = trace_frame_end + 1;
                 trace_gpu_sampling = true;

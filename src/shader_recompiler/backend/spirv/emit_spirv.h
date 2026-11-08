@@ -6,6 +6,8 @@
 
 #pragma once
 
+#include <algorithm>
+#include <limits>
 #include <vector>
 
 #include "common/common_types.h"
@@ -50,11 +52,31 @@ constexpr u32 COOPERATIVE_HMMA_TEST_LANE_WORDS = 10;
 /// Mesh emulation without VK_EXT_mesh_shader. The mesh program runs as a compute shader
 /// (RuntimeInfo::mesh_as_compute) that writes one block per workgroup to a u32 storage buffer:
 /// max_vertices * vertex_lines words (vertex v, line l at v * vertex_lines + l), then
-/// max_primitives * 3 vertex indices (0 0 0 past the primitive count, a degenerate triangle).
+/// max_primitives * 3 indices (degenerate triangles past the primitive count), then one
+/// primitive_lines-word record per primitive. All three corners read the same primitive record.
 [[nodiscard]] inline u32 MeshEmulationBlockWords(const MeshInfo& mesh) {
     return mesh.max_vertices * static_cast<u32>(mesh.vertex_lines.size()) +
-           mesh.max_primitives * 3;
+           mesh.max_primitives * (3 + static_cast<u32>(mesh.primitive_lines.size()));
 }
+
+/// Scalar workgroup allocations made by DefineMesh when the program runs as compute.
+[[nodiscard]] inline u64 MeshEmulationSharedBytes(const MeshInfo& mesh, Stage stage) {
+    u64 words{(std::max)(mesh.payload_words, 1U)};
+    if (stage == Stage::Mesh) {
+        const auto bank_words = [](u32 elements, size_t lines) {
+            return ((u64{elements} + 31) / 32) * 32 * lines;
+        };
+        const u64 attributes{bank_words(mesh.max_vertices, mesh.vertex_lines.size()) +
+                             bank_words(mesh.max_primitives, mesh.primitive_lines.size())};
+        // One u32 per map byte, then the separate primitive-count word.
+        const u64 map_words{4 + u64{mesh.PrimitiveVertices()} * mesh.max_primitives};
+        words += (std::max)(attributes, u64{1}) + map_words + 1;
+    }
+    return words * sizeof(u32);
+}
+
+/// Can the pulling vertex shader represent these per-primitive attributes at ordinary locations?
+[[nodiscard]] bool CanEmulatePrimitiveOutputs(const MeshInfo& mesh);
 
 /// Vertex shader drawing the emulation's output as a triangle list of
 /// groups * max_primitives * 3 vertices, with the mesh program's vertex outputs. With a task
@@ -63,6 +85,24 @@ constexpr u32 COOPERATIVE_HMMA_TEST_LANE_WORDS = 10;
                                                        const MeshInfo& mesh, u32 binding,
                                                        u32 args_binding, bool convert_depth);
 
+constexpr u32 MESH_EMULATION_TASK_SEARCH_STEPS = 17;
+
+/// Bound the direct dispatch and its per-group staging buffer before allocating either.
+[[nodiscard]] constexpr u32 MaxMeshEmulationInputGroups(bool has_task, u64 bytes_per_group,
+                                                        u32 max_dispatch_x, u64 max_storage_range) {
+    // StagingBufferPool sizes its backing allocation from a u32 byte count.
+    const u64 max_range{(std::min)(max_storage_range, u64{(std::numeric_limits<u32>::max)()})};
+    const u32 lookup_limit{has_task ? 1U << MESH_EMULATION_TASK_SEARCH_STEPS : max_dispatch_x};
+    return bytes_per_group == 0 ? 0
+                                : static_cast<u32>(std::min<u64>(
+                                      {max_dispatch_x, lookup_limit, max_range / bytes_per_group}));
+}
+
+struct MeshEmulationArenaUsage {
+    u32 requested_words;
+    u32 largest_rejected_dispatch;
+};
+
 /// Mesh emulation with a task program: push constants of the distribution pass.
 struct MeshEmulationDistributionConstants {
     u32 tasks;              ///< task workgroups of the draw
@@ -70,6 +110,7 @@ struct MeshEmulationDistributionConstants {
     u32 capacity_words;     ///< words of the output arena
     u32 block_words;        ///< output words per mesh workgroup
     u32 vertices_per_group; ///< draw vertices per mesh workgroup
+    u32 max_dispatch_x;     ///< device limit for the generated vkCmdDispatchIndirect
 };
 /// Words of the distribution's argument buffer: vkCmdDispatchIndirect at 0, the mesh workgroups
 /// the tasks asked for at 3, vkCmdDrawIndirect at MESH_EMULATION_DRAW_ARGS_OFFSET, then the

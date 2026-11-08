@@ -12,14 +12,15 @@
 #include <cstddef>
 #include <deque>
 #include <filesystem>
-#include <unordered_map>
-#include <unordered_set>
+#include <iosfwd>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <type_traits>
-#include "common/container/unordered_map.h"
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
+#include "common/container/unordered_map.h"
 
 #include "common/common_types.h"
 #include "common/thread_worker.h"
@@ -54,6 +55,12 @@ class ShaderNotify;
 namespace Vulkan {
 
 using Maxwell = Tegra::Engines::Maxwell3D::Regs;
+
+/// Read a fixed-state compatible graphics key once, irrespective of its guest shader stages.
+[[nodiscard]] std::optional<u64> ReadCachedGraphicsKey(std::istream& file,
+                                                       GraphicsPipelineCacheKey& key,
+                                                       const DynamicFeatures& dynamic_features,
+                                                       std::unordered_set<u64>& known_keys);
 
 struct ComputePipelineCacheKey {
     u64 unique_hash;

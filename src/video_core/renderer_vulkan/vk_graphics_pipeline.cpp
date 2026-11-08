@@ -853,9 +853,16 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
         // triangles the draw then reads; both use the descriptor set committed here.
         scheduler.RequestOutsideRenderPassOperationContext();
         if (!IsBuilt()) {
-            scheduler.Record([this](vk::CommandBuffer) { build->Wait(!worker_only_build); });
+            scheduler.Record([this](vk::CommandBuffer) {
+                const auto begin = std::chrono::steady_clock::now();
+                build->Wait(!worker_only_build);
+                hold_time_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                           std::chrono::steady_clock::now() - begin)
+                                           .count(),
+                                       std::memory_order::relaxed);
+            });
         }
-        scheduler.Record([this, descriptor_data, groups = mesh_groups, capacity = mesh_capacity,
+        auto dispatch = [this, descriptor_data, groups = mesh_groups, capacity = mesh_capacity,
                           task_buffers = mesh_task_buffers,
                           rescaling_data = rescaling.Data(), is_rescaling = texture_cache.IsRescaling(),
                           uses_render_area = render_area.uses_render_area,
@@ -954,6 +961,7 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
                 .capacity_words = capacity,
                 .block_words = mesh_emulation->block_words,
                 .vertices_per_group = mesh_emulation->max_primitives * 3,
+                .max_dispatch_x = device.GetMaxComputeWorkGroupCount()[0],
             };
             cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *distribution_pipeline);
             cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *distribution_layout, 0,
@@ -975,7 +983,16 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
             memory_barrier(VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                            VK_PIPELINE_STAGE_VERTEX_SHADER_BIT);
-        });
+        };
+        if (mesh_groups && scheduler.MeshPerfActive()) {
+            const u64 mesh_hash = key.unique_hashes[mesh_emulation->mesh_stage + 1];
+            scheduler.Record([this, dispatch, groups = mesh_groups, mesh_hash](vk::CommandBuffer cmdbuf) {
+                scheduler.TraceGpuWork(cmdbuf, mesh_hash, 0, {groups, 1, 1}, [&] { dispatch(cmdbuf); },
+                                       Scheduler::WorkKind::MeshCompute);
+            });
+        } else {
+            scheduler.Record(std::move(dispatch));
+        }
     }
     scheduler.RequestRenderpass(texture_cache.GetFramebuffer());
     if (writes_storage) {

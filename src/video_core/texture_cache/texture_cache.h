@@ -7,15 +7,21 @@
 #pragma once
 
 #include <algorithm>
+#include <chrono>
 #include <numeric>
 #include <cstdlib>
+#include <filesystem>
 #include <limits>
 #include <map>
 #include <vector>
 #include <optional>
 #include <bit>
 #include <string>
+#include <string_view>
 #include <utility>
+#ifdef __linux__
+#include <sys/resource.h>
+#endif
 #include "common/container/unordered_map.h"
 #include <boost/container/small_vector.hpp>
 
@@ -28,6 +34,7 @@
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/guest_memory.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
+#include "video_core/texture_cache/alias_copy.h"
 #include "video_core/texture_cache/image_view_base.h"
 #include "video_core/texture_cache/conversion.h"
 #include "video_core/texture_cache/samples_helper.h"
@@ -43,6 +50,14 @@ namespace VideoCommon {
 /// EDEN_NATIVE_DRAW_DIAGNOSTICS is read once: getenv scans the whole environment block on Windows.
 [[nodiscard]] inline bool NativeDrawDiagnostics() {
     static const bool enabled = std::getenv("EDEN_NATIVE_DRAW_DIAGNOSTICS") != nullptr;
+    return enabled;
+}
+
+[[nodiscard]] inline bool TextureUploadTimings() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_UPLOAD_TIMING");
+        return value && std::string_view{value} == "1";
+    }();
     return enabled;
 }
 
@@ -137,15 +152,81 @@ TextureCache<P>::TextureCache(Runtime& runtime_, Tegra::MaxwellDeviceMemoryManag
 
 template <class P>
 void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
+    const bool time_collector = TextureUploadTimings();
+    const auto collector_begin = time_collector ? std::chrono::steady_clock::now()
+                                               : std::chrono::steady_clock::time_point{};
+    const u64 memory_before = total_used_memory;
+    SCOPE_EXIT {
+        if (time_collector) {
+            const double ms = std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() - collector_begin).count();
+            if (ms >= 2.0) {
+                LOG_INFO(HW_GPU,
+                         "Texture collector host wall: frame={} ms={:.3f} usage={} -> {} MiB "
+                         "expected={} critical={} MiB allocation_failure={}",
+                         frame_tick, ms, memory_before >> 20, total_used_memory >> 20,
+                         expected_memory >> 20, critical_memory >> 20, out_of_memory);
+            }
+        }
+    };
     bool high_priority_mode = false;
     bool aggressive_mode = false;
     bool evict_old_costly = false;
     u64 ticks_to_destroy = 0;
     size_t num_iterations = 0;
+    // Port of Lichii #376: retain download buffers until one wait completes the batch.
+    using Map = decltype(runtime.DownloadStagingBuffer(size_t{}));
+    using Copies = decltype(FullDownloadCopies(std::declval<const ImageInfo&>()));
+    struct PendingDownload {
+        ImageId image_id;
+        Map map;
+        Copies copies;
+    };
+    boost::container::small_vector<PendingDownload, 16> pending;
+    size_t pending_bytes = 0;
+    u64 pending_freed = 0;
+    static const char* const baseline_file = std::getenv("EDEN_NX2_TC_GC_BASELINE_FILE");
+    static u32 baseline_checks{};
+    static bool baseline{};
+    if (baseline_file && (baseline_checks++ % 64) == 0) {
+        baseline = std::filesystem::exists(baseline_file);
+    }
+    // Failed allocations retain the immediate reclamation path.
+    const bool batch_downloads = !out_of_memory && !baseline;
+    const auto used_memory = [&] {
+        return total_used_memory - (std::min)(total_used_memory, pending_freed);
+    };
+    const auto Evict = [this](ImageId image_id) {
+        auto& image = slot_images[image_id];
+        if (True(image.flags & ImageFlagBits::Tracked)) {
+            UntrackImage(image, image_id);
+        }
+        ++(True(image.flags & ImageFlagBits::CostlyLoad) ? gc_costly_deletes : gc_deletes);
+        UnregisterImage(image_id);
+        DeleteImage(image_id, image.scale_tick > frame_tick + 5);
+    };
+    const auto FlushPending = [&] {
+        if (pending.empty()) {
+            return;
+        }
+        runtime.Finish();
+        ++gc_download_waits;
+        for (PendingDownload& entry : pending) {
+            Image& image = slot_images[entry.image_id];
+            SwizzleImage(*gpu_memory, image.gpu_addr, image.info, entry.copies,
+                         entry.map.mapped_span, swizzle_data_buffer);
+            runtime.FreeDeferredStagingBuffer(entry.map);
+            ++gc_download_deletes;
+            Evict(entry.image_id);
+        }
+        pending.clear();
+        pending_bytes = 0;
+        pending_freed = 0;
+    };
     const auto Configure = [&](bool allow_aggressive) {
-        high_priority_mode = out_of_memory || total_used_memory >= expected_memory;
+        high_priority_mode = out_of_memory || used_memory() >= expected_memory;
         aggressive_mode =
-            allow_aggressive && (out_of_memory || total_used_memory >= critical_memory);
+            allow_aggressive && (out_of_memory || used_memory() >= critical_memory);
         ticks_to_destroy = aggressive_mode ? 10ULL : high_priority_mode ? 25ULL : 50ULL;
         // EDEN_NX2_TC_MIN_AGE=<frames>: never evict images used more recently (thrash tests).
         static const u64 min_age = [] {
@@ -155,10 +236,14 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
         ticks_to_destroy = (std::max)(ticks_to_destroy, min_age);
         num_iterations = aggressive_mode ? 40 : (high_priority_mode ? 20 : 10);
     };
-    const auto Cleanup = [this, &num_iterations, &high_priority_mode, &aggressive_mode,
-                          &evict_old_costly, out_of_memory](ImageId image_id) {
+    const auto Cleanup = [&](ImageId image_id) {
         if (num_iterations == 0) {
             return true;
+        }
+        if (std::ranges::any_of(pending, [image_id](const PendingDownload& entry) {
+                return entry.image_id == image_id;
+            })) {
+            return false;
         }
         --num_iterations;
         auto& image = slot_images[image_id];
@@ -171,26 +256,38 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
             return false;
         }
         if (must_download) {
-            auto map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes);
-            const auto copies = FullDownloadCopies(image.info);
+            constexpr size_t MaxBatchBytes = 64_MiB;
+            if (batch_downloads && !pending.empty() &&
+                image.unswizzled_size_bytes > MaxBatchBytes -
+                    (std::min)(pending_bytes, MaxBatchBytes)) {
+                return false;
+            }
+            auto map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes, batch_downloads);
+            auto copies = FullDownloadCopies(image.info);
             image.DownloadMemory(map, copies);
-            runtime.Finish();
-            SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, map.mapped_span, swizzle_data_buffer);
-            ++gc_download_deletes;
+            if (batch_downloads) {
+                pending_bytes += image.unswizzled_size_bytes;
+                pending_freed += (image.HasScaled() ? GetScaledImageSizeBytes(image) : 0) +
+                                 ImageMemoryBytes(image);
+                pending.push_back(PendingDownload{image_id, map, std::move(copies)});
+            } else {
+                runtime.Finish();
+                ++gc_download_waits;
+                SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, map.mapped_span,
+                             swizzle_data_buffer);
+                ++gc_download_deletes;
+                Evict(image_id);
+            }
+        } else {
+            Evict(image_id);
         }
-        if (True(image.flags & ImageFlagBits::Tracked)) {
-            UntrackImage(image, image_id);
-        }
-        ++(True(image.flags & ImageFlagBits::CostlyLoad) ? gc_costly_deletes : gc_deletes);
-        UnregisterImage(image_id);
-        DeleteImage(image_id, image.scale_tick > frame_tick + 5);
         if (out_of_memory) {
             return false;
         }
-        if (aggressive_mode && total_used_memory < critical_memory) {
+        if (aggressive_mode && used_memory() < critical_memory) {
             num_iterations >>= 2;
             aggressive_mode = false;
-        } else if (high_priority_mode && total_used_memory < expected_memory) {
+        } else if (high_priority_mode && used_memory() < expected_memory) {
             num_iterations >>= 1;
             high_priority_mode = false;
         }
@@ -207,6 +304,11 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
             std::vector<ImageId> candidates;
             const size_t limit = num_iterations * 8;
             lru_cache.ForEachItemBelow(frame_tick - ticks_to_destroy, [&](ImageId image_id) {
+                if (std::ranges::any_of(pending, [image_id](const PendingDownload& entry) {
+                        return entry.image_id == image_id;
+                    })) {
+                    return false;
+                }
                 candidates.push_back(image_id);
                 return candidates.size() >= limit;
             });
@@ -258,10 +360,11 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
         evict_old_costly = false;
     }
     Collect();
-    if (out_of_memory || total_used_memory >= critical_memory) {
+    if (out_of_memory || used_memory() >= critical_memory) {
         Configure(true);
         Collect();
     }
+    FlushPending();
 }
 
 template <class P>
@@ -435,12 +538,15 @@ void TextureCache<P>::TickFrame() {
         if constexpr (requires { runtime.LogMemoryStatistics(); }) {
             runtime.LogMemoryStatistics();
         }
-        LOG_INFO(HW_GPU, "Texture cache last 600 frames: created {} images, deleted {} (collector {}, {} costly, {} downloaded), {} async decodes, ASTC {} opaque / {} alpha",
+        LOG_INFO(HW_GPU, "Texture cache last 600 frames: created {} images, deleted {} (collector {}, {} costly, {} downloaded in {} GPU waits), {} async decodes, ASTC {} opaque / {} alpha",
                  images_created, images_deleted, gc_deletes + gc_costly_deletes, gc_costly_deletes,
-                 gc_download_deletes,
+                 gc_download_deletes, gc_download_waits,
                  async_decodes_queued, astc_opaque_images, astc_alpha_images);
         LOG_INFO(HW_GPU, "Texture cache last 600 frames: {} uploads from guest memory, {} MiB (largest {} MiB, {} by layer)",
                  images_uploaded, uploaded_bytes >> 20, largest_upload >> 20, layer_uploads);
+        LOG_INFO(HW_GPU, "Texture cache last 600 frames: {} initial uploads avoided by full alias copies ({} guest bytes)",
+                 join_uploads_avoided, join_upload_bytes_avoided);
+        join_uploads_avoided = join_upload_bytes_avoided = 0;
         images_uploaded = uploaded_bytes = largest_upload = layer_uploads = 0;
         astc_opaque_images = astc_alpha_images = 0;
         std::vector<std::pair<u32, u64>> shapes;
@@ -456,7 +562,8 @@ void TextureCache<P>::TickFrame() {
         created_shapes.clear();
         // The per-image and per-shape tallies only feed debug lines: skip them while those are off.
         debug_stats = Common::Log::IsLevelEnabled(Common::Log::Class::HW_GPU, Common::Log::Level::Debug);
-        gc_deletes = gc_costly_deletes = gc_download_deletes = async_decodes_queued = 0;
+        gc_deletes = gc_costly_deletes = gc_download_deletes = gc_download_waits = 0;
+        async_decodes_queued = 0;
         images_created = images_deleted = 0;
     }
     // An image that could not be made at all: the driver is out of memory whatever the counts
@@ -1766,6 +1873,45 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
         // Only upload modified images
         return;
     }
+    const bool time_upload = TextureUploadTimings();
+    const auto upload_begin = time_upload ? std::chrono::steady_clock::now()
+                                         : std::chrono::steady_clock::time_point{};
+    const auto upload_flags = image.flags;
+#ifdef __linux__
+    rusage upload_faults_before{};
+    const bool have_upload_faults =
+        time_upload && getrusage(RUSAGE_THREAD, &upload_faults_before) == 0;
+#endif
+    SCOPE_EXIT {
+        if (time_upload) {
+            const double ms = std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() - upload_begin).count();
+            if (ms >= 2.0) {
+#ifdef __linux__
+                rusage faults_after{};
+                const bool have_fault_delta =
+                    have_upload_faults && getrusage(RUSAGE_THREAD, &faults_after) == 0;
+#endif
+                LOG_INFO(HW_GPU,
+                         "Texture upload host wall: frame={} ms={:.3f} footprint_bytes={} size={}x{}x{} "
+                         "levels={} layers={} type={} format={} flags={:#x}",
+                         frame_tick, ms, image.guest_size_bytes, image.info.size.width,
+                         image.info.size.height, image.info.size.depth, image.info.resources.levels,
+                         image.info.resources.layers, static_cast<u32>(image.info.type),
+                         static_cast<u32>(image.info.format), static_cast<u32>(upload_flags));
+#ifdef __linux__
+                if (have_fault_delta) {
+                    LOG_INFO(HW_GPU,
+                             "Texture upload faults: frame={} guest_address={:#x} "
+                             "device_address={:#x} footprint_bytes={} minor={} major={}",
+                             frame_tick, image.gpu_addr, image.cpu_addr, image.guest_size_bytes,
+                             faults_after.ru_minflt - upload_faults_before.ru_minflt,
+                             faults_after.ru_majflt - upload_faults_before.ru_majflt);
+                }
+#endif
+            }
+        }
+    };
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::TextureUpload};
 
     image.flags &= ~ImageFlagBits::CpuModified;
@@ -2821,11 +2967,24 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             return false;
         }
     };
+    static const char* const baseline_file = std::getenv("EDEN_NX2_JOIN_UPLOAD_BASELINE_FILE");
+    if (baseline_file && (join_baseline_checks++ % 64) == 0) {
+        std::error_code error;
+        const bool requested = std::filesystem::exists(baseline_file, error) || error;
+        if (join_baseline_checks == 1 || requested != join_upload_baseline) {
+            LOG_INFO(HW_GPU, "Texture join upload mode: {}", requested ? "baseline" : "full alias copy");
+        }
+        join_upload_baseline = requested;
+    }
+    // Lichii #288: on a newly allocated, unscaled image, the first live alias copy may supply
+    // every texel. Decide immediately before that copy so it cannot be invalidated in between.
+    bool upload_pending = !join_upload_baseline && Tegra::g_nx2_ampere.load(std::memory_order_relaxed) &&
+                          !can_rescale && new_info.type == ImageType::e2D && !join_copies_to_do.empty();
     if (overwritten_by_clear()) {
         // Stays CpuModified: UpdateRenderTargets' PrepareImage drops the upload only when
         // IsFullClear agrees the clear covers the whole image, and uploads it otherwise.
         runtime.TransitionImageLayout(new_image);
-    } else {
+    } else if (!upload_pending) {
         // TODO: Only upload what we need
         RefreshContents(new_image, new_image_id);
     }
@@ -2889,9 +3048,25 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
                 continue;
             }
             const AliasedImage& aliased = new_image.aliased_images[alias_pointer->second];
+            if (upload_pending) {
+                upload_pending = false;
+                if (AliasCopyReplacesUpload(new_image, overlap, aliased.copies)) {
+                    new_image.flags &= ~ImageFlagBits::CpuModified;
+                    TrackImage(new_image, new_image_id);
+                    runtime.TransitionImageLayout(new_image);
+                    ++join_uploads_avoided;
+                    join_upload_bytes_avoided += new_image.guest_size_bytes;
+                } else {
+                    RefreshContents(new_image, new_image_id);
+                }
+            }
             CopyImage(new_image_id, aliased.id, aliased.copies);
             new_image.modification_tick = overlap.modification_tick;
             continue;
+        }
+        if (upload_pending) {
+            upload_pending = false;
+            RefreshContents(new_image, new_image_id);
         }
         if (True(overlap.flags & ImageFlagBits::GpuModified)) {
             new_image.flags |= ImageFlagBits::GpuModified;
@@ -2914,6 +3089,10 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         DeleteImage(copy_object.id);
     }
 
+    if (upload_pending) {
+        // All queued aliases were rejected.
+        RefreshContents(new_image, new_image_id);
+    }
     RegisterImage(new_image_id);
     return new_image_id;
 }

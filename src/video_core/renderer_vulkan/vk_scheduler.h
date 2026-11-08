@@ -7,6 +7,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -79,6 +80,11 @@ public:
     /// safe to touch worker resources.
     void WaitWorker();
 
+    static bool MeshPerfRequested();
+    [[nodiscard]] bool MeshPerfActive() const {
+        return mesh_perf_active.load(std::memory_order_relaxed);
+    }
+    enum class WorkKind { Guest, MeshCompute, MeshGraphics };
     void MarkFrameEnd(u64 frame);
     void TraceGraphicsPipeline(const std::array<u64, 6>& hashes);
     void TraceComputePipeline(u64 hash);
@@ -86,13 +92,14 @@ public:
     /// submission. A draw passes its vertex and fragment hashes, a dispatch its compute hash.
     template <typename Func>
     void TraceGpuWork(vk::CommandBuffer cmdbuf, u64 hash, u64 fragment_hash,
-                      std::array<u32, 3> size, Func&& work) {
-        if (!trace_gpu_recording || !trace_work_pool || trace_work_count == TraceMaxWork) {
+                      std::array<u32, 3> size, Func&& work, WorkKind kind = WorkKind::Guest) {
+        if (!trace_gpu_recording || !trace_work_pool || trace_work_count == TraceMaxWork ||
+            (kind == WorkKind::Guest && !Common::DkbFrameTrace::Enabled())) {
             work();
             return;
         }
         const u32 query = trace_work_count * 2;
-        trace_work_items[trace_work_count++] = {hash, fragment_hash, size};
+        trace_work_items[trace_work_count++] = {hash, fragment_hash, size, kind};
         cmdbuf.WriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, *trace_work_pool, query);
         work();
         cmdbuf.WriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, *trace_work_pool, query + 1);
@@ -474,6 +481,7 @@ private:
         u64 fragment_hash{};
         /// Dispatch grid, or vertex and instance counts of a draw; zero when indirect.
         std::array<u32, 3> size{};
+        WorkKind kind{};
     };
     vk::QueryPool trace_work_pool;
     std::vector<WorkTrace> trace_work_items;
@@ -486,6 +494,8 @@ private:
     u64 trace_gpu_skipped{};
     u32 trace_timestamp_bits{};
     float trace_timestamp_period{};
+    std::atomic<bool> mesh_perf_active{}; ///< Set at presentation, read by the GPU recording thread.
+    bool trace_allow_next_frame{};      ///< Worker thread, ordered with the presentation marker.
     bool trace_gpu_recording{};
     bool trace_gpu_sampling{};
     bool trace_gpu_pending{};

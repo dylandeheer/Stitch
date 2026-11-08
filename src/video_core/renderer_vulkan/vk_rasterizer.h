@@ -8,6 +8,7 @@
 
 #include <array>
 #include <optional>
+#include <map>
 #include <string_view>
 
 #include <boost/container/static_vector.hpp>
@@ -275,6 +276,16 @@ private:
     boost::container::static_vector<VkSampler, MAX_TEXTURES> sampler_handles;
 
     u32 draw_counter = 0;
+    struct MeshPerfStats {
+        u64 draws{};
+        u64 input_groups{};
+        u32 max_vertices{};
+        u32 max_primitives{};
+        u32 vertex_lines{};
+        u32 primitive_lines{};
+    };
+    std::map<std::array<u64, 3>, MeshPerfStats> mesh_perf_programs;
+    u32 mesh_perf_frames{};
     u64 render_trace_frame = 0;
     u32 render_trace_draws = 0;
     u32 render_trace_clears = 0;
@@ -323,6 +334,14 @@ private:
     std::vector<MeshArena> mesh_arenas;
     size_t mesh_arena_current{~size_t{}};
     u64 mesh_arena_size{64ULL << 20};
+    u64 mesh_empty_bypassed{};
+    u64 mesh_empty_blocked{};
+    std::array<u64, 10> mesh_empty_blockers{};
+    u32 mesh_empty_mode_checks{};
+    bool mesh_empty_use_baseline{};
+    bool mesh_warned_direct_limit{};
+    bool mesh_warned_indirect_limit{};
+    bool mesh_warned_arena_limit{};
     /// The current submission's arena, after its counter is reset.
     const MeshArena& AcquireMeshArena();
 

@@ -42,6 +42,9 @@ public:
 
     void Barriers(bool is_prebarrier);
 
+    /// Whether an empty draw can begin its next samples query without changing render passes.
+    [[nodiscard]] bool CanBeginSamplesQueryInPass() const;
+
     void EndHostConditionalRendering();
 
     void PauseHostConditionalRendering();

@@ -95,6 +95,7 @@ struct MeshEmulationSetup {
     // Output layout, for the readback diagnostics.
     u32 max_vertices{};
     u32 vertex_lines{};
+    u32 primitive_lines{};
     std::array<u32, 4> position_lines{~0U, ~0U, ~0U, ~0U}; ///< line of PositionX..W
 };
 

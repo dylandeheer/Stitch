@@ -926,6 +926,43 @@ ComputePipeline* PipelineCache::CurrentComputePipeline() {
                      kepler_compute->regs.code_loc.Address() + qmd.program_start, key);
 }
 
+std::optional<u64> ReadCachedGraphicsKey(std::istream& file, GraphicsPipelineCacheKey& key,
+                                         const DynamicFeatures& dynamic_features,
+                                         std::unordered_set<u64>& known_keys) {
+    if (!file.read(reinterpret_cast<char*>(&key), sizeof(key))) {
+        return std::nullopt;
+    }
+    // The stored stages are guest programs. Their translation chooses native mesh or compute
+    // emulation on this device; only incompatible fixed state excludes a key at this point.
+    if ((key.state.extended_dynamic_state != 0) != dynamic_features.has_extended_dynamic_state ||
+        (key.state.extended_dynamic_state_2 != 0) !=
+            dynamic_features.has_extended_dynamic_state_2 ||
+        (key.state.extended_dynamic_state_2_logic_op != 0) !=
+            dynamic_features.has_extended_dynamic_state_2_logic_op ||
+        (key.state.extended_dynamic_state_3_blend != 0) !=
+            dynamic_features.has_extended_dynamic_state_3_blend ||
+        (key.state.extended_dynamic_state_3_enables != 0) !=
+            dynamic_features.has_extended_dynamic_state_3_enables ||
+        (key.state.color_write_enable_dynamic != 0) != dynamic_features.has_color_write_enable ||
+        (key.state.dynamic_vertex_input != 0) != dynamic_features.has_dynamic_vertex_input) {
+        return std::nullopt;
+    }
+
+    const bool key_requests_provoking_last = key.state.provoking_vertex_last != 0;
+    if (key_requests_provoking_last && !dynamic_features.has_provoking_vertex_last_mode) {
+        return std::nullopt;
+    }
+
+    const bool key_uses_transform_feedback = key.state.xfb_enabled != 0;
+    if (key_uses_transform_feedback && key_requests_provoking_last &&
+        !dynamic_features.has_provoking_vertex_tf_preserve) {
+        return std::nullopt;
+    }
+
+    const u64 hash{key.Hash()};
+    return known_keys.insert(hash).second ? std::optional{hash} : std::nullopt;
+}
+
 void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading,
                                       const VideoCore::DiskResourceLoadCallback& callback) {
     if (title_id == 0) {
@@ -979,6 +1016,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         std::mutex mutex;
         size_t total{};
         size_t built{};
+        size_t emulated_mesh_built{};
         bool has_loaded{};
         std::unique_ptr<PipelineStatistics> statistics;
     } state;
@@ -1021,51 +1059,13 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     }};
     const auto load_graphics{[&](std::ifstream& file, std::vector<FileEnvironment> envs) {
         GraphicsPipelineCacheKey key;
-        file.read(reinterpret_cast<char*>(&key), sizeof(key));
-
-        if (!device.IsExtMeshShaderSupported() &&
-            std::ranges::any_of(envs, [](const FileEnvironment& env) {
-                return env.ShaderStage() == Shader::Stage::Task ||
-                       env.ShaderStage() == Shader::Stage::Mesh;
-            })) {
-            return;
-        }
-
-        if ((key.state.extended_dynamic_state != 0) !=
-                dynamic_features.has_extended_dynamic_state ||
-            (key.state.extended_dynamic_state_2 != 0) !=
-                dynamic_features.has_extended_dynamic_state_2 ||
-            (key.state.extended_dynamic_state_2_logic_op != 0) !=
-                dynamic_features.has_extended_dynamic_state_2_logic_op ||
-            (key.state.extended_dynamic_state_3_blend != 0) !=
-                dynamic_features.has_extended_dynamic_state_3_blend ||
-            (key.state.extended_dynamic_state_3_enables != 0) !=
-                dynamic_features.has_extended_dynamic_state_3_enables ||
-            (key.state.color_write_enable_dynamic != 0) !=
-                dynamic_features.has_color_write_enable ||
-            (key.state.dynamic_vertex_input != 0) !=
-                dynamic_features.has_dynamic_vertex_input) {
-            return;
-        }
-
-        const bool key_requests_provoking_last = key.state.provoking_vertex_last != 0;
-        if (key_requests_provoking_last && !dynamic_features.has_provoking_vertex_last_mode) {
-            return;
-        }
-
-        const bool key_uses_transform_feedback = key.state.xfb_enabled != 0;
-        if (key_uses_transform_feedback && key_requests_provoking_last &&
-            !dynamic_features.has_provoking_vertex_tf_preserve) {
-            return;
-        }
-
-        const u64 hash = key.Hash();
-        if (!disk_pipelines.insert(hash).second) {
+        const auto hash{ReadCachedGraphicsKey(file, key, dynamic_features, disk_pipelines)};
+        if (!hash) {
             return;
         }
         if (!PreloadAllPipelines() &&
             (used_pipelines.empty() ? queued_graphics >= MaxPipelinesWithoutUsedList
-                                    : !used_pipelines.contains(hash))) {
+                                    : !used_pipelines.contains(*hash))) {
             ++skipped_pipelines;
             size_t capture_bytes = (envs.capacity() - envs.size()) * sizeof(FileEnvironment);
             for (const auto& env : envs) {
@@ -1104,6 +1104,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
 
             std::scoped_lock lock{state.mutex};
             if (pipeline) {
+                state.emulated_mesh_built += pipeline->IsEmulatedMesh() && !pipeline->Failed();
                 graphics_cache.emplace(key, std::move(pipeline));
             }
             ++state.built;
@@ -1135,6 +1136,10 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     lock.unlock();
 
     workers.WaitForRequests(stop_loading);
+    if (state.emulated_mesh_built != 0) {
+        LOG_INFO(Render_Vulkan, "Built {} cached mesh emulation pipelines at boot",
+                 state.emulated_mesh_built);
+    }
 
     if (use_vulkan_pipeline_cache) {
         SerializeVulkanPipelineCache(vulkan_pipeline_cache_filename, vulkan_pipeline_cache,
@@ -1538,18 +1543,16 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             }
             return nullptr;
         }
-        // Without VK_EXT_mesh_shader the driver cannot build a task/mesh pipeline; the draw is
-        // skipped (see the pipeline check in the rasterizer). The stages are still translated
-        // so the skipped pipeline's needs can be reported below.
+        // Without VK_EXT_mesh_shader, translate the stages so eligible draws can use the
+        // compute fallback and unsupported pipelines can report what they need below.
         if ((env.ShaderStage() == Shader::Stage::Task ||
              env.ShaderStage() == Shader::Stage::Mesh) &&
             !device.IsExtMeshShaderSupported()) {
             static std::atomic<bool> logged{};
             if (!logged.exchange(true, std::memory_order_relaxed)) {
                 LOG_WARNING(Render_Vulkan,
-                            "{} has no VK_EXT_mesh_shader: pipelines with task/mesh shaders are "
-                            "skipped, so the geometry they draw (such as foliage and props) will "
-                            "be missing",
+                            "{} has no active VK_EXT_mesh_shader: eligible task/mesh draws use "
+                            "compute emulation",
                             device.GetModelName());
             }
             mesh_unsupported = true;
@@ -1581,7 +1584,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         }
     }
     // Mesh emulation without VK_EXT_mesh_shader (prototype): a mesh program, after an optional
-    // task program, drawing triangles without per-primitive outputs, before a pixel program only.
+    // task program, drawing triangles before a pixel program only.
     // EDEN_NX2_NO_MESH_EMULATION=1 turns it off, EDEN_NX2_NO_TASK_EMULATION=1 only with a task.
     std::optional<MeshEmulationSetup> mesh_emulation;
     size_t mesh_index{};
@@ -1600,7 +1603,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         bool eligible{!disabled && !(has_task && task_disabled) && mesh_index != 0 &&
                       (mesh_index == 1 || has_task) && layer_source_program == nullptr};
         const Shader::IR::Program& mesh{programs[mesh_index]};
-        eligible = eligible && mesh.mesh.topology == 4 && mesh.mesh.primitive_lines.empty() &&
+        eligible = eligible && mesh.mesh.topology == 4 &&
+                   Shader::Backend::SPIRV::CanEmulatePrimitiveOutputs(mesh.mesh) &&
                    !mesh.mesh.vertex_lines.empty() && mesh.mesh.max_vertices != 0 &&
                    mesh.mesh.max_primitives != 0;
         for (size_t index = 1; index < Maxwell::MaxShaderProgram && eligible; ++index) {
@@ -1611,26 +1615,80 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         if (!eligible) {
             return nullptr;
         }
-        // The output buffer's binding follows every program's (unified bindings, one per
-        // descriptor element, as the SPIR-V backend numbers them).
-        u32 output_binding{};
-        for (size_t index = 1; index < Maxwell::MaxShaderProgram; ++index) {
-            if (key.unique_hashes[index] == 0) {
-                continue;
+        const auto check_limit = [](const char* resource, u64 used, u64 limit) {
+            if (used > limit) {
+                throw Shader::NotImplementedException(
+                    "Mesh emulation requires {} {}, device limit {}", used, resource, limit);
             }
-            const Shader::Info& info{programs[index].info};
-            const auto add = [&](const auto& descriptors) {
-                for (const auto& descriptor : descriptors) {
-                    output_binding += descriptor.count;
-                }
-            };
-            add(info.constant_buffer_descriptors);
-            add(info.storage_buffers_descriptors);
-            add(info.texture_buffer_descriptors);
-            add(info.image_buffer_descriptors);
-            add(info.texture_descriptors);
-            add(info.image_descriptors);
+        };
+        const auto check_shared_memory = [&](const Shader::IR::Program& program) {
+            // The task/mesh frontend uses the ISBE arrays only. A separate shared block would
+            // require a compatible layout alongside the implicit workgroup arrays in DefineMesh.
+            if (program.shared_memory_size != 0) {
+                throw Shader::NotImplementedException(
+                    "Mesh emulation with an extra shared-memory block");
+            }
+            check_limit(
+                "workgroup bytes",
+                Shader::Backend::SPIRV::MeshEmulationSharedBytes(program.mesh, program.stage),
+                device.GetMaxComputeSharedMemorySize());
+        };
+        check_shared_memory(mesh);
+        if (has_task) {
+            check_shared_memory(programs[1]);
         }
+
+        // Task and mesh bindings are both visible to compute in the same layout. Combined image
+        // samplers count against both sampler and image limits, but only once as a resource.
+        const u32 auxiliary{has_task ? 4U : 1U};
+        DescriptorBankInfo descriptors{.storage_buffers = auxiliary};
+        const auto add = [&](const Shader::Info& info) {
+            descriptors.uniform_buffers += Shader::NumDescriptors(info.constant_buffer_descriptors);
+            descriptors.storage_buffers += Shader::NumDescriptors(info.storage_buffers_descriptors);
+            descriptors.texture_buffers += Shader::NumDescriptors(info.texture_buffer_descriptors);
+            descriptors.image_buffers += Shader::NumDescriptors(info.image_buffer_descriptors);
+            descriptors.textures += Shader::NumDescriptors(info.texture_descriptors);
+            descriptors.images += Shader::NumDescriptors(info.image_descriptors);
+        };
+        const auto resources = [&] {
+            return descriptors.uniform_buffers + descriptors.storage_buffers +
+                   descriptors.texture_buffers + descriptors.image_buffers + descriptors.textures +
+                   descriptors.images;
+        };
+        add(mesh.info);
+        if (has_task) {
+            add(programs[1].info);
+        }
+        const auto limits{device.GetPhysical().GetProperties().limits};
+        check_limit("compute-visible storage buffers", descriptors.storage_buffers,
+                    limits.maxPerStageDescriptorStorageBuffers);
+        check_limit("compute-visible uniform buffers", descriptors.uniform_buffers,
+                    limits.maxPerStageDescriptorUniformBuffers);
+        check_limit("compute-visible samplers", descriptors.textures,
+                    limits.maxPerStageDescriptorSamplers);
+        check_limit("compute-visible sampled images",
+                    descriptors.textures + descriptors.texture_buffers,
+                    limits.maxPerStageDescriptorSampledImages);
+        check_limit("compute-visible storage images",
+                    descriptors.images + descriptors.image_buffers,
+                    limits.maxPerStageDescriptorStorageImages);
+        check_limit("compute-visible resources", resources(), limits.maxPerStageResources);
+
+        for (size_t index = 1; index < Maxwell::MaxShaderProgram; ++index) {
+            if (key.unique_hashes[index] != 0 && programs[index].stage == Shader::Stage::Fragment) {
+                add(programs[index].info);
+            }
+        }
+        check_limit("set storage buffers", descriptors.storage_buffers,
+                    limits.maxDescriptorSetStorageBuffers);
+        check_limit("set uniform buffers", descriptors.uniform_buffers,
+                    limits.maxDescriptorSetUniformBuffers);
+        check_limit("set samplers", descriptors.textures, limits.maxDescriptorSetSamplers);
+        check_limit("set sampled images", descriptors.textures + descriptors.texture_buffers,
+                    limits.maxDescriptorSetSampledImages);
+        check_limit("set storage images", descriptors.images + descriptors.image_buffers,
+                    limits.maxDescriptorSetStorageImages);
+        const u32 output_binding{resources() - auxiliary};
         mesh_emulation.emplace();
         mesh_emulation->output_binding = output_binding;
         if (has_task) {
@@ -1647,6 +1705,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         mesh_emulation->block_words = Shader::Backend::SPIRV::MeshEmulationBlockWords(mesh.mesh);
         mesh_emulation->max_primitives = mesh.mesh.max_primitives;
         mesh_emulation->max_vertices = mesh.mesh.max_vertices;
+        mesh_emulation->primitive_lines = static_cast<u32>(mesh.mesh.primitive_lines.size());
         mesh_emulation->vertex_lines = static_cast<u32>(mesh.mesh.vertex_lines.size());
         for (u32 line = 0; line < mesh.mesh.vertex_lines.size(); ++line) {
             const u32 attribute{mesh.mesh.vertex_lines[line]};
@@ -1751,6 +1810,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         infos[stage_index] = &program.info;
 
         auto runtime_info{MakeRuntimeInfo(programs, key, program, previous_stage, device)};
+        runtime_info.emulate_per_primitive_inputs =
+            mesh_emulation && program.stage == Shader::Stage::Fragment;
         if (mesh_emulation && (program.stage == Shader::Stage::Mesh ||
                                program.stage == Shader::Stage::Task)) {
             runtime_info.mesh_as_compute = true;

@@ -10,6 +10,7 @@
 // epilogue (reached by every invocation, see structured_control_flow.cpp) hands them to Vulkan.
 
 #include <algorithm>
+#include <bitset>
 #include <span>
 
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
@@ -55,15 +56,18 @@ void If(EmitContext& ctx, Id condition, Func&& body) {
     ctx.AddLabel(merge_label);
 }
 
-// Copies the lines of element `index` (a vertex or a primitive) from the attribute region.
-void CopyLines(EmitContext& ctx, Id index, u32 base, u32 num_lines,
-               const std::vector<EmitContext::MeshLineTarget>& targets) {
+Id FirstAttributeWord(EmitContext& ctx, Id index, u32 base, u32 num_lines) {
     // Word of line 0: base + (index / 32) * num_lines * 32 + index % 32.
     const Id group{ctx.OpShiftRightLogical(ctx.U32[1], index, ctx.Const(5U))};
     const Id slot{ctx.OpBitwiseAnd(ctx.U32[1], index, ctx.Const(31U))};
-    const Id first{ctx.OpIAdd(ctx.U32[1],
-                              ctx.OpIMul(ctx.U32[1], group, ctx.Const(num_lines * 32)),
-                              ctx.OpIAdd(ctx.U32[1], slot, ctx.Const(base)))};
+    return ctx.OpIAdd(ctx.U32[1], ctx.OpIMul(ctx.U32[1], group, ctx.Const(num_lines * 32)),
+                      ctx.OpIAdd(ctx.U32[1], slot, ctx.Const(base)));
+}
+
+// Copies the lines of element `index` (a vertex or a primitive) from the attribute region.
+void CopyLines(EmitContext& ctx, Id index, u32 base, u32 num_lines,
+               const std::vector<EmitContext::MeshLineTarget>& targets) {
+    const Id first{FirstAttributeWord(ctx, index, base, num_lines)};
     for (u32 line = 0; line < num_lines; ++line) {
         const EmitContext::MeshLineTarget& target{targets[line]};
         if (!Sirit::ValidId(target.variable)) {
@@ -179,24 +183,23 @@ void ComputeMeshEpilogue(EmitContext& ctx) {
     const Id invocation{LocalInvocation(ctx)};
     const u32 threads{ctx.mesh_threads};
 
+    const auto copy_attributes = [&](Id index, u32 bank, u32 lines, Id destination) {
+        const Id source{FirstAttributeWord(ctx, index, bank, lines)};
+        for (u32 line = 0; line < lines; ++line) {
+            const Id word{ctx.OpLoad(
+                ctx.U32[1], SharedWord(ctx, ctx.mesh_attributes,
+                                       ctx.OpIAdd(ctx.U32[1], source, ctx.Const(line * 32))))};
+            ctx.OpStore(OutputWord(ctx, ctx.OpIAdd(ctx.U32[1], destination, ctx.Const(line))),
+                        word);
+        }
+    };
     // Vertex v, line l: output word v * vertex_lines + l, from the stage buffer's line groups.
     for (u32 first = 0; first < mesh.max_vertices; first += threads) {
         const Id vertex{ctx.OpIAdd(ctx.U32[1], invocation, ctx.Const(first))};
         const auto copy = [&] {
-            const Id group{ctx.OpShiftRightLogical(ctx.U32[1], vertex, ctx.Const(5U))};
-            const Id slot{ctx.OpBitwiseAnd(ctx.U32[1], vertex, ctx.Const(31U))};
-            const Id source{ctx.OpIAdd(
-                ctx.U32[1], ctx.OpIMul(ctx.U32[1], group, ctx.Const(vertex_lines * 32)), slot)};
             const Id destination{ctx.OpIAdd(
                 ctx.U32[1], block, ctx.OpIMul(ctx.U32[1], vertex, ctx.Const(vertex_lines)))};
-            for (u32 line = 0; line < vertex_lines; ++line) {
-                const Id word{ctx.OpLoad(
-                    ctx.U32[1],
-                    SharedWord(ctx, ctx.mesh_attributes,
-                               ctx.OpIAdd(ctx.U32[1], source, ctx.Const(line * 32))))};
-                ctx.OpStore(OutputWord(ctx, ctx.OpIAdd(ctx.U32[1], destination, ctx.Const(line))),
-                            word);
-            }
+            copy_attributes(vertex, 0, vertex_lines, destination);
         };
         if (first + threads > mesh.max_vertices) {
             If(ctx, ctx.OpULessThan(ctx.U1, vertex, ctx.Const(mesh.max_vertices)), copy);
@@ -222,6 +225,14 @@ void ComputeMeshEpilogue(EmitContext& ctx) {
                 ctx.OpStore(
                     OutputWord(ctx, ctx.OpIAdd(ctx.U32[1], destination, ctx.Const(element))),
                     ctx.OpSelect(ctx.U32[1], used, value, ctx.u32_zero_value));
+            }
+            const u32 lines{static_cast<u32>(mesh.primitive_lines.size())};
+            if (lines != 0) {
+                const Id primitive_data{
+                    ctx.OpIAdd(ctx.U32[1], index_base, ctx.Const(mesh.max_primitives * 3))};
+                const Id record{ctx.OpIAdd(ctx.U32[1], primitive_data,
+                                           ctx.OpIMul(ctx.U32[1], primitive, ctx.Const(lines)))};
+                copy_attributes(primitive, ctx.mesh_primitive_base, lines, record);
             }
         };
         if (first + threads > mesh.max_primitives) {
@@ -374,7 +385,7 @@ void EmitMeshPrologue(EmitContext& ctx) {
                                           ctx.Const(1U))};
             Id task{ctx.u32_zero_value};
             Id remaining{tasks};
-            for (u32 step_index = 0; step_index < 17; ++step_index) {
+            for (u32 step_index = 0; step_index < MESH_EMULATION_TASK_SEARCH_STEPS; ++step_index) {
                 const Id half{ctx.OpShiftRightLogical(ctx.U32[1], remaining, ctx.Const(1U))};
                 const Id middle{ctx.OpUMin(ctx.U32[1], ctx.OpIAdd(ctx.U32[1], task, half), last_task)};
                 const Id first{ctx.OpLoad(ctx.U32[1],
@@ -451,6 +462,29 @@ void EmitMeshEpilogue(EmitContext& ctx) {
     }
 }
 
+bool CanEmulatePrimitiveOutputs(const MeshInfo& mesh) {
+    if (mesh.primitive_lines.empty()) {
+        return true;
+    }
+    std::bitset<IR::NUM_GENERICS> vertex_locations;
+    for (const u32 line : mesh.vertex_lines) {
+        const IR::Attribute attribute{line};
+        if (IR::IsGeneric(attribute)) {
+            vertex_locations.set(IR::GenericAttributeIndex(attribute));
+        }
+    }
+    for (const u32 line : mesh.primitive_lines) {
+        const IR::Attribute attribute{line};
+        // The ordinary vertex/fragment interface cannot give one location both interpolation
+        // modes. Layer, ViewportIndex and PrimitiveId also need their own built-in semantics.
+        if (!IR::IsGeneric(attribute) ||
+            vertex_locations.test(IR::GenericAttributeIndex(attribute))) {
+            return false;
+        }
+    }
+    return true;
+}
+
 std::vector<u32> EmitMeshEmulationVertex(const Profile& profile, const MeshInfo& mesh, u32 binding,
                                          u32 args_binding, bool convert_depth) {
     Sirit::Module module{profile.supported_spirv};
@@ -504,18 +538,25 @@ std::vector<u32> EmitMeshEmulationVertex(const Profile& profile, const MeshInfo&
     module.Decorate(position, spv::Decoration::BuiltIn, spv::BuiltIn::Position);
     interfaces.push_back(position);
     std::array<Id, IR::NUM_GENERICS> generics{};
-    for (const u32 line : mesh.vertex_lines) {
-        const IR::Attribute attribute{line};
-        if (!IR::IsGeneric(attribute)) {
-            continue;
+    const auto declare_generics = [&](std::span<const u32> lines, bool flat) {
+        for (const u32 line : lines) {
+            const IR::Attribute attribute{line};
+            if (!IR::IsGeneric(attribute)) {
+                continue;
+            }
+            const u32 index{IR::GenericAttributeIndex(attribute)};
+            if (!Sirit::ValidId(generics[index])) {
+                generics[index] = module.AddGlobalVariable(output_vec4, spv::StorageClass::Output);
+                module.Decorate(generics[index], spv::Decoration::Location, index);
+                if (flat) {
+                    module.Decorate(generics[index], spv::Decoration::Flat);
+                }
+                interfaces.push_back(generics[index]);
+            }
         }
-        const u32 index{IR::GenericAttributeIndex(attribute)};
-        if (!Sirit::ValidId(generics[index])) {
-            generics[index] = module.AddGlobalVariable(output_vec4, spv::StorageClass::Output);
-            module.Decorate(generics[index], spv::Decoration::Location, index);
-            interfaces.push_back(generics[index]);
-        }
-    }
+    };
+    declare_generics(mesh.vertex_lines, false);
+    declare_generics(mesh.primitive_lines, true);
     if (profile.supported_spirv >= 0x00010400) {
         interfaces.push_back(buffer);
         if (Sirit::ValidId(args)) {
@@ -581,6 +622,22 @@ std::vector<u32> EmitMeshEmulationVertex(const Profile& profile, const MeshInfo&
                            value);
         }
     }
+    const u32 primitive_lines{static_cast<u32>(mesh.primitive_lines.size())};
+    if (primitive_lines != 0) {
+        const Id data{module.OpIAdd(
+            u32_type, block, constant(mesh.max_vertices * vertex_lines + mesh.max_primitives * 3))};
+        const Id record{module.OpIAdd(
+            u32_type, data, module.OpIMul(u32_type, primitive, constant(primitive_lines)))};
+        for (u32 line = 0; line < primitive_lines; ++line) {
+            const IR::Attribute attribute{mesh.primitive_lines[line]};
+            const Id value{
+                module.OpBitcast(f32_type, load(module.OpIAdd(u32_type, record, constant(line))))};
+            module.OpStore(module.OpAccessChain(output_f32,
+                                                generics[IR::GenericAttributeIndex(attribute)],
+                                                constant(IR::GenericAttributeElement(attribute))),
+                           value);
+        }
+    }
     // OpenGL-style clip space, as the mesh epilogue's ConvertDepth: z = (z + w) / 2.
     if (convert_depth && Sirit::ValidId(position_z) && Sirit::ValidId(position_w)) {
         const Id z{module.OpFMul(f32_type, module.OpFAdd(f32_type, position_z, position_w),
@@ -626,7 +683,8 @@ std::vector<u32> EmitMeshEmulationDistribution(const Profile& profile) {
     const Id counter{define_buffer(3, "arena_counter")};
 
     constexpr u32 num_constants{sizeof(MeshEmulationDistributionConstants) / sizeof(u32)};
-    const std::array<Id, num_constants> members{u32_type, u32_type, u32_type, u32_type, u32_type};
+    std::array<Id, num_constants> members;
+    members.fill(u32_type);
     const Id constants_type{module.TypeStruct(std::span<const Id>(members))};
     module.Decorate(constants_type, spv::Decoration::Block);
     for (u32 member = 0; member < num_constants; ++member) {
@@ -659,6 +717,8 @@ std::vector<u32> EmitMeshEmulationDistribution(const Profile& profile) {
     const Id capacity_words{push(2)};
     const Id block_words{push(3)};
     const Id vertices_per_group{push(4)};
+    const Id max_dispatch_x{push(5)};
+    const Id uint_max{constant(~0U)};
     module.OpStore(total_var, constant(0));
     module.OpStore(task_var, constant(0));
 
@@ -683,7 +743,9 @@ std::vector<u32> EmitMeshEmulationDistribution(const Profile& profile) {
                                                   module.OpIMul(u32_type, task, payload_words),
                                                   constant(1))))};
         module.OpStore(word(offsets, task), total);
-        module.OpStore(total_var, module.OpIAdd(u32_type, total, requested));
+        const Id increment{
+            module.OpUMin(u32_type, requested, module.OpISub(u32_type, uint_max, total))};
+        module.OpStore(total_var, module.OpIAdd(u32_type, total, increment));
     }
     module.OpBranch(continue_label);
     module.AddLabel(continue_label);
@@ -696,11 +758,22 @@ std::vector<u32> EmitMeshEmulationDistribution(const Profile& profile) {
     // The counter keeps growing past the end, so the host sees how much the submission needed.
     const Id total{module.OpLoad(u32_type, total_var)};
     const Id base{module.OpLoad(u32_type, word(counter, constant(0)))};
+    const Id valid{module.OpULessThanEqual(bool_type, total, max_dispatch_x)};
+    const Id rejected{word(counter, constant(1))};
+    module.OpStore(rejected, module.OpUMax(u32_type, module.OpLoad(u32_type, rejected),
+                                           module.OpSelect(u32_type, valid, constant(0), total)));
+    // An invalid request produces no dispatch and reserves no arena space. The demand counter for
+    // valid draws saturates rather than wrapping back into the beginning of the arena.
+    const Id count{module.OpSelect(u32_type, valid, total, constant(0))};
+    const Id max_count{
+        module.OpUDiv(u32_type, module.OpISub(u32_type, uint_max, base), block_words)};
+    const Id end{module.OpIAdd(u32_type, base, module.OpIMul(u32_type, count, block_words))};
     module.OpStore(word(counter, constant(0)),
-                   module.OpIAdd(u32_type, base, module.OpIMul(u32_type, total, block_words)));
+                   module.OpSelect(u32_type, module.OpULessThanEqual(bool_type, count, max_count),
+                                   end, uint_max));
     const Id room{module.OpSelect(u32_type, module.OpULessThan(bool_type, base, capacity_words),
                                   module.OpISub(u32_type, capacity_words, base), constant(0))};
-    const Id dispatched{module.OpUMin(u32_type, total, module.OpUDiv(u32_type, room, block_words))};
+    const Id dispatched{module.OpUMin(u32_type, count, module.OpUDiv(u32_type, room, block_words))};
     module.OpStore(word(args, constant(0)), dispatched);
     module.OpStore(word(args, constant(1)), constant(1));
     module.OpStore(word(args, constant(2)), constant(1));

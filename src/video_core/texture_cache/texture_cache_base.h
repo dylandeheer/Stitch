@@ -126,13 +126,18 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     // Periodic statistics (TickFrame).
     u64 gc_deletes{};
     u64 gc_costly_deletes{};
-    u64 gc_download_deletes{}; ///< Evictions that downloaded the image first (a full GPU wait)
+    u64 gc_download_deletes{}; ///< Evictions that downloaded the image first
+    u64 gc_download_waits{};   ///< GPU waits those downloads took
     u64 async_decodes_queued{};
     u64 images_created{};
     u64 images_uploaded{};   ///< Image contents uploaded from guest memory (last 600 frames)
     u64 uploaded_bytes{};    ///< Guest bytes those uploads read
     u64 largest_upload{};    ///< Largest of them
     u64 layer_uploads{};     ///< Of them, uploads of only the written layers
+    u64 join_uploads_avoided{};
+    u64 join_upload_bytes_avoided{};
+    u32 join_baseline_checks{};
+    bool join_upload_baseline{};
     bool native_thresholds_applied{};
     u64 native_critical_memory{};
     u64 native_expected_memory{};

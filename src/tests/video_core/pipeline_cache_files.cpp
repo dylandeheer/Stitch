@@ -121,6 +121,52 @@ TEST_CASE("Task and mesh disk environments roundtrip all translation state and r
     REQUIRE(read == 3);
 }
 
+TEST_CASE("A cached task/mesh pipeline reaches fallback warmup once on a compatible device",
+          "[pipeline_cache_files][mesh_serialization]") {
+    TempDir temp;
+    const auto path = temp.path / "fallback.bin";
+    SerializedEnvironment task{Shader::Stage::Task};
+    SerializedEnvironment mesh{Shader::Stage::Mesh};
+    SerializedEnvironment fragment{Shader::Stage::Fragment};
+    const std::array<const VideoCommon::GenericEnvironment*, 3> stages{&task, &mesh, &fragment};
+
+    Vulkan::GraphicsPipelineCacheKey good{};
+    good.unique_hashes[1] = 11;
+    good.unique_hashes[2] = 22;
+    good.unique_hashes[5] = 33;
+    auto incompatible = good;
+    incompatible.state.dynamic_vertex_input.Assign(1);
+    auto provoking = good;
+    provoking.state.provoking_vertex_last.Assign(1);
+    for (const auto& key : {incompatible, good, good, provoking}) {
+        VideoCommon::SerializePipeline(key, stages, path, VideoCommon::VulkanPipelineCacheVersion);
+    }
+    const Vulkan::DynamicFeatures features{};
+    std::unordered_set<u64> known_keys;
+    std::vector<u64> admitted;
+    size_t records{};
+    VideoCommon::LoadPipelines(
+        {}, path, VideoCommon::VulkanPipelineCacheVersion,
+        [](std::ifstream&, VideoCommon::FileEnvironment) { FAIL("Unexpected compute record"); },
+        [&](std::ifstream& file, std::vector<VideoCommon::FileEnvironment> envs) {
+            ++records;
+            REQUIRE(envs.size() == 3);
+            REQUIRE(envs[0].ShaderStage() == Shader::Stage::Task);
+            REQUIRE(envs[1].ShaderStage() == Shader::Stage::Mesh);
+            REQUIRE(envs[1].MeshRegisters() == mesh.MeshRegisters());
+            REQUIRE(envs[2].ShaderStage() == Shader::Stage::Fragment);
+            Vulkan::GraphicsPipelineCacheKey key{};
+            if (auto hash = Vulkan::ReadCachedGraphicsKey(file, key, features, known_keys)) {
+                REQUIRE(key == good);
+                admitted.push_back(*hash);
+            }
+        });
+    REQUIRE(records == 4);
+    REQUIRE(admitted == std::vector<u64>{good.Hash()});
+    REQUIRE(known_keys.contains(good.Hash())); // runtime serialization won't append the key again
+    REQUIRE(known_keys.size() == 1);
+}
+
 TEST_CASE("Compatible v52 pipelines migrate without changing or discarding the old warm cache",
           "[pipeline_cache_files][mesh_serialization]") {
     TempDir temp;

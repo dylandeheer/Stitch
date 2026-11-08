@@ -166,6 +166,11 @@ public:
 
     ~SamplesStreamer() = default;
 
+    [[nodiscard]] bool CanReserveInCurrentBank() const {
+        // Reserving a new bank can require a query-pool reset outside the render pass.
+        return current_bank && !current_bank->IsClosed();
+    }
+
     void StartCounter() override {
         if (has_started) {
             return;
@@ -1407,6 +1412,11 @@ void QueryCacheRuntime::View3DRegs(Func&& func) {
     if (impl->maxwell3d) {
         func(*impl->maxwell3d);
     }
+}
+
+bool QueryCacheRuntime::CanBeginSamplesQueryInPass() const {
+    return impl->scheduler.IsRenderPassActive() && !impl->hcr_is_set &&
+           impl->sample_streamer.CanReserveInCurrentBank();
 }
 
 void QueryCacheRuntime::EndHostConditionalRendering() {
