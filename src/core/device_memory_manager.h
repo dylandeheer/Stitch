@@ -17,6 +17,7 @@
 #include <span>
 
 #include "common/common_types.h"
+#include "core/download_landing.h"
 #include "common/range_mutex.h"
 #include "common/scratch_buffer.h"
 #include "common/thread_worker.h"
@@ -54,6 +55,8 @@ public:
     static constexpr size_t AS_BITS = Traits::device_virtual_bits;
 
     void BindInterface(DeviceInterface* device_inter);
+
+    DownloadLanding download_landing;
 
     /// Marks the memory behind [address, address + size) cold (Common::HostMemory::HintCold),
     /// from a low-priority thread: data the host GPU has its own copy of, e.g. uploaded textures.

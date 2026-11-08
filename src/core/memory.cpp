@@ -961,6 +961,7 @@ struct Memory::Impl {
                 }
             }
             gpu_dirty_managers[core].Collect(address, size);
+            gpu_device_memory->download_landing.Await(address, size);
         });
     }
 

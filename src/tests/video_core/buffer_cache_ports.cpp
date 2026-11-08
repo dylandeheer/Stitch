@@ -627,3 +627,35 @@ TEST_CASE("Downloads keep CPU writes collected and not yet applied", "[buffer_po
     REQUIRE(std::all_of(f.bytes + 0x20ff8, f.bytes + 0x21008, [](u8 b) { return b == 0xee; }));
     REQUIRE(f.bytes[0x21008] == 0x34);
 }
+
+TEST_CASE("A synchronous GPU download keeps CPU writes completed during its wait",
+          "[buffer_ports][download_landing]") {
+    Fixture f;
+    const bool mapped = GENERATE(false, true);
+    const bool batched = GENERATE(false, true);
+    CAPTURE(mapped, batched);
+    constexpr DAddr address = 0x20000;
+    const auto id = Access::Add(*f.cache, address, 0x10000, mapped);
+    std::ranges::fill(Access::Get(*f.cache, id).bytes, 0x71);
+    Access::Dirty(*f.cache, address, 0x2000);
+    bool written = false;
+    f.cache->SetPendingCpuWrites([&](const std::function<void(DAddr, size_t)>& visit) {
+        if (written) {
+            visit(address + 0x100, 64);
+        }
+    });
+    f.runtime.before_completion = [&] {
+        written = true;
+        std::fill_n(f.bytes + 0x10100, 64, 0xe3);
+    };
+    if (batched) {
+        const std::array<std::pair<DAddr, u64>, 1> ranges{{{address, 0x2000}}};
+        Access::Download(*f.cache, ranges);
+    } else {
+        f.cache->DownloadMemory(address, 0x2000);
+    }
+    REQUIRE(written);
+    REQUIRE(f.bytes[0x100ff] == 0x71);
+    REQUIRE(std::all_of(f.bytes + 0x10100, f.bytes + 0x10140, [](u8 b) { return b == 0xe3; }));
+    REQUIRE(f.bytes[0x10140] == 0x71);
+}
