@@ -412,7 +412,8 @@ void Fsr3Upscaler::CreateResources(VkExtent2D render_size, VkExtent2D upscale_si
     frame_info = CreateTexture(VK_FORMAT_R32G32B32A32_SFLOAT, 1, 1);
     spd_atomic = CreateTexture(VK_FORMAT_R32_UINT, 1, 1);
     lanczos_lut = CreateTexture(VK_FORMAT_R16_SNORM, 128, 1);
-    default_reactive = CreateTexture(VK_FORMAT_R8_UNORM, 1, 1);
+    // The SDK clamps reactive-mask integer fetches to the render extent.
+    default_reactive = CreateTexture(VK_FORMAT_R8_UNORM, rw, rh);
     output = CreateTexture(VK_FORMAT_R16G16B16A16_SFLOAT, uw, uh);
     render_extent = render_size;
     upscale_extent = upscale_size;
