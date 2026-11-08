@@ -13,6 +13,7 @@
 #include <catch2/generators/catch_generators.hpp>
 
 #include "common/page_table.h"
+#include "common/scope_exit.h"
 #include "core/core.h"
 #include "core/device_memory.h"
 #include "core/gpu_dirty_memory_manager.h"
@@ -187,6 +188,29 @@ struct Runtime {
         Finish();
     }
     void BindUniformBuffer(Buffer&, u32, u32) {}
+    void ClearBuffer(Buffer& dst, u32 offset, u32 size, u32 value) {
+        REQUIRE(size % sizeof(value) == 0);
+        REQUIRE(u64{offset} + size <= dst.bytes.size());
+        for (u32 i = 0; i < size; i += sizeof(value))
+            std::memcpy(dst.bytes.data() + offset + i, &value, sizeof(value));
+    }
+    void CopyBuffer(Buffer& dst, Buffer& src, std::span<const VideoCommon::BufferCopy> copies,
+                    bool) {
+        for (const auto& copy : copies) {
+            REQUIRE(copy.src_offset + copy.size <= src.bytes.size());
+            REQUIRE(copy.dst_offset + copy.size <= dst.bytes.size());
+            std::memcpy(dst.bytes.data() + copy.dst_offset, src.bytes.data() + copy.src_offset,
+                        copy.size);
+        }
+    }
+    void BindStorageBuffer(Buffer& buffer, u32 offset, u32 size, bool written) {
+        REQUIRE(written);
+        bound_storage = &buffer;
+        bound_storage_offset = offset;
+        bound_storage_size = size;
+    }
+    Buffer* bound_storage{};
+    u32 bound_storage_offset{}, bound_storage_size{};
     std::span<u8> BindMappedUniformBuffer(size_t, u32, u32 size) {
         stream.resize(size);
         return stream;
@@ -247,6 +271,11 @@ struct BufferCacheTestAccess {
     }
     static void StorageWrite(Cache& cache, BufferId buffer, DAddr addr, u64 size, bool compute) {
         cache.MarkWrittenBuffer(buffer, addr, static_cast<u32>(size), compute);
+    }
+
+    static void BindComputeStorage(Cache& cache) {
+        cache.UpdateComputeStorageBuffers();
+        cache.BindHostComputeStorageBuffers();
     }
 
     static void DemandBatch(Cache& cache, u64 frame, bool bounded) {
@@ -1053,13 +1082,13 @@ TEST_CASE("Optional buffer pages cannot follow a remap or identical physical ali
 
 namespace {
 struct EarlyFixture : Fixture {
-    static constexpr DAddr page = 0x20000;
+    const DAddr page;
     VideoCommon::BufferId id{};
     bool old_ampere{};
-    explicit EarlyFixture(bool verify = false) {
+    explicit EarlyFixture(bool verify = false, DAddr watched_page = 0x20000) : page{watched_page} {
         old_ampere = Tegra::g_nx2_ampere.exchange(true);
         Access::EarlyMode(*cache, verify);
-        id = Access::Add(*cache, page, 0x4000);
+        id = Access::Add(*cache, 0x20000, 0x4000);
         for (int i = 0; i < 3; ++i) {
             Compute(0x10 + i);
             Demand();
@@ -1072,7 +1101,8 @@ struct EarlyFixture : Fixture {
         Tegra::g_nx2_ampere = old_ampere;
     }
     void Compute(u8 value) {
-        std::fill_n(Access::Get(*cache, id).bytes.begin(), 4096, value);
+        auto& buffer = Access::Get(*cache, id);
+        std::fill_n(buffer.bytes.begin() + buffer.Offset(page), 4096, value);
         Access::StorageWrite(*cache, id, page, 4096, true);
         cache->RecordEarlyCpuReads();
     }
@@ -1397,4 +1427,81 @@ TEST_CASE("Native write marks cover shader-visible padding independent of the CP
         REQUIRE(Access::Pending(*f.cache, binding.device_addr + mark - 1, 1));
         REQUIRE_FALSE(Access::Pending(*f.cache, binding.device_addr + mark, 1));
     }
+}
+
+TEST_CASE("Native compute binding invalidates a ready snapshot at the shader-padded write tail",
+          "[buffer_ports][storage_extent][early_buffer]") {
+    constexpr GPUVAddr gpu_base = 0x200000;
+    constexpr DAddr device_base = 0x20000;
+    constexpr u32 write_reach = 8192, shader_pad = 255;
+    constexpr u32 last_word_byte = write_reach + shader_pad - 1;
+    constexpr u8 sentinel = 0xd3;
+    enum class Proof { Full, Auto, DeliberatelyTooSmall };
+    const auto proof = GENERATE(Proof::Full, Proof::Auto, Proof::DeliberatelyTooSmall);
+    const bool warm_binding = GENERATE(false, true);
+    CAPTURE(static_cast<int>(proof), warm_binding);
+    const bool control = proof == Proof::DeliberatelyTooSmall;
+    const auto mode = proof == Proof::Full ? Settings::NativeComputeWriteMark::Full
+                                           : Settings::NativeComputeWriteMark::Auto;
+    EarlyFixture f{false, device_base + write_reach};
+    f.runtime.CompleteGpu(); // Finish the old speculative copy of page three, still trapped.
+    REQUIRE(Access::EarlyState(*f.cache).stats.copies == 1);
+    REQUIRE(f.bytes[0x10000 + last_word_byte] == 0x12);
+    REQUIRE(Access::Get(*f.cache, f.id).bytes[last_word_byte] == 0x42);
+
+    f.memory->Map(gpu_base, device_base, 0x4000, Tegra::PTEKind::PITCH, false);
+    f.Descriptor(gpu_base, 0); // The CPU binding sees zero padding.
+    f.runtime.alignment = 256;
+    Tegra::Control::ChannelState channel{0};
+    channel.memory_manager = &*f.memory;
+    channel.Init(f.system, 0);
+    f.cache->CreateChannel(channel);
+    f.cache->BindToChannel(0);
+    SCOPE_EXIT {
+        f.cache->EraseChannel(0);
+    };
+    auto& compute = channel.payload->kepler_compute;
+    REQUIRE(compute.IsNativeMode());
+    auto& qmd = compute.launch_description;
+    qmd.const_buffer_enable_mask.Assign(1);
+    qmd.const_buffer_config[0].address_low = 0x100000;
+    qmd.block_dim_x.Assign(1);
+    qmd.block_dim_y.Assign(1);
+    qmd.block_dim_z.Assign(1);
+    qmd.grid_dim_x.Assign(1);
+    qmd.grid_dim_y.Assign(1);
+    qmd.grid_dim_z.Assign(1);
+    auto& setting = Settings::values.native_compute_write_mark;
+    const auto previous = setting.GetValue();
+    SCOPE_EXIT {
+        setting.SetValue(previous);
+    };
+    setting.SetValue(mode);
+    // Negative control: cancel the maximum padding inside the declared extent. The real shader
+    // below still writes its last byte on page three, which now has an untracked write.
+    const Shader::StorageWriteExtent extent{
+        .bounded = true, .const_end = control ? write_reach - shader_pad : write_reach};
+    if (warm_binding) {
+        // Identical native GPU pointer, writeability, address-space generation and alignment.
+        REQUIRE(f.Bind(true, true).gpu_addr == gpu_base);
+    }
+    f.cache->BindComputeStorageBuffer(0, 0, 0, true, ~0U, extent);
+    Access::BindComputeStorage(*f.cache);
+    REQUIRE(f.runtime.bound_storage == &Access::Get(*f.cache, f.id));
+    REQUIRE(f.runtime.bound_storage_size == 0x4000); // Reads keep all four pages in both modes.
+    REQUIRE(Access::Pending(*f.cache, device_base + 0x3000, 1) ==
+            (mode == Settings::NativeComputeWriteMark::Full));
+
+    // Independent modeled shader store, queued after binding. No use of the production mark or
+    // extent-resolution helper to choose where it writes. Page 3 contains the previous ready copy.
+    auto* dest = f.runtime.bound_storage;
+    const auto index = f.runtime.bound_storage_offset + last_word_byte;
+    f.runtime.pending.emplace_back([dest, index] { dest->bytes.at(index) = sentinel; });
+    f.cache->RecordEarlyCpuReads();
+    // The real mark invalidates page three. Only the deliberate underbound can serve the old
+    // 0x42 snapshot. Any newly recorded copy is still unsubmitted at demand.
+    REQUIRE(f.Demand() == control);
+    REQUIRE(f.bytes[0x10000 + last_word_byte] == (control ? 0x42 : sentinel));
+    f.runtime.CompleteGpu();
+    REQUIRE(dest->bytes.at(index) == sentinel);
 }
