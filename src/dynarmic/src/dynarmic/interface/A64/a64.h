@@ -11,7 +11,9 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -43,6 +45,14 @@ public:
      * Can be called at any time. Halts execution if called within a callback.
      */
     void ClearCache();
+
+#if defined(__x86_64__) || defined(_M_X64)
+    // Optional embedding-provided authenticated code windows, checked again at translation.
+    using CompareWindow = std::array<std::uint32_t, 7>;
+    using CompareFilter = std::function<std::optional<CompareWindow>(std::uint64_t)>;
+    void SetCompareLinkFilter(CompareFilter filter, std::function<void(std::size_t)> observer = {});
+    std::size_t CompareLinksCompiled() const;
+#endif
 
     /**
      * Invalidate the code cache at a range of addresses.

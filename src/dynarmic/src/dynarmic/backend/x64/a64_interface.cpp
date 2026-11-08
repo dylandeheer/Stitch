@@ -58,6 +58,27 @@ static Optimization::PolyfillOptions GenPolyfillOptions(const BlockOfCode& code)
     };
 }
 
+// The sign-extended imm19 counts instructions relative to the branch's own PC.
+static s64 CompareLinkDisplacement(u32 word) {
+    return static_cast<s32>(word << 8) >> 13;
+}
+
+// The first instruction has already been translated normally. The following CMP Wn,Wm
+// remains live across two conditional selects and CBZ Wn. The second CMP is identical,
+// and both branches target the same PC. No guest data-memory instruction is fused.
+static bool IsCompareLinkWindow(const Jit::CompareWindow& w) {
+    const u32 cmp = w[1];
+    if ((cmp & 0xffe0fc1f) != 0x6b00001f || w[5] != cmp || (w[4] & 0xff000000) != 0x34000000 || (w[6] & 0xff00001f) != 0x54000001)
+        return false;
+    const u32 lhs = (cmp >> 5) & 31, rhs = (cmp >> 16) & 31;
+    for (const u32 select : {w[2], w[3]}) {
+        // 32-bit CSEL/CSINC/CSINV/CSNEG, which preserve NZCV.
+        if ((select & 0xbfe00800) != 0x1a800000 || (select & 31) == lhs || (select & 31) == rhs)
+            return false;
+    }
+    return lhs != 31 && rhs != 31 && (w[4] & 31) == lhs && CompareLinkDisplacement(w[4]) == CompareLinkDisplacement(w[6]) + 2;
+}
+
 struct Jit::Impl final {
 public:
     Impl(Jit* jit, UserConfig conf)
@@ -223,6 +244,10 @@ public:
         return Common::DisassembleX64(p, p + size);
     }
 
+    CompareFilter compare_filter;
+    std::function<void(size_t)> compare_observer;
+    size_t compare_links{};
+
 private:
     static CodePtr GetCurrentBlockThunk(void* thisptr) {
         Jit::Impl* this_ = static_cast<Jit::Impl*>(thisptr);
@@ -258,8 +283,42 @@ private:
         // LocationDescriptor ctor() does important ops (like tflags) do not skip
         auto const arch_descriptor = A64::LocationDescriptor{descriptor};
         ir_block.Reset(arch_descriptor);
-        A64::Translate(ir_block, arch_descriptor, get_code, {conf.define_unpredictable_behaviour, conf.wall_clock_cntpct});
+        const TranslationOptions options{conf.define_unpredictable_behaviour, conf.wall_clock_cntpct};
+        const auto start = arch_descriptor.PC();
+        const auto expected = compare_filter && !arch_descriptor.SingleStepping() && !conf.enable_cycle_counting && conf.HasOptimization(OptimizationFlag::BlockLinking)
+                                ? compare_filter(start)
+                                : std::nullopt;
+        bool fold = false;
+        if (expected) {
+            size_t seen = 0;
+            bool matches = true;
+            const auto observed = [&](u64 pc) {
+                const auto word = get_code(pc);
+                matches &= seen < 5 && pc == start + seen * 4 && word == (*expected)[seen];
+                ++seen;
+                return word;
+            };
+            A64::Translate(ir_block, arch_descriptor, observed, options);
+            fold = matches && seen == 5 && get_code(start + 20) == (*expected)[5] && get_code(start + 24) == (*expected)[6] && IsCompareLinkWindow(*expected);
+        } else {
+            A64::Translate(ir_block, arch_descriptor, get_code, options);
+        }
         Optimization::Optimize(ir_block, conf, polyfill_options);
+        if (fold) {
+            const auto* branch = std::get_if<IR::Term::CheckBit>(&ir_block.terminal);
+            const auto* zero = branch ? std::get_if<IR::Term::LinkBlock>(&branch->then_) : nullptr;
+            const auto* nonzero = branch ? std::get_if<IR::Term::LinkBlock>(&branch->else_) : nullptr;
+            const u64 target = start + 16 + CompareLinkDisplacement((*expected)[4]) * 4;
+            fold = zero && nonzero && zero->next == arch_descriptor.SetPC(target) && nonzero->next == arch_descriptor.SetPC(start + 20);
+        }
+        if (fold) {
+            // A write to either inlined instruction invalidates this block as well.
+            ir_block.SetEndLocation(arch_descriptor.AdvancePC(28));
+            ++compare_links;
+            if (compare_observer)
+                compare_observer(compare_links);
+            return emitter.Emit(ir_block, true).entrypoint;
+        }
         return emitter.Emit(ir_block).entrypoint;
     }
 
@@ -400,6 +459,16 @@ u32 Jit::GetPstate() const {
 
 void Jit::SetPstate(u32 value) {
     impl->SetPstate(value);
+}
+
+void Jit::SetCompareLinkFilter(CompareFilter filter, std::function<void(size_t)> observer) {
+    ClearCache();
+    impl->compare_filter = std::move(filter);
+    impl->compare_observer = std::move(observer);
+}
+
+size_t Jit::CompareLinksCompiled() const {
+    return impl->compare_links;
 }
 
 void Jit::ClearExclusiveState() {

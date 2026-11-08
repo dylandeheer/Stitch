@@ -6,9 +6,11 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cstdlib>
 #include <cstring>
 #include <span>
 #include <vector>
+#include "core/arm/dynarmic/oot_lookup_sites.h"
 
 #include "common/common_funcs.h"
 #include "common/game_presets.h"
@@ -340,6 +342,23 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
         }
     }
     LOG_INFO(Loader, "Module {} loaded at {:#x} (size {:#x})", nso_file.GetName(), load_base, image_size);
+#if defined(__linux__) && defined(__x86_64__)
+    if (name == "main" && process.GetProgramId() == 0x0400486024DEC000ULL) {
+        const char* option = std::getenv("STITCH_OOT_COMPARE_LINK");
+        if (option && std::string_view{option} == "1" && !system.DebuggerEnabled() &&
+            Common::HexToString(nso_header.build_id) ==
+                "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348000000000000000000000000") {
+            const auto module = std::span<const u8>{codeset.memory}.subspan(module_start);
+            const auto& text = nso_header.segments[0];
+            auto sites =
+                Core::OotLookupSites::FromModule(module, load_base, text.location, text.size);
+            LOG_INFO(Loader, "OoT compare links: verified={}", static_cast<bool>(sites));
+            process.SetLookupSites(std::move(sites));
+        } else {
+            process.SetLookupSites({});
+        }
+    }
+#endif
     process.LoadModule(system.Kernel(), std::move(codeset), load_base);
     if (name == "main" && process.GetProgramId() == Settings::MarioKartWorldProgramId) {
         process.SetMkwDynamicFpsPatchApplied(mkw_dynamic_fps_patch_applied);

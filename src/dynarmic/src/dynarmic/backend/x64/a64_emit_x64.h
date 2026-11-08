@@ -48,7 +48,7 @@ public:
 
     /// Emit host machine code for a basic block with intermediate representation `block`.
     /// @note block is modified.
-    BlockDescriptor Emit(IR::Block& block) noexcept;
+    BlockDescriptor Emit(IR::Block& block, bool fold_compare = false) noexcept;
 
     void ClearCache() override;
 

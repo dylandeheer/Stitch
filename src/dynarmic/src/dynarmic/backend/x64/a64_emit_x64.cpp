@@ -72,7 +72,7 @@ A64EmitX64::A64EmitX64(BlockOfCode& code, A64::UserConfig conf, A64::Jit* jit_in
 
 A64EmitX64::~A64EmitX64() = default;
 
-A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) noexcept {
+A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block, bool fold_compare) noexcept {
     if (conf.very_verbose_debugging_output) [[unlikely]] {
         std::puts(IR::DumpBlock(block).c_str());
     }
@@ -148,7 +148,28 @@ finish_this_inst:
     if (conf.enable_cycle_counting)
         EmitAddCycles(block.CycleCount());
     code.mov(rbp, code.qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, abi_base_pointer)]);
-    EmitTerminal(block.terminal, ctx.Location().SetSingleStepping(false), ctx.IsSingleStep());
+    if (fold_compare) {
+        const auto& branch = std::get<IR::Term::CheckBit>(block.terminal);
+        const auto target = std::get<IR::Term::LinkBlock>(branch.then_).next;
+        const auto continuation = std::get<IR::Term::LinkBlock>(branch.else_).next;
+        Xbyak::Label zero, halted;
+        code.cmp(code.byte[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, check_bit)], 0);
+        code.jne(zero, code.T_NEAR);
+        // The original nonzero edge links first to CMP. Preserve its halt checkpoint and PC.
+        code.cmp(code.dword[code.ABI_JIT_PTR + offsetof(A64JitState, halt_reason)], 0);
+        code.jne(halted, code.T_NEAR);
+        EmitTerminal(IR::Term::If{IR::Cond::NE, IR::Term::LinkBlock{target},
+                                  IR::Term::LinkBlock{A64::LocationDescriptor{continuation}.AdvancePC(8)}},
+                     ctx.Location(), false);
+        code.L(halted);
+        code.mov(rax, A64::LocationDescriptor{continuation}.PC());
+        code.mov(code.qword[code.ABI_JIT_PTR + offsetof(A64JitState, pc)], rax);
+        code.ForceReturnFromRunCode();
+        code.L(zero);
+        EmitLeafTerminal(branch.then_, ctx.Location(), false);
+    } else {
+        EmitTerminal(block.terminal, ctx.Location().SetSingleStepping(false), ctx.IsSingleStep());
+    }
     code.int3();
     for (auto& deferred_emit : ctx.deferred_emits)
         deferred_emit();

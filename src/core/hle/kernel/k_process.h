@@ -23,6 +23,10 @@
 #include "core/hle/kernel/k_thread_local_page.h"
 #include "core/memory.h"
 
+namespace Core {
+struct OotLookupSites;
+}
+
 namespace Kernel {
 
 enum class DebugWatchpointType : u8 {
@@ -121,6 +125,7 @@ private:
 
     std::atomic<s64> m_cpu_time{};
     std::atomic_bool m_mkw_dynamic_fps_patch_applied{};
+    std::shared_ptr<const Core::OotLookupSites> m_lookup_sites;
     std::atomic<s64> m_num_process_switches{};
     std::atomic<s64> m_num_thread_switches{};
     std::atomic<s64> m_num_fpu_switches{};
@@ -182,6 +187,13 @@ public:
 
     u64 GetProgramId() const {
         return m_program_id;
+    }
+
+    void SetLookupSites(std::shared_ptr<const Core::OotLookupSites> sites) {
+        std::atomic_store(&m_lookup_sites, std::move(sites));
+    }
+    auto GetLookupSites() const {
+        return std::atomic_load(&m_lookup_sites);
     }
 
     bool IsMkwDynamicFpsPatchApplied() const {

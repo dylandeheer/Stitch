@@ -13,6 +13,7 @@
 #include "core/arm/dynarmic/arm_dynarmic.h"
 #include "core/arm/dynarmic/arm_dynarmic_64.h"
 #include "core/arm/dynarmic/dynarmic_exclusive_monitor.h"
+#include "core/arm/dynarmic/oot_lookup_sites.h"
 #include "core/arm/dynarmic/window_trace.h"
 #include "core/core_timing.h"
 #include "core/hle/kernel/k_process.h"
@@ -457,6 +458,25 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
         config.fastmem_exclusive_access = false;
     }
     m_jit.emplace(config);
+#if defined(__linux__) && defined(__x86_64__)
+    const char* option = std::getenv("STITCH_OOT_COMPARE_LINK");
+    if (option && std::string_view{option} == "1" && !m_system.DebuggerEnabled() &&
+        !config.enable_cycle_counting) {
+        m_jit->SetCompareLinkFilter(
+            [this](u64 pc) -> std::optional<Core::OotLookupSites::Window> {
+                if (!OotLookupSites::MayContain(pc))
+                    return std::nullopt;
+                auto sites = m_cb->m_process->GetLookupSites();
+                return sites ? sites->Find(pc) : std::nullopt;
+            },
+            [this](size_t count) {
+                if (count <= 14 || std::has_single_bit(count)) {
+                    LOG_INFO(Core_ARM, "OoT compare links: core={} compiled={}", m_core_index,
+                             count);
+                }
+            });
+    }
+#endif
 }
 
 HaltReason ArmDynarmic64::RunThread(Kernel::KThread* thread) {
