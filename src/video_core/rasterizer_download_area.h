@@ -14,6 +14,7 @@ struct RasterizerDownloadArea {
     VAddr end_address;
     bool preemtive;
     DownloadSource source{};
+    bool read_after_compute_rewrite{};
 };
 
 } // namespace VideoCore

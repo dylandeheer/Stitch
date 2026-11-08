@@ -738,3 +738,23 @@ TEST_CASE("A CPU store published after the GPU landing snapshot keeps the newest
     REQUIRE(f.bytes[0x10110] == 0x56);
     if (aliased) f.device.Unmap(alias, 0x1000);
 }
+
+TEST_CASE("Readback tracing recognizes exact page reuse after compute storage writes",
+          "[readback_trace]") {
+    VideoCore::ReadbackTrace::ComputePages trace;
+    constexpr DAddr page = 0x14000;
+    REQUIRE_FALSE(trace.Read(page + 1, page + 4097));
+    REQUIRE_FALSE(trace.Read(page, page));
+    REQUIRE_FALSE(trace.Read(page, page + 4096));
+    trace.Write(page + 4096, 4);
+    REQUIRE_FALSE(trace.Read(page, page + 4096));
+    trace.Write(page - 2, 8);
+    REQUIRE(trace.Read(page, page + 4096));
+    REQUIRE_FALSE(trace.Read(page, page + 4096));
+    trace.Write(page, 16 * 4096 + 1);
+    REQUIRE_FALSE(trace.Read(page, page + 4096));
+    trace.Write(page, 8);
+    constexpr DAddr collision = page + 64 * 4096;
+    REQUIRE_FALSE(trace.Read(collision, collision + 4096));
+    REQUIRE_FALSE(trace.Read(page, page + 4096));
+}

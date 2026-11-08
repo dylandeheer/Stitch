@@ -288,7 +288,8 @@ struct GPU::Impl {
             WaitForSyncOperation(fence);
             if (record->complete.load(std::memory_order_acquire)) {
                 const auto returned = Trace::Clock::now();
-                readback_windows.Add(raster_area, record->event, arrival, returned);
+                readback_windows.Add(raster_area, record->event, arrival, returned,
+                                     system.GetCurrentHostThreadID());
             }
         } else {
             const u64 fence = RequestSyncOperation(flush);
