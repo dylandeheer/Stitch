@@ -287,6 +287,10 @@ std::optional<VideoCore::RasterizerDownloadArea> BufferCache<P>::GetFlushArea(DA
     // instead keep read traps and flush on demand.
     const bool preflush = !Tegra::g_nx2_ampere.load(std::memory_order_relaxed);
     if (!area->preemtive) {
+        if (VideoCore::ReadbackTrace::Enabled()) {
+            area->read_after_compute_rewrite =
+                readback_pages.Read(area->start_address, area->end_address);
+        }
         if (Nx2DownloadTrace::g_enabled) [[unlikely]] {
             Nx2DownloadTrace::Marked(device_addr_start_aligned,
                                      device_addr_end_aligned - device_addr_start_aligned, preflush);
@@ -1769,6 +1773,9 @@ void BufferCache<P>::BindHostComputeStorageBuffers() {
         buffer.MarkUsage(offset, size);
 
         if (is_written) {
+            if (VideoCore::ReadbackTrace::Enabled()) {
+                readback_pages.Write(binding.device_addr, size);
+            }
             MarkWrittenBuffer(binding.buffer_id, binding.device_addr, size, true);
         }
 
