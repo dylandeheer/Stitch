@@ -28,8 +28,11 @@ public:
         const u32 bit = Hash(physical_page);
         return words[bit / 64].load(std::memory_order_acquire) & (u64{1} << (bit % 64));
     }
+
 private:
-    static u32 Hash(u32 page) { return (page * 0x9e3779b9U) >> 16; }
+    static u32 Hash(u32 page) {
+        return (page * 0x9e3779b9U) >> 16;
+    }
     std::array<std::atomic<u64>, 1024> words{};
 };
 

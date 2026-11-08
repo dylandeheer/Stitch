@@ -80,19 +80,32 @@ struct Runtime {
     bool CanReorderUpload(const Buffer&, std::span<VideoCommon::BufferCopy>) const {
         return false;
     }
-    u64 CurrentTick() const { return current_tick; }
-    u64 QueueEarlyHostRead() { return current_tick; }
-    bool EarlyHostReadReady(u64 tick) { return tick <= completed_tick; }
-    u64 CompletedEarlyReadTick() { return completed_tick; }
-    bool EarlyTickSubmitted(u64 tick) const { return tick <= completed_tick; }
+    u64 CurrentTick() const {
+        return current_tick;
+    }
+    u64 QueueEarlyHostRead() {
+        return current_tick;
+    }
+    bool EarlyHostReadReady(u64 tick) {
+        return tick <= completed_tick;
+    }
+    u64 CompletedEarlyReadTick() {
+        return completed_tick;
+    }
+    bool EarlyTickSubmitted(u64 tick) const {
+        return tick <= completed_tick;
+    }
     std::optional<Staging> TryEarlyStaging(size_t bytes) {
-        if (fail_loan) return std::nullopt;
+        if (fail_loan)
+            return std::nullopt;
         return DownloadStagingBuffer(bytes, true);
     }
     bool InvalidateEarlyHostRead(Staging& ref) {
-        if (fail_invalidate) return false;
+        if (fail_invalidate)
+            return false;
         if (!ref.host_coherent) {
-            std::copy_n(ref.buffer->bytes.data()+ref.offset,ref.mapped_span.size(),ref.mapped_span.data());
+            std::copy_n(ref.buffer->bytes.data() + ref.offset, ref.mapped_span.size(),
+                        ref.mapped_span.data());
             ++early_invalidations;
         }
         return true;
@@ -102,18 +115,21 @@ struct Runtime {
         FreeDeferredStagingBuffer(ref);
     }
     void CompleteGpu() {
-        for (auto& copy : pending) copy();
+        for (auto& copy : pending)
+            copy();
         pending.clear();
         completed_tick = current_tick++;
     }
     void FreeDeferredStagingBuffer(Staging& ref) {
         // The pool retains released Vulkan resources through their submission's tick.
-        REQUIRE(std::any_of(deferred.begin(), deferred.end(), [&](const auto& p) { return p.get() == ref.buffer; }));
+        REQUIRE(std::any_of(deferred.begin(), deferred.end(),
+                            [&](const auto& p) { return p.get() == ref.buffer; }));
         ++deferred_releases;
     }
     Staging DownloadStagingBuffer(u64 size, bool keep = false) {
         if (keep) {
-            auto& loan = deferred.emplace_back(std::make_unique<Buffer>(*this, 0, size + 128, false));
+            auto& loan =
+                deferred.emplace_back(std::make_unique<Buffer>(*this, 0, size + 128, false));
             if (noncoherent_early) {
                 auto& cpu = noncoherent_views.emplace_back(size, 0xff);
                 return {loan.get(), 128, cpu, false};
@@ -174,7 +190,8 @@ struct Runtime {
         return stream;
     }
 
-    u64 current_tick{1}, completed_tick{}, deferred_releases{}, last_release_tick{}, early_invalidations{};
+    u64 current_tick{1}, completed_tick{}, deferred_releases{}, last_release_tick{},
+        early_invalidations{};
     bool noncoherent_early{}, noncoherent_reference{}, fail_loan{}, fail_invalidate{};
     std::vector<std::vector<u8>> noncoherent_views;
     std::vector<std::unique_ptr<Buffer>> deferred;
@@ -219,11 +236,13 @@ using Cache = VideoCommon::BufferCache<Policy>;
 namespace VideoCommon {
 
 struct BufferCacheTestAccess {
-    static void EarlyMode(Cache& cache, bool verify=false) {
+    static void EarlyMode(Cache& cache, bool verify = false) {
         cache.early_reads = std::make_unique<Cache::Early>("/unused-test-marker", verify);
         cache.early_reads->active = true;
     }
-    static auto& EarlyState(Cache& cache) { return *cache.early_reads; }
+    static auto& EarlyState(Cache& cache) {
+        return *cache.early_reads;
+    }
     static void StorageWrite(Cache& cache, BufferId buffer, DAddr addr, u64 size, bool compute) {
         cache.MarkWrittenBuffer(buffer, addr, static_cast<u32>(size), compute);
     }
@@ -1031,24 +1050,27 @@ struct EarlyFixture : Fixture {
         old_ampere = Tegra::g_nx2_ampere.exchange(true);
         Access::EarlyMode(*cache, verify);
         id = Access::Add(*cache, page, 0x4000);
-        for (int i=0; i<3; ++i) {
-            Compute(0x10+i);
+        for (int i = 0; i < 3; ++i) {
+            Compute(0x10 + i);
             Demand();
         }
         REQUIRE(Access::EarlyState(*cache).stats.copies == 0);
         Compute(0x42);
         REQUIRE(Access::EarlyState(*cache).stats.copies == 1);
     }
-    ~EarlyFixture() { Tegra::g_nx2_ampere = old_ampere; }
+    ~EarlyFixture() {
+        Tegra::g_nx2_ampere = old_ampere;
+    }
     void Compute(u8 value) {
-        std::fill_n(Access::Get(*cache,id).bytes.begin(), 4096, value);
-        Access::StorageWrite(*cache,id,page,4096,true);
+        std::fill_n(Access::Get(*cache, id).bytes.begin(), 4096, value);
+        Access::StorageWrite(*cache, id, page, 4096, true);
         cache->RecordEarlyCpuReads();
     }
     bool Demand() {
-        REQUIRE_FALSE(cache->GetFlushArea(page,1)->preemtive);
-        const bool hit = cache->TryEarlyCpuRead(page,4096);
-        if (!hit) cache->DownloadMemory(page,4096);
+        REQUIRE_FALSE(cache->GetFlushArea(page, 1)->preemtive);
+        const bool hit = cache->TryEarlyCpuRead(page, 4096);
+        if (!hit)
+            cache->DownloadMemory(page, 4096);
         return hit;
     }
 };
@@ -1058,94 +1080,109 @@ TEST_CASE("A completed early buffer snapshot only lands on demand and keeps CPU 
           "[early_buffer]") {
     EarlyFixture f;
     REQUIRE(f.bytes[0x10001] == 0x12);
-    REQUIRE(Access::Pending(*f.cache,f.page,4096));
+    REQUIRE(Access::Pending(*f.cache, f.page, 4096));
     f.runtime.CompleteGpu();
     REQUIRE(f.bytes[0x10001] == 0x12);
-    f.cache->SetPendingCpuWrites([](const auto& visit){visit(0x20040,64);});
-    std::fill_n(f.bytes+0x10040,64,0xfe);
+    f.cache->SetPendingCpuWrites([](const auto& visit) { visit(0x20040, 64); });
+    std::fill_n(f.bytes + 0x10040, 64, 0xfe);
     const auto waits = f.runtime.finishes;
     REQUIRE(f.Demand());
-    REQUIRE(f.runtime.finishes==waits);
-    REQUIRE(f.bytes[0x10000]==0x42);
-    REQUIRE(f.bytes[0x10040]==0xfe);
-    REQUIRE(f.bytes[0x10080]==0x42);
-    REQUIRE_FALSE(Access::Pending(*f.cache,f.page,4096));
-    REQUIRE(Access::EarlyState(*f.cache).stats.hit_bytes==4032);
+    REQUIRE(f.runtime.finishes == waits);
+    REQUIRE(f.bytes[0x10000] == 0x42);
+    REQUIRE(f.bytes[0x10040] == 0xfe);
+    REQUIRE(f.bytes[0x10080] == 0x42);
+    REQUIRE_FALSE(Access::Pending(*f.cache, f.page, 4096));
+    REQUIRE(Access::EarlyState(*f.cache).stats.hit_bytes == 4032);
     f.cache->RecordEarlyCpuReads();
-    REQUIRE(f.runtime.deferred_releases==1);
+    REQUIRE(f.runtime.deferred_releases == 1);
 }
 
-TEST_CASE("Ineligible early snapshots leave the full original demand available",
-          "[early_buffer]") {
+TEST_CASE("Ineligible early snapshots leave the full original demand available", "[early_buffer]") {
     EarlyFixture f;
-    const auto invalidation=GENERATE(0,1,2,3,4,5,6);
+    const auto invalidation = GENERATE(0, 1, 2, 3, 4, 5, 6);
     CAPTURE(invalidation);
-    if (invalidation!=0) f.runtime.CompleteGpu();
+    if (invalidation != 0)
+        f.runtime.CompleteGpu();
     switch (invalidation) {
-    case 0: break; // Queued but not submitted/completed.
-    case 1: Access::StorageWrite(*f.cache,f.id,f.page+32,4,false); break;
-    case 2: f.cache->OutdateEarlyCpuReads(f.page+36,4); break; // Query copy/host upload/DMA.
-    case 3: f.device.Map(0x60000,f.page,4096,f.asid); break;
-    case 4: f.device.ExcludeEarlyReadReport(f.page-4,16); break; // Cross-page semaphore/report tail.
-    case 5: ++Access::Get(*f.cache,f.id).early_read_instance; break; // Slot reused.
-    case 6: Access::EarlyState(*f.cache).active=false; break;
+    case 0:
+        break; // Queued but not submitted/completed.
+    case 1:
+        Access::StorageWrite(*f.cache, f.id, f.page + 32, 4, false);
+        break;
+    case 2:
+        f.cache->OutdateEarlyCpuReads(f.page + 36, 4);
+        break; // Query copy/host upload/DMA.
+    case 3:
+        f.device.Map(0x60000, f.page, 4096, f.asid);
+        break;
+    case 4:
+        f.device.ExcludeEarlyReadReport(f.page - 4, 16);
+        break; // Cross-page semaphore/report tail.
+    case 5:
+        ++Access::Get(*f.cache, f.id).early_read_instance;
+        break; // Slot reused.
+    case 6:
+        Access::EarlyState(*f.cache).active = false;
+        break;
     }
-    REQUIRE_FALSE(f.cache->TryEarlyCpuRead(f.page,4096));
-    REQUIRE(Access::Pending(*f.cache,f.page,4096));
-    f.cache->DownloadMemory(f.page,4096);
-    REQUIRE(f.bytes[0x10000]==0x42);
-    if (invalidation==3) f.device.Unmap(0x60000,4096);
+    REQUIRE_FALSE(f.cache->TryEarlyCpuRead(f.page, 4096));
+    REQUIRE(Access::Pending(*f.cache, f.page, 4096));
+    f.cache->DownloadMemory(f.page, 4096);
+    REQUIRE(f.bytes[0x10000] == 0x42);
+    if (invalidation == 3)
+        f.device.Unmap(0x60000, 4096);
 }
 
 TEST_CASE("Early verification compares only GPU-owned bytes and returns the original on mismatch",
           "[early_buffer]") {
-    const bool corrupt=GENERATE(false,true);
+    const bool corrupt = GENERATE(false, true);
     EarlyFixture f{true};
     f.runtime.CompleteGpu();
     // Deliberately bypass all production writer invalidation, proving VERIFY catches a stale byte.
-    if (corrupt) Access::Get(*f.cache,f.id).bytes[1]=0x7d;
-    f.cache->SetPendingCpuWrites([](const auto& visit){visit(0x20040,64);});
-    std::fill_n(f.bytes+0x10040,64,0xee);
+    if (corrupt)
+        Access::Get(*f.cache, f.id).bytes[1] = 0x7d;
+    f.cache->SetPendingCpuWrites([](const auto& visit) { visit(0x20040, 64); });
+    std::fill_n(f.bytes + 0x10040, 64, 0xee);
     REQUIRE(f.Demand());
-    auto& state=Access::EarlyState(*f.cache);
-    REQUIRE(state.stats.comparisons==1);
-    REQUIRE(state.stats.compared_bytes==4032);
-    REQUIRE(state.stats.masked_bytes==64);
-    REQUIRE(state.stats.mismatches==(corrupt?1:0));
-    REQUIRE(state.failed==corrupt);
-    REQUIRE(f.bytes[0x10001]==(corrupt?0x7d:0x42));
-    REQUIRE(f.bytes[0x10040]==0xee);
+    auto& state = Access::EarlyState(*f.cache);
+    REQUIRE(state.stats.comparisons == 1);
+    REQUIRE(state.stats.compared_bytes == 4032);
+    REQUIRE(state.stats.masked_bytes == 64);
+    REQUIRE(state.stats.mismatches == (corrupt ? 1 : 0));
+    REQUIRE(state.failed == corrupt);
+    REQUIRE(f.bytes[0x10001] == (corrupt ? 0x7d : 0x42));
+    REQUIRE(f.bytes[0x10040] == 0xee);
 }
 
 TEST_CASE("A snapshot cannot replace a multi-page fault or an unserved byte range",
           "[early_buffer]") {
     EarlyFixture f;
     f.runtime.CompleteGpu();
-    Access::Dirty(*f.cache,f.page+4096,4096);
-    std::fill_n(Access::Get(*f.cache,f.id).bytes.begin()+4096,4096,0x7b);
-    REQUIRE_FALSE(f.cache->TryEarlyCpuRead(f.page,8192));
-    REQUIRE_FALSE(f.cache->TryEarlyCpuRead(f.page+4,4096));
-    f.cache->DownloadMemory(f.page,8192);
-    REQUIRE(f.bytes[0x10000]==0x42);
-    REQUIRE(f.bytes[0x11001]==0x7b);
+    Access::Dirty(*f.cache, f.page + 4096, 4096);
+    std::fill_n(Access::Get(*f.cache, f.id).bytes.begin() + 4096, 4096, 0x7b);
+    REQUIRE_FALSE(f.cache->TryEarlyCpuRead(f.page, 8192));
+    REQUIRE_FALSE(f.cache->TryEarlyCpuRead(f.page + 4, 4096));
+    f.cache->DownloadMemory(f.page, 8192);
+    REQUIRE(f.bytes[0x10000] == 0x42);
+    REQUIRE(f.bytes[0x11001] == 0x7b);
 }
 
 TEST_CASE("Early training expires unread dispatches and never trusts an aliased report",
           "[early_buffer]") {
     EarlyFixture f;
-    for (int i=0;i<6;++i) {
+    for (int i = 0; i < 6; ++i) {
         f.runtime.CompleteGpu();
         f.Compute(0x55);
     }
-    auto& state=Access::EarlyState(*f.cache);
-    const auto& page=state.Slot(f.page);
-    REQUIRE(page.reads_after_write==0);
+    auto& state = Access::EarlyState(*f.cache);
+    const auto& page = state.Slot(f.page);
+    REQUIRE(page.reads_after_write == 0);
     REQUIRE_FALSE(page.requested);
     // The report's old alias disappears. Its physical bytes remain excluded.
-    f.device.Map(0x60000,f.page,4096,f.asid);
-    f.device.ExcludeEarlyReadReport(0x60040,16);
-    f.device.Unmap(0x60000,4096);
-    REQUIRE_FALSE(f.device.WithEarlyReadPage(f.page,f.device.MappingGeneration(),[]{}));
+    f.device.Map(0x60000, f.page, 4096, f.asid);
+    f.device.ExcludeEarlyReadReport(0x60040, 16);
+    f.device.Unmap(0x60000, 4096);
+    REQUIRE_FALSE(f.device.WithEarlyReadPage(f.page, f.device.MappingGeneration(), [] {}));
 }
 
 TEST_CASE("Reaching the early-read budget leaves the demand on the standard download",
@@ -1153,43 +1190,43 @@ TEST_CASE("Reaching the early-read budget leaves the demand on the standard down
     EarlyFixture f;
     f.runtime.CompleteGpu();
     REQUIRE(f.Demand());
-    auto& state=Access::EarlyState(*f.cache);
-    state.frame_bytes=1024*1024;
+    auto& state = Access::EarlyState(*f.cache);
+    state.frame_bytes = 1024 * 1024;
     f.Compute(0xab);
-    REQUIRE(state.stats.caps==1);
+    REQUIRE(state.stats.caps == 1);
     REQUIRE_FALSE(f.Demand());
-    REQUIRE(f.bytes[0x10000]==0xab);
+    REQUIRE(f.bytes[0x10000] == 0xab);
 }
 
-TEST_CASE("Fully CPU-owned early verify bytes are not reported as compared",
-          "[early_buffer]") {
+TEST_CASE("Fully CPU-owned early verify bytes are not reported as compared", "[early_buffer]") {
     EarlyFixture f{true};
     f.runtime.CompleteGpu();
-    f.cache->SetPendingCpuWrites([&](const auto& visit){ visit(f.page,4096); });
+    f.cache->SetPendingCpuWrites([&](const auto& visit) { visit(f.page, 4096); });
     REQUIRE(f.Demand());
-    const auto& stats=Access::EarlyState(*f.cache).stats;
-    REQUIRE(stats.compared_bytes==0);
-    REQUIRE(stats.comparisons==0);
-    REQUIRE(stats.empty_checks==1);
-    REQUIRE(stats.masked_bytes==4096);
-    REQUIRE(f.bytes[0x10001]==0x12);
+    const auto& stats = Access::EarlyState(*f.cache).stats;
+    REQUIRE(stats.compared_bytes == 0);
+    REQUIRE(stats.comparisons == 0);
+    REQUIRE(stats.empty_checks == 1);
+    REQUIRE(stats.masked_bytes == 4096);
+    REQUIRE(f.bytes[0x10001] == 0x12);
 }
 
-TEST_CASE("An early snapshot lands only the current dirty subranges and preserves the rest of its page",
-          "[early_buffer]") {
+TEST_CASE(
+    "An early snapshot lands only the current dirty subranges and preserves the rest of its page",
+    "[early_buffer]") {
     EarlyFixture f;
     f.runtime.CompleteGpu();
     REQUIRE(f.Demand());
     std::fill_n(f.bytes + 0x10000, 4096, 0xde);
-    std::fill_n(Access::Get(*f.cache,f.id).bytes.begin(), 4096, 0x79);
-    Access::StorageWrite(*f.cache,f.id,f.page+0x120,0x60,true);
+    std::fill_n(Access::Get(*f.cache, f.id).bytes.begin(), 4096, 0x79);
+    Access::StorageWrite(*f.cache, f.id, f.page + 0x120, 0x60, true);
     f.cache->RecordEarlyCpuReads();
     f.runtime.CompleteGpu();
-    f.cache->SetPendingCpuWrites([&](const auto& visit){ visit(f.page+0x144,4); });
+    f.cache->SetPendingCpuWrites([&](const auto& visit) { visit(f.page + 0x144, 4); });
     REQUIRE(f.Demand());
-    const auto* ptr=f.bytes+0x10000;
-    for (size_t i=0;i<4096;++i) {
-        const bool owned = i>=0x120 && i<0x180 && !(i>=0x144 && i<0x148);
+    const auto* ptr = f.bytes + 0x10000;
+    for (size_t i = 0; i < 4096; ++i) {
+        const bool owned = i >= 0x120 && i < 0x180 && !(i >= 0x144 && i < 0x148);
         REQUIRE(ptr[i] == (owned ? 0x79 : 0xde));
     }
 }
@@ -1197,26 +1234,27 @@ TEST_CASE("An early snapshot lands only the current dirty subranges and preserve
 TEST_CASE("Early staging survives cancellation before submission and completion before a read",
           "[early_buffer]") {
     EarlyFixture f;
-    const auto start_tick=f.runtime.current_tick;
-    auto& state=Access::EarlyState(*f.cache);
+    const auto start_tick = f.runtime.current_tick;
+    auto& state = Access::EarlyState(*f.cache);
     // Do not submit or complete the copies. Observe more requests than the loan budget.
-    for (size_t i=0;i<40;++i) {
-        REQUIRE_FALSE(f.cache->GetFlushArea(f.page,4)->preemtive);
+    for (size_t i = 0; i < 40; ++i) {
+        REQUIRE_FALSE(f.cache->GetFlushArea(f.page, 4)->preemtive);
         f.Compute(0xa4);
     }
-    REQUIRE(f.runtime.deferred.size()==32);
-    REQUIRE(f.runtime.deferred_releases==0);
-    REQUIRE(state.stats.caps>0);
+    REQUIRE(f.runtime.deferred.size() == 32);
+    REQUIRE(f.runtime.deferred_releases == 0);
+    REQUIRE(state.stats.caps > 0);
     state.Reset();
     f.cache->RecordEarlyCpuReads();
-    REQUIRE(f.runtime.deferred_releases==0);
+    REQUIRE(f.runtime.deferred_releases == 0);
     f.runtime.CompleteGpu();
     f.cache->RecordEarlyCpuReads();
-    REQUIRE(f.runtime.deferred_releases==32);
-    REQUIRE(f.runtime.last_release_tick==start_tick);
-    REQUIRE(f.bytes[0x10001]==0x12);
-    REQUIRE_FALSE(f.Demand()); // Full normal read remains after every speculative loan was canceled.
-    REQUIRE(f.bytes[0x10001]==0xa4);
+    REQUIRE(f.runtime.deferred_releases == 32);
+    REQUIRE(f.runtime.last_release_tick == start_tick);
+    REQUIRE(f.bytes[0x10001] == 0x12);
+    REQUIRE_FALSE(
+        f.Demand()); // Full normal read remains after every speculative loan was canceled.
+    REQUIRE(f.bytes[0x10001] == 0xa4);
 }
 
 TEST_CASE("Noncoherent early allocations invalidate host memory after the GPU tick",
@@ -1224,66 +1262,66 @@ TEST_CASE("Noncoherent early allocations invalidate host memory after the GPU ti
     EarlyFixture f;
     f.runtime.CompleteGpu();
     REQUIRE(f.Demand());
-    f.runtime.noncoherent_early=true;
+    f.runtime.noncoherent_early = true;
     f.Compute(0x4b);
     f.runtime.CompleteGpu();
     f.cache->RecordEarlyCpuReads(); // A completed valid loan remains unavailable for pool reuse.
-    const auto held=f.runtime.deferred_releases;
+    const auto held = f.runtime.deferred_releases;
     REQUIRE(f.Demand());
-    REQUIRE(f.bytes[0x10001]==0x4b);
-    REQUIRE(f.runtime.early_invalidations==1);
-    REQUIRE(f.runtime.deferred_releases==held);
+    REQUIRE(f.bytes[0x10001] == 0x4b);
+    REQUIRE(f.runtime.early_invalidations == 1);
+    REQUIRE(f.runtime.deferred_releases == held);
 }
 
 TEST_CASE("VERIFY never certifies an unqualified original noncoherent staging allocation",
           "[early_buffer]") {
     EarlyFixture f{true};
     f.runtime.CompleteGpu();
-    f.runtime.noncoherent_reference=true;
+    f.runtime.noncoherent_reference = true;
     REQUIRE(f.Demand());
-    const auto& s=Access::EarlyState(*f.cache).stats;
-    REQUIRE(s.noncoherent_reference==1);
-    REQUIRE(s.comparisons==0);
-    REQUIRE(s.compared_bytes==0);
-    REQUIRE(s.mismatches==0);
+    const auto& s = Access::EarlyState(*f.cache).stats;
+    REQUIRE(s.noncoherent_reference == 1);
+    REQUIRE(s.comparisons == 0);
+    REQUIRE(s.compared_bytes == 0);
+    REQUIRE(s.mismatches == 0);
 }
 
 TEST_CASE("A late shadow comparison never counts as a ready acceleration opportunity",
           "[early_buffer]") {
     EarlyFixture f{true};
     REQUIRE(f.Demand());
-    const auto& stats=Access::EarlyState(*f.cache).stats;
-    REQUIRE(stats.late==1);
-    REQUIRE(stats.unsubmitted==1);
-    REQUIRE(stats.ready_checks==0);
-    REQUIRE(stats.late_checks==1);
-    REQUIRE(stats.compared_bytes==4096);
-    REQUIRE(f.bytes[0x10000]==0x42);
+    const auto& stats = Access::EarlyState(*f.cache).stats;
+    REQUIRE(stats.late == 1);
+    REQUIRE(stats.unsubmitted == 1);
+    REQUIRE(stats.ready_checks == 0);
+    REQUIRE(stats.late_checks == 1);
+    REQUIRE(stats.compared_bytes == 4096);
+    REQUIRE(f.bytes[0x10000] == 0x42);
 }
 
 TEST_CASE("Cache teardown returns an outstanding deferred loan with its original retirement tick",
           "[early_buffer]") {
     EarlyFixture f;
-    const auto issuing_tick=f.runtime.current_tick;
+    const auto issuing_tick = f.runtime.current_tick;
     REQUIRE(f.runtime.completed_tick < issuing_tick);
     // BufferCache never sends or waits for a speculative command when the session ends.
     f.cache.reset();
-    REQUIRE(f.runtime.deferred_releases==1);
-    REQUIRE(f.runtime.last_release_tick==issuing_tick);
+    REQUIRE(f.runtime.deferred_releases == 1);
+    REQUIRE(f.runtime.last_release_tick == issuing_tick);
     REQUIRE(f.runtime.completed_tick < issuing_tick);
 }
 
 TEST_CASE("A failed speculative loan or host invalidation keeps the complete mandatory read",
           "[early_buffer]") {
-    const bool loan_failure=GENERATE(false,true);
+    const bool loan_failure = GENERATE(false, true);
     EarlyFixture f;
     f.runtime.CompleteGpu();
     REQUIRE(f.Demand());
-    f.runtime.fail_loan=loan_failure;
-    f.runtime.fail_invalidate=!loan_failure;
+    f.runtime.fail_loan = loan_failure;
+    f.runtime.fail_invalidate = !loan_failure;
     f.Compute(0x37);
     f.runtime.CompleteGpu();
     REQUIRE_FALSE(f.Demand());
-    REQUIRE(f.bytes[0x10001]==0x37);
-    REQUIRE(Access::EarlyState(*f.cache).stats.unavailable==1);
+    REQUIRE(f.bytes[0x10001] == 0x37);
+    REQUIRE(Access::EarlyState(*f.cache).stats.unavailable == 1);
 }

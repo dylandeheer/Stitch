@@ -230,7 +230,7 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
     }
     if (op == GpuSemaphoreOperation::WriteLong) {
         const GPUVAddr sequence_address{regs.semaphore_address.SemaphoreAddress()};
-    dma_pusher.memory_manager.ExcludeEarlyReadReport(sequence_address, 16);
+        dma_pusher.memory_manager.ExcludeEarlyReadReport(sequence_address, 16);
         const u32 payload = regs.semaphore_sequence;
         // RELEASE_SIZE (bit 24) set means a 4-byte release without the timestamp; writing 16
         // bytes there clobbers the words next to it (Switch 2 packs semaphores tightly).

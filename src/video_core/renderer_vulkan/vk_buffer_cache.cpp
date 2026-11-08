@@ -481,7 +481,8 @@ std::optional<StagingBufferRef> BufferCacheRuntime::TryEarlyStaging(size_t bytes
         return DownloadStagingBuffer(bytes, true);
     } catch (const vk::Exception& error) {
         if (error.GetResult() != VK_ERROR_OUT_OF_DEVICE_MEMORY &&
-            error.GetResult() != VK_ERROR_OUT_OF_HOST_MEMORY) throw;
+            error.GetResult() != VK_ERROR_OUT_OF_HOST_MEMORY)
+            throw;
         return std::nullopt;
     } catch (const std::bad_alloc&) {
         return std::nullopt;
@@ -506,7 +507,8 @@ u64 BufferCacheRuntime::CompletedEarlyReadTick() {
 
 bool BufferCacheRuntime::EarlyHostReadReady(u64 tick) {
     auto& semaphore = scheduler.GetMasterSemaphore();
-    if (!semaphore.IsFree(tick)) semaphore.Refresh();
+    if (!semaphore.IsFree(tick))
+        semaphore.Refresh();
     return semaphore.IsFree(tick);
 }
 

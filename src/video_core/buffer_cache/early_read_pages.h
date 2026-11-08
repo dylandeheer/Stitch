@@ -34,8 +34,10 @@ struct EarlyReadPages {
         bool canceled{};
     };
     struct Stats {
-        u64 copies{}, bytes{}, hits{}, hit_bytes{}, cpu_only{}, late{}, unsubmitted{}, ready_checks{}, late_checks{}, stale{}, blocked{}, comparisons{},
-            compared_bytes{}, masked_bytes{}, empty_checks{}, remapped_checks{}, noncoherent_reference{}, unavailable{}, mismatches{}, caps{};
+        u64 copies{}, bytes{}, hits{}, hit_bytes{}, cpu_only{}, late{}, unsubmitted{},
+            ready_checks{}, late_checks{}, stale{}, blocked{}, comparisons{}, compared_bytes{},
+            masked_bytes{}, empty_checks{}, remapped_checks{}, noncoherent_reference{},
+            unavailable{}, mismatches{}, caps{};
     };
     struct Shadow {
         DAddr page;
@@ -53,7 +55,8 @@ struct EarlyReadPages {
     Stats stats{};
     Shadow* shadow{};
 
-    EarlyReadPages(std::filesystem::path marker_, bool verify_) : marker{std::move(marker_)}, verify{verify_} {}
+    EarlyReadPages(std::filesystem::path marker_, bool verify_)
+        : marker{std::move(marker_)}, verify{verify_} {}
 
     void Poll() {
         std::error_code error;
@@ -65,10 +68,13 @@ struct EarlyReadPages {
     }
     void Reset() {
         pages = {};
-        for (auto& copy : copies) if (copy) copy->canceled = true;
+        for (auto& copy : copies)
+            if (copy)
+                copy->canceled = true;
     }
     void ObserveGeneration(u64 gen) {
-        if (generation == gen) return;
+        if (generation == gen)
+            return;
         Reset();
         generation = gen;
     }
@@ -79,21 +85,27 @@ struct EarlyReadPages {
     void Demand(DAddr page) {
         auto& p = Slot(page);
         if (!p.valid || p.address != page) {
-            p = {.address=page, .version=++next_version, .valid=true};
+            p = {.address = page, .version = ++next_version, .valid = true};
         }
         if (p.compute && !p.read) {
-            if (p.reads_after_write < 2) ++p.reads_after_write;
+            if (p.reads_after_write < 2)
+                ++p.reads_after_write;
             p.missed = 0;
             p.read = true;
         }
     }
     void Write(DAddr start, u64 size, BufferId writer = {}, bool compute = false) {
-        if (!active || !size) return;
+        if (!active || !size)
+            return;
         const auto update = [&](Page& p) {
-            if (!p.valid || !(start <= p.address ? p.address - start < size : start - p.address < PageSize)) return;
+            if (!p.valid ||
+                !(start <= p.address ? p.address - start < size : start - p.address < PageSize))
+                return;
             if (compute) {
-                if (p.compute && !p.read && p.missed < 4) ++p.missed;
-                if (p.missed == 4) p.reads_after_write = 0;
+                if (p.compute && !p.read && p.missed < 4)
+                    ++p.missed;
+                if (p.missed == 4)
+                    p.reads_after_write = 0;
             }
             p.version = ++next_version;
             p.writer = writer;
@@ -103,12 +115,14 @@ struct EarlyReadPages {
         };
         if (size <= 16 * PageSize && start <= ~DAddr{} - size) {
             const DAddr last = (start + size - 1) >> 12;
-            for (DAddr i=start >> 12; i<=last; ++i) {
+            for (DAddr i = start >> 12; i <= last; ++i) {
                 auto& p = Slot(i << 12);
-                if (p.valid && p.address == i << 12) update(p);
+                if (p.valid && p.address == i << 12)
+                    update(p);
             }
         } else {
-            for (auto& p : pages) update(p);
+            for (auto& p : pages)
+                update(p);
         }
     }
     bool Current(const Copy& c) {
@@ -117,13 +131,16 @@ struct EarlyReadPages {
                c.generation == generation && p.writer == c.buffer;
     }
     void Compare(DAddr address, const u8* data, size_t size) {
-        if (!shadow || !size) return;
+        if (!shadow || !size)
+            return;
         const DAddr start = std::max(address, shadow->page);
-        const DAddr end = std::min(address+size, shadow->page+PageSize);
-        if (start >= end) return;
-        const auto offset = start-shadow->page;
-        std::memcpy(shadow->original.data()+offset, data+(start-address), end-start);
-        for (size_t i=offset; i<offset+(end-start); ++i) shadow->readable.set(i);
+        const DAddr end = std::min(address + size, shadow->page + PageSize);
+        if (start >= end)
+            return;
+        const auto offset = start - shadow->page;
+        std::memcpy(shadow->original.data() + offset, data + (start - address), end - start);
+        for (size_t i = offset; i < offset + (end - start); ++i)
+            shadow->readable.set(i);
     }
 };
 } // namespace VideoCommon

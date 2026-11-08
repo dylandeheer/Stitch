@@ -17,12 +17,12 @@
 #include <span>
 
 #include "common/common_types.h"
-#include "core/early_read_report_pages.h"
-#include "core/download_landing.h"
 #include "common/range_mutex.h"
 #include "common/scratch_buffer.h"
-#include "common/thread_worker.h"
 #include "common/sparse_large_vector.h"
+#include "common/thread_worker.h"
+#include "core/download_landing.h"
+#include "core/early_read_report_pages.h"
 
 namespace Core {
 
@@ -58,7 +58,8 @@ public:
     void BindInterface(DeviceInterface* device_inter);
 
     void ExcludeEarlyReadPointer(const u8* ptr, size_t size) {
-        if (!Core::EarlyBufferReadsRequested() || !ptr || !size || !IsPhysicalPointer(ptr)) return;
+        if (!Core::EarlyBufferReadsRequested() || !ptr || !size || !IsPhysicalPointer(ptr))
+            return;
         std::scoped_lock lock{mapping_guard};
         const auto physical = GetRawPhysicalAddr(ptr);
         const auto last = (physical + size - 1) >> page_bits;
@@ -68,7 +69,8 @@ public:
     }
 
     void ExcludeEarlyReadReport(DAddr address, u64 size) {
-        if (!size || address >= device_as_size || size > device_as_size - address) return;
+        if (!size || address >= device_as_size || size > device_as_size - address)
+            return;
         std::scoped_lock lock{mapping_guard};
         const auto last = (address + size - 1) >> page_bits;
         for (auto page = address >> page_bits; page <= last; ++page) {
@@ -76,7 +78,8 @@ public:
             if (backing) {
                 early_read_reports.Exclude(backing - 1);
                 // Some report engines memcpy a scalar through the first host pointer.
-                if (page < last) early_read_reports.Exclude(backing);
+                if (page < last)
+                    early_read_reports.Exclude(backing);
             }
         }
     }

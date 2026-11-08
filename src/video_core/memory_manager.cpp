@@ -65,7 +65,8 @@ MemoryManager::MemoryManager(Core::System& system_, u64 address_space_bits_, GPU
 {}
 
 void MemoryManager::SetNativeSyncpointShim(GPUVAddr address) {
-    if (address) ExcludeEarlyReadReport(address, NumShimSyncpoints * sizeof(u32));
+    if (address)
+        ExcludeEarlyReadReport(address, NumShimSyncpoints * sizeof(u32));
     native_syncpoint_shim.store(address, std::memory_order_release);
 }
 
@@ -322,10 +323,12 @@ std::optional<DAddr> MemoryManager::GpuToCpuAddress(GPUVAddr addr, std::size_t s
 
 void MemoryManager::ExcludeEarlyReadReport(GPUVAddr address, size_t size) const {
     if (!Core::EarlyBufferReadsRequested() || size == 0 || address >= address_space_size ||
-        size > address_space_size - address) return;
+        size > address_space_size - address)
+        return;
     const auto end = address + size;
     for (auto addr = address; addr < end;) {
-        const auto bytes = std::min<u64>(end - addr, Core::DEVICE_PAGESIZE - (addr & Core::DEVICE_PAGEMASK));
+        const auto bytes =
+            std::min<u64>(end - addr, Core::DEVICE_PAGESIZE - (addr & Core::DEVICE_PAGEMASK));
         if (const auto device = GpuToCpuAddress(addr)) {
             // Also blacklist the contiguous physical tail if a scalar crosses the first GPU page.
             memory.ExcludeEarlyReadReport(*device, addr == address ? size : bytes);
@@ -415,14 +418,16 @@ T MemoryManager::Read(GPUVAddr addr) const {
 template <bool report, typename T>
 void MemoryManager::WriteScalar(GPUVAddr addr, T data) {
     if (auto page_pointer{GetPointer(addr)}; page_pointer) {
-        if constexpr (report) memory.ExcludeEarlyReadPointer(page_pointer, sizeof(T));
+        if constexpr (report)
+            memory.ExcludeEarlyReadPointer(page_pointer, sizeof(T));
         std::memcpy(page_pointer, &data, sizeof(T));
         return;
     }
     // A Switch 2 sparse block nobody wrote yet gets its memory now.
     Tegra::Nx2BackSparseWrite(addr, sizeof(T), &data);
     if (auto page_pointer{GetPointer(addr)}; page_pointer) {
-        if constexpr (report) memory.ExcludeEarlyReadPointer(page_pointer, sizeof(T));
+        if constexpr (report)
+            memory.ExcludeEarlyReadPointer(page_pointer, sizeof(T));
         std::memcpy(page_pointer, &data, sizeof(T));
         return;
     }

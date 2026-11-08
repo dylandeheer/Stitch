@@ -2008,8 +2008,9 @@ void RasterizerVulkan::FlushGpuWrittenCommandListPages(std::span<const DAddr> pa
 
 void RasterizerVulkan::FlushCpuRead(const VideoCore::RasterizerDownloadArea& area) {
     const auto size = area.end_address - area.start_address;
-    const bool early = Core::EarlyBufferReadsRequested() && area.source == VideoCore::DownloadSource::Buffer &&
-                       size == Core::DEVICE_PAGESIZE && !query_cache.HoldsQueries(area.start_address, size);
+    const bool early =
+        Core::EarlyBufferReadsRequested() && area.source == VideoCore::DownloadSource::Buffer &&
+        size == Core::DEVICE_PAGESIZE && !query_cache.HoldsQueries(area.start_address, size);
     FlushRegionImpl(area.start_address, size, VideoCommon::CacheType::All, early);
 }
 
@@ -2017,7 +2018,8 @@ void RasterizerVulkan::FlushRegion(DAddr addr, u64 size, VideoCommon::CacheType 
     FlushRegionImpl(addr, size, which, false);
 }
 
-void RasterizerVulkan::FlushRegionImpl(DAddr addr, u64 size, VideoCommon::CacheType which, bool early_read) {
+void RasterizerVulkan::FlushRegionImpl(DAddr addr, u64 size, VideoCommon::CacheType which,
+                                       bool early_read) {
     if (addr == 0 || size == 0) {
         return;
     }

@@ -83,7 +83,8 @@ BufferCache<P>::~BufferCache() {
     if constexpr (requires { runtime.QueueEarlyHostRead(); }) {
         if (early_reads) {
             for (auto& copy : early_reads->copies) {
-                if (copy) runtime.ReleaseEarlyHostRead(copy->staging, copy->tick);
+                if (copy)
+                    runtime.ReleaseEarlyHostRead(copy->staging, copy->tick);
             }
         }
     }
@@ -133,15 +134,22 @@ void BufferCache<P>::TickFrame() {
     }
     if (early_reads) {
         early_reads->frame_bytes = 0;
-        if ((frame_tick % 16) == 0) early_reads->Poll();
+        if ((frame_tick % 16) == 0)
+            early_reads->Poll();
         if ((frame_tick % 120) == 0) {
             const auto& s = early_reads->stats;
-            LOG_INFO(HW_GPU, "Early buffer reads frame={} active={} verify={} failed={} copies={} "
-                     "recorded_bytes={} hits={} hit_bytes={} cpu_only={} late={} unsubmitted={} ready_checks={} late_checks={} stale={} blocked={} "
-                     "compared_reads={} compared_bytes={} cpu_masked_bytes={} empty_checks={} remapped_checks={} noncoherent_reference={} unavailable={} mismatches={} capped={}",
+            LOG_INFO(HW_GPU,
+                     "Early buffer reads frame={} active={} verify={} failed={} copies={} "
+                     "recorded_bytes={} hits={} hit_bytes={} cpu_only={} late={} unsubmitted={} "
+                     "ready_checks={} late_checks={} stale={} blocked={} "
+                     "compared_reads={} compared_bytes={} cpu_masked_bytes={} empty_checks={} "
+                     "remapped_checks={} noncoherent_reference={} unavailable={} mismatches={} "
+                     "capped={}",
                      frame_tick, early_reads->active, early_reads->verify, early_reads->failed,
-                     s.copies, s.bytes, s.hits, s.hit_bytes, s.cpu_only, s.late, s.unsubmitted, s.ready_checks, s.late_checks, s.stale, s.blocked,
-                     s.comparisons, s.compared_bytes, s.masked_bytes, s.empty_checks, s.remapped_checks, s.noncoherent_reference, s.unavailable, s.mismatches, s.caps);
+                     s.copies, s.bytes, s.hits, s.hit_bytes, s.cpu_only, s.late, s.unsubmitted,
+                     s.ready_checks, s.late_checks, s.stale, s.blocked, s.comparisons,
+                     s.compared_bytes, s.masked_bytes, s.empty_checks, s.remapped_checks,
+                     s.noncoherent_reference, s.unavailable, s.mismatches, s.caps);
         }
     }
     if (read_batch_baseline_file && *read_batch_baseline_file && frame_tick % 16 == 0) {
@@ -327,7 +335,8 @@ std::optional<VideoCore::RasterizerDownloadArea> BufferCache<P>::GetFlushArea(DA
     // instead keep read traps and flush on demand.
     const bool preflush = !Tegra::g_nx2_ampere.load(std::memory_order_relaxed);
     if (!area->preemtive) {
-        if (early_reads && early_reads->active && Tegra::g_nx2_ampere.load(std::memory_order_relaxed) &&
+        if (early_reads && early_reads->active &&
+            Tegra::g_nx2_ampere.load(std::memory_order_relaxed) &&
             area->end_address - area->start_address == Early::PageSize) {
             early_reads->ObserveGeneration(device_memory.MappingGeneration());
             early_reads->Demand(area->start_address);
@@ -436,13 +445,15 @@ void BufferCache<P>::DownloadMemory(DAddr device_addr, u64 size) {
 
 template <class P>
 void BufferCache<P>::OutdateEarlyCpuReads(DAddr address, u64 size) {
-    if (early_reads) early_reads->Write(address, size);
+    if (early_reads)
+        early_reads->Write(address, size);
 }
 
 template <class P>
 void BufferCache<P>::RecordEarlyCpuReads() {
     if constexpr (requires { runtime.QueueEarlyHostRead(); }) {
-        if (!early_reads) return;
+        if (!early_reads)
+            return;
         auto& state = *early_reads;
         state.ObserveGeneration(device_memory.MappingGeneration());
         // Canceled loans still occupy a slot until their real submission retires.
@@ -450,22 +461,29 @@ void BufferCache<P>::RecordEarlyCpuReads() {
         std::optional<u64> completed;
         for (auto& c : state.copies) {
             if (c && (!state.active || !state.Current(*c))) {
-                if (!completed) completed = runtime.CompletedEarlyReadTick();
-                if (c->tick > *completed) continue;
+                if (!completed)
+                    completed = runtime.CompletedEarlyReadTick();
+                if (c->tick > *completed)
+                    continue;
                 runtime.ReleaseEarlyHostRead(c->staging, c->tick);
                 c.reset();
                 ++state.stats.stale;
             }
         }
-        if (!state.active) return;
+        if (!state.active)
+            return;
         for (auto& page : state.pages) {
-            if (!page.requested) continue;
+            if (!page.requested)
+                continue;
             page.requested = false;
-            if (!slot_buffers.contains(page.writer)) continue;
+            if (!slot_buffers.contains(page.writer))
+                continue;
             const DAddr begin = page.address;
             auto& buffer = slot_buffers[page.writer];
-            if (begin < buffer.CpuAddr() || begin + Early::PageSize > buffer.CpuAddr() + buffer.SizeBytes() ||
-                !gpu_modified_ranges.Intersects(begin, Early::PageSize)) continue;
+            if (begin < buffer.CpuAddr() ||
+                begin + Early::PageSize > buffer.CpuAddr() + buffer.SizeBytes() ||
+                !gpu_modified_ranges.Intersects(begin, Early::PageSize))
+                continue;
             auto dest = std::find_if(state.copies.begin(), state.copies.end(),
                                      [](const auto& copy) { return !copy.has_value(); });
             if (dest == state.copies.end() || state.frame_bytes + Early::PageSize > 1024 * 1024) {
@@ -485,15 +503,20 @@ void BufferCache<P>::RecordEarlyCpuReads() {
                 break;
             }
             // If recording unwinds after a transfer was enqueued, preserve its real lifetime.
-            SCOPE_EXIT { if (loan) runtime.ReleaseEarlyHostRead(*loan, runtime.CurrentTick()); };
+            SCOPE_EXIT {
+                if (loan)
+                    runtime.ReleaseEarlyHostRead(*loan, runtime.CurrentTick());
+            };
             auto& staging = *loan;
-            const BufferCopy copy{.src_offset=buffer.Offset(begin), .dst_offset=staging.offset,
-                                  .size=Early::PageSize};
+            const BufferCopy copy{.src_offset = buffer.Offset(begin),
+                                  .dst_offset = staging.offset,
+                                  .size = Early::PageSize};
             buffer.MarkUsage(copy.src_offset, copy.size);
             runtime.CopyBuffer(staging.buffer, buffer, std::span{&copy, 1}, true);
             const u64 tick = runtime.QueueEarlyHostRead();
-            dest->emplace(typename Early::Copy{begin, page.version, state.generation, tick, buffer.early_read_instance,
-                                               page.writer, std::move(staging)});
+            dest->emplace(typename Early::Copy{begin, page.version, state.generation, tick,
+                                               buffer.early_read_instance, page.writer,
+                                               std::move(staging)});
             loan.reset();
             ++state.stats.copies;
             state.stats.bytes += Early::PageSize;
@@ -508,26 +531,32 @@ bool BufferCache<P>::TryEarlyCpuRead(DAddr address, u64 size) {
         return false;
     } else {
         if (!early_reads || !early_reads->active || size != Early::PageSize ||
-            (address & (Early::PageSize - 1)) != 0) return false;
+            (address & (Early::PageSize - 1)) != 0)
+            return false;
         auto& state = *early_reads;
         const u64 generation = device_memory.MappingGeneration();
         state.ObserveGeneration(generation);
         auto slot = std::find_if(state.copies.begin(), state.copies.end(), [&](const auto& c) {
             return c && c->page == address && state.Current(*c);
         });
-        if (slot == state.copies.end()) return false;
+        if (slot == state.copies.end())
+            return false;
         auto& copy = **slot;
-        if (!slot_buffers.contains(copy.buffer)) return false;
+        if (!slot_buffers.contains(copy.buffer))
+            return false;
         const bool ready = runtime.EarlyHostReadReady(copy.tick);
         if (!ready) {
             ++state.stats.late;
-            if (!runtime.EarlyTickSubmitted(copy.tick)) ++state.stats.unsubmitted;
-            if (!state.verify) return false;
+            if (!runtime.EarlyTickSubmitted(copy.tick))
+                ++state.stats.unsubmitted;
+            if (!state.verify)
+                return false;
         }
         const auto& buffer = slot_buffers[copy.buffer];
         if (!copy.instance || copy.instance != buffer.early_read_instance ||
             address < buffer.CpuAddr() || address + size > buffer.CpuAddr() + buffer.SizeBytes() ||
-            !gpu_modified_ranges.Intersects(address, size)) return false;
+            !gpu_modified_ranges.Intersects(address, size))
+            return false;
         if (state.verify) {
             if (!device_memory.WithEarlyReadPage(address, generation, [] {})) {
                 ++state.stats.blocked;
@@ -535,7 +564,9 @@ bool BufferCache<P>::TryEarlyCpuRead(DAddr address, u64 size) {
             }
             typename Early::Shadow shadow{address};
             state.shadow = &shadow;
-            SCOPE_EXIT { state.shadow = nullptr; };
+            SCOPE_EXIT {
+                state.shadow = nullptr;
+            };
             // Only the original synchronous download writes guest memory in VERIFY mode.
             DownloadMemory(address, size);
             state.stats.masked_bytes += shadow.masked;
@@ -545,7 +576,7 @@ bool BufferCache<P>::TryEarlyCpuRead(DAddr address, u64 size) {
                 return true; // Original returned; no proven coherent comparison.
             }
             const auto compared = shadow.readable.count();
-            if (!device_memory.WithEarlyReadPage(address, generation, []{})) {
+            if (!device_memory.WithEarlyReadPage(address, generation, [] {})) {
                 ++state.stats.remapped_checks;
             } else if (!compared || !runtime.EarlyHostReadReady(copy.tick)) {
                 ++state.stats.empty_checks;
@@ -556,18 +587,23 @@ bool BufferCache<P>::TryEarlyCpuRead(DAddr address, u64 size) {
                     return true; // The original has already completed.
                 }
                 size_t different = 0;
-                for (size_t i=0; i<Early::PageSize; ++i) {
-                    different += shadow.readable[i] && shadow.original[i] != copy.staging.mapped_span[i];
+                for (size_t i = 0; i < Early::PageSize; ++i) {
+                    different +=
+                        shadow.readable[i] && shadow.original[i] != copy.staging.mapped_span[i];
                 }
                 ++state.stats.comparisons;
-                if (ready) ++state.stats.ready_checks; else ++state.stats.late_checks;
+                if (ready)
+                    ++state.stats.ready_checks;
+                else
+                    ++state.stats.late_checks;
                 state.stats.compared_bytes += compared;
                 if (different) {
                     state.failed = true;
                     state.active = false;
                     state.Reset();
                     ++state.stats.mismatches;
-                    LOG_ERROR(HW_GPU, "Early buffer verification mismatch: page={:#x} "
+                    LOG_ERROR(HW_GPU,
+                              "Early buffer verification mismatch: page={:#x} "
                               "compared={} differing_bytes={}; original retained",
                               address, compared, different);
                 }
@@ -583,7 +619,8 @@ bool BufferCache<P>::TryEarlyCpuRead(DAddr address, u64 size) {
         }
         // The guest store publishes its dirty range before checking this gate.
         // Do not take query/cache locks or wait on Vulkan under the mapping mutex.
-        const Core::DownloadLanding::Scope landing{device_memory.download_landing, address, address + size};
+        const Core::DownloadLanding::Scope landing{device_memory.download_landing, address,
+                                                   address + size};
         const auto cpu_written = PendingCpuWriteRanges();
         bool served = false;
         const u64 before_bytes = state.stats.hit_bytes;
@@ -591,9 +628,11 @@ bool BufferCache<P>::TryEarlyCpuRead(DAddr address, u64 size) {
             memory_tracker.ForEachDownloadRangeAndClear(address, size, [&](DAddr page, u64 bytes) {
                 gpu_modified_ranges.ForEachInRange(page, bytes, [&](DAddr begin, DAddr end) {
                     WriteDownloadedMemory(cpu_written, begin,
-                                          copy.staging.mapped_span.data() + (begin - address), end - begin);
+                                          copy.staging.mapped_span.data() + (begin - address),
+                                          end - begin);
                     u64 landed = end - begin;
-                    cpu_written.ForEachInRange(begin, landed, [&](DAddr lo, DAddr hi) { landed -= hi - lo; });
+                    cpu_written.ForEachInRange(begin, landed,
+                                               [&](DAddr lo, DAddr hi) { landed -= hi - lo; });
                     state.stats.hit_bytes += landed;
                     served = true;
                 });
@@ -601,10 +640,14 @@ bool BufferCache<P>::TryEarlyCpuRead(DAddr address, u64 size) {
                 gpu_modified_ranges.Subtract(page, bytes);
             });
         });
-        if (!pinned) ++state.stats.blocked;
-        if (!served) return false;
-        if (before_bytes != state.stats.hit_bytes) ++state.stats.hits;
-        else ++state.stats.cpu_only;
+        if (!pinned)
+            ++state.stats.blocked;
+        if (!served)
+            return false;
+        if (before_bytes != state.stats.hit_bytes)
+            ++state.stats.hits;
+        else
+            ++state.stats.cpu_only;
         copy.canceled = true;
         download_cpu_read_ranges = false;
         return true;
@@ -681,10 +724,12 @@ void BufferCache<P>::DownloadRangesMemory(std::span<const std::pair<DAddr, u64>>
                 for (const Download& download : staged) {
                     if constexpr (requires { staging->host_coherent; }) {
                         if (early_reads && early_reads->shadow && !staging->host_coherent) {
-                            const DAddr start = slot_buffers[download.buffer_id].CpuAddr() + download.copy.src_offset;
+                            const DAddr start = slot_buffers[download.buffer_id].CpuAddr() +
+                                                download.copy.src_offset;
                             const auto requested = early_reads->shadow->page;
-                            early_reads->shadow->uncertain |= start < requested + Early::PageSize &&
-                                                              requested < start + download.copy.size;
+                            early_reads->shadow->uncertain |=
+                                start < requested + Early::PageSize &&
+                                requested < start + download.copy.size;
                         }
                     }
                     WriteDownloadedMemory(
@@ -1341,12 +1386,14 @@ void BufferCache<P>::WriteDownloadedMemory(const Common::RangeSet<DAddr>& cpu_wr
         const DAddr begin = std::max(device_addr, shadow.page);
         const DAddr end = std::min(device_addr + size, shadow.page + Early::PageSize);
         if (begin < end) {
-            cpu_written.ForEachInRange(begin, end-begin, [&](DAddr lo, DAddr hi) { shadow.masked += hi-lo; });
+            cpu_written.ForEachInRange(begin, end - begin,
+                                       [&](DAddr lo, DAddr hi) { shadow.masked += hi - lo; });
         }
     }
     if (!cpu_written.Intersects(device_addr, size)) {
         if (auto* trace = VideoCore::ReadbackTrace::active) trace->Landed(device_addr, size);
-        if (early_reads) early_reads->Compare(device_addr, data, size);
+        if (early_reads)
+            early_reads->Compare(device_addr, data, size);
         device_memory.WriteBlockUnsafe(device_addr, data, size);
         return;
     }
@@ -1357,7 +1404,8 @@ void BufferCache<P>::WriteDownloadedMemory(const Common::RangeSet<DAddr>& cpu_wr
     });
     parts.ForEach([&](DAddr start, DAddr end) {
         if (auto* trace = VideoCore::ReadbackTrace::active) trace->Landed(start, end - start);
-        if (early_reads) early_reads->Compare(start, data + (start - device_addr), end - start);
+        if (early_reads)
+            early_reads->Compare(start, data + (start - device_addr), end - start);
         device_memory.WriteBlockUnsafe(start, data + (start - device_addr), end - start);
     });
 }
@@ -2370,7 +2418,8 @@ void BufferCache<P>::UpdateComputeTextureBuffers() {
 
 template <class P>
 void BufferCache<P>::MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u32 size, bool needs_sync) {
-    if (early_reads) early_reads->Write(device_addr, size, buffer_id, needs_sync);
+    if (early_reads)
+        early_reads->Write(device_addr, size, buffer_id, needs_sync);
     if constexpr (!IS_OPENGL) {
         if (needs_sync) {
             Buffer& buffer = slot_buffers[buffer_id];
@@ -2790,7 +2839,8 @@ BufferId BufferCache<P>::CreateBuffer(DAddr device_addr, u32 wanted_size,
 
 template <class P>
 void BufferCache<P>::Register(BufferId buffer_id) {
-    if (early_reads) slot_buffers[buffer_id].early_read_instance = ++early_reads->next_buffer_instance;
+    if (early_reads)
+        slot_buffers[buffer_id].early_read_instance = ++early_reads->next_buffer_instance;
     ChangeRegister<true>(buffer_id);
 }
 
@@ -2922,7 +2972,8 @@ template <class P>
 void BufferCache<P>::UploadMemory(Buffer& buffer, u64 total_size_bytes, u64 largest_copy,
                                   std::span<BufferCopy> copies) {
     if (early_reads) {
-        for (const auto& copy : copies) OutdateEarlyCpuReads(buffer.CpuAddr() + copy.dst_offset, copy.size);
+        for (const auto& copy : copies)
+            OutdateEarlyCpuReads(buffer.CpuAddr() + copy.dst_offset, copy.size);
     }
 
     if constexpr (USE_MEMORY_MAPS_FOR_UPLOADS) {
