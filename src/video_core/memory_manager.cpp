@@ -300,6 +300,35 @@ std::optional<DAddr> MemoryManager::GpuToCpuAddress(GPUVAddr addr, std::size_t s
     return std::nullopt;
 }
 
+bool MemoryManager::TryReadUniqueWords(GPUVAddr address, std::span<u32> dest, u64 generation) const {
+    constexpr size_t max_words = 0x1000; // MME DMA limit
+    constexpr u64 mask = Core::DEVICE_PAGEMASK;
+    if (dest.empty() || dest.size() > max_words || (address & 3) ||
+        page_bits < Core::DEVICE_PAGEBITS || big_page_bits < Core::DEVICE_PAGEBITS ||
+        address >= address_space_size || dest.size_bytes() > address_space_size - address) {
+        return false;
+    }
+    // GPU::MapInOrder drains page-table changes on the split. Independently, a service
+    // thread can change device-to-physical mappings. WithUniquePhysicalPages pins those.
+    std::array<DAddr, max_words * sizeof(u32) / Core::DEVICE_PAGESIZE + 1> pages;
+    size_t count{};
+    const u64 end = address + dest.size_bytes();
+    for (u64 cursor = address; cursor < end;) {
+        const auto page = GpuToCpuAddress(cursor);
+        if (!page || (*page & mask) != (cursor & mask)) {
+            return false;
+        }
+        pages[count++] = *page;
+        cursor += std::min(end - cursor, Core::DEVICE_PAGESIZE - (cursor & mask));
+    }
+    return memory.WithUniquePhysicalPages(std::span{pages}.first(count), generation, [&] {
+        for (u32& value : dest) {
+            value = Read<u32>(address); // Includes the native syncpoint shim.
+            address += sizeof(value);
+        }
+    });
+}
+
 template <typename T>
 T MemoryManager::Read(GPUVAddr addr) const {
     if constexpr (sizeof(T) == sizeof(u32)) {

@@ -115,6 +115,44 @@ public:
         return (PAddr(paddr - 1) << page_bits) + subbits;
     }
 
+    [[nodiscard]] u64 MappingGeneration() const {
+        return translation_generation.load(std::memory_order_acquire);
+    }
+
+    /// Reads only while Map/Unmap cannot change the mappings. The caller supplies one address
+    /// per 4 KiB page touched, and must not acquire cache locks or wait for the GPU in copy().
+    template <typename Func>
+    bool WithUniquePhysicalPages(std::span<const DAddr> addresses, u64 generation, Func&& copy) {
+        std::scoped_lock lk(mapping_guard);
+        if (MappingGeneration() != generation || addresses.empty()) {
+            return false;
+        }
+        for (const DAddr address : addresses) {
+            const auto page = address >> page_bits;
+            if (!page || page >= tracked_entries.size()) {
+                return false;
+            }
+            // Encoded raw physical page plus one: physical page zero is a valid mapping.
+            const u32 backing = tracked_entries[page].compressed_physical_ptr;
+            if (!backing || backing - 1U >= compressed_device_addr.size() ||
+                tracked_entries[0].compressed_physical_ptr == backing ||
+                compressed_device_addr[backing - 1U] != page) {
+                return false; // Unmapped, aliased, or inconsistent reverse mapping.
+            }
+            // A host report can memcpy an unaligned u64 across a physical page end. If our
+            // bytes could include that tail, its start must also have the expected device page.
+            if ((address & page_mask) < sizeof(u64) - 1 && backing > 1) {
+                const u32 previous = compressed_device_addr[backing - 2U];
+                if ((previous && previous != page - 1) ||
+                    tracked_entries[0].compressed_physical_ptr == backing - 1U) {
+                    return false;
+                }
+            }
+        }
+        copy();
+        return true;
+    }
+
     template <typename T>
     void Write(DAddr address, T value);
 

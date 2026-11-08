@@ -12,6 +12,7 @@
 #include <mutex>
 #include <optional>
 #include <source_location>
+#include <span>
 #include <vector>
 #include <boost/container/small_vector.hpp>
 
@@ -70,6 +71,12 @@ public:
     [[nodiscard]] std::optional<DAddr> GpuToCpuAddress(GPUVAddr addr) const;
 
     [[nodiscard]] std::optional<DAddr> GpuToCpuAddress(GPUVAddr addr, std::size_t size) const;
+
+    [[nodiscard]] u64 DeviceMappingGeneration() const { return memory.MappingGeneration(); }
+
+    /// Copies the same words as Read<u32> only if their physical pages have unique device
+    /// addresses throughout the read and no device mapping changed since the cache checks.
+    bool TryReadUniqueWords(GPUVAddr address, std::span<u32> dest, u64 generation) const;
 
     template <typename T>
     [[nodiscard]] T Read(GPUVAddr addr) const;

@@ -3,6 +3,8 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <filesystem>
+#include <string_view>
 #include <thread>
 
 #ifdef _MSC_VER
@@ -113,6 +115,13 @@ void GpuSplit::MaybeStart(Core::System& system_) {
     if (active || !allowed) {
         return;
     }
+    const auto enabled = [](const char* name) {
+        const char* value = std::getenv(name);
+        return value && std::string_view{value} == "1";
+    };
+    writer_requested = enabled("STITCH_WRITER_FRONTIER");
+    writer_verify = enabled("STITCH_WRITER_VERIFY");
+    writer_marker = std::getenv("STITCH_WRITER_FRONTIER_FILE");
     system = &system_;
     check_owner = std::getenv("EDEN_NX2_SPLIT_CHECK") != nullptr;
     ring = std::make_unique<u64[]>(RingWords);
@@ -141,6 +150,13 @@ void GpuSplit::Stop() {
     write_position = 0;
     last_writer_position = 0;
     last_sync_position = 0;
+    last_any_write = last_noted_write = writer_mapping_generation = 0;
+    write_positions.fill(0);
+    writer_requested = writer_frontier = writer_verify = false;
+    // A failed verification stays latched for the life of this split, even across Stop/Start.
+    writer_marker = nullptr;
+    writer_marker_reads = 0;
+    writer_attempts = writer_waits = writer_fast = writer_compared = 0;
     published_local = 0;
     consumed_cache = 0;
     publish_every = PublishEvery;
@@ -226,6 +242,119 @@ bool GpuSplit::WaitForSync() {
     return WaitFor(std::min(last_sync_position, write_position), DrainSite::ListSync);
 }
 
+namespace {
+
+/// Calls `func(device_address, size)` for each mapped piece of [address, address + size) within
+/// one 4 KiB GPU page. False means a piece was not mapped at classification time.
+template <typename Func>
+bool ForEachDeviceRange(const Tegra::MemoryManager& memory, GPUVAddr address, u64 size,
+                        Func&& func) {
+    constexpr GPUVAddr page_size = 0x1000;
+    const GPUVAddr end = address + size;
+    for (GPUVAddr begin = address; begin < end;) {
+        const GPUVAddr page_end = begin + std::min(page_size - (begin & (page_size - 1)), end - begin);
+        const auto device = memory.GpuToCpuAddress(begin);
+        if (!device) {
+            return false;
+        }
+        func(*device, page_end - begin);
+        begin = page_end;
+    }
+    return true;
+}
+
+} // Anonymous namespace
+
+void GpuSplit::NoteWrite(const Tegra::MemoryManager& memory, GPUVAddr address, u64 size) {
+    const u64 generation = memory.DeviceMappingGeneration();
+    if (generation != writer_mapping_generation) {
+        // A previous queued write might have already obtained a pointer to its old backing.
+        last_any_write = std::max(last_any_write, last_noted_write);
+        writer_mapping_generation = generation;
+    }
+    // A write may allocate backing for a Switch 2 sparse page. Never predict its address.
+    if (size > MaxNotedBytes || address + size < address ||
+        (address < Tegra::g_nx2_sparse_high.load(std::memory_order_relaxed) &&
+         address + size > Tegra::g_nx2_sparse_low.load(std::memory_order_relaxed))) {
+        NoteAnyWrite();
+        return;
+    }
+    if (!ForEachDeviceRange(memory, address, size,
+                            [this](DAddr device, u64 bytes) { NoteDeviceWrite(device, bytes); })) {
+        NoteAnyWrite();
+    }
+}
+
+void GpuSplit::NoteDeviceWrite(DAddr address, u64 size) {
+    const u64 last = (address + size - 1) >> WriteGranuleBits;
+    for (u64 granule = address >> WriteGranuleBits; granule <= last; ++granule) {
+        write_positions[WriteSlot(granule)] = write_position;
+    }
+    last_noted_write = write_position;
+}
+
+u64 GpuSplit::WritesTarget(const Tegra::MemoryManager& memory, GPUVAddr address, u64 size) const {
+    if (memory.DeviceMappingGeneration() != writer_mapping_generation ||
+        size > MaxNotedBytes || address + size < address) {
+        return std::max(last_any_write, last_noted_write);
+    }
+    u64 target = last_any_write;
+    if (!ForEachDeviceRange(memory, address, size, [this, &target](DAddr device, u64 bytes) {
+            target = std::max(target, DeviceWritesTarget(device, bytes));
+        })) {
+        return std::max(last_any_write, last_noted_write);
+    }
+    return target;
+}
+
+u64 GpuSplit::DeviceWritesTarget(DAddr address, u64 size) const {
+    u64 target = 0;
+    const u64 last = (address + size - 1) >> WriteGranuleBits;
+    for (u64 granule = address >> WriteGranuleBits; granule <= last; ++granule) {
+        target = std::max(target, write_positions[WriteSlot(granule)]);
+    }
+    return target;
+}
+
+bool GpuSplit::WaitForWrites(const Tegra::MemoryManager& memory, GPUVAddr address, u64 size) {
+    return WaitFor(std::min(WritesTarget(memory, address, size), write_position),
+                   DrainSite::MacroDmaWrites);
+}
+
+bool GpuSplit::SelectWriterFrontier() {
+    if (!writer_requested || writer_rejected) {
+        return false;
+    }
+    if ((writer_marker_reads++ & 1023U) == 0) {
+        std::error_code error;
+        const bool enable = !writer_marker || std::filesystem::exists(writer_marker, error);
+        if (enable != writer_frontier) {
+            // Every entry sent before tracking was enabled is an unknown writer.
+            last_any_write = write_position;
+            writer_frontier = enable;
+            LOG_INFO(HW_GPU, "Macro writer frontier {} (verify={})", enable, writer_verify);
+        }
+    }
+    return writer_frontier;
+}
+
+void GpuSplit::CountWriterRead(bool waited, bool used, bool compared) {
+    ++writer_attempts;
+    writer_waits += waited;
+    writer_fast += used;
+    writer_compared += compared;
+    if ((writer_attempts & 65535U) == 0) {
+        LOG_INFO(HW_GPU, "Macro writer reads: attempts={} waited_for_writer={} "
+                         "no_cache_flush={} compared={}",
+                 writer_attempts, writer_waits, writer_fast, writer_compared);
+    }
+}
+
+void GpuSplit::RejectWriterFrontier() {
+    writer_rejected = true;
+    writer_frontier = false;
+}
+
 bool GpuSplit::WaitFor(u64 target, DrainSite site) {
     consumed_cache = consumed.load(std::memory_order_acquire);
     if (consumed_cache >= target) {
@@ -274,7 +403,8 @@ void GpuSplit::SwitchEngine(Tegra::Engines::EngineInterface* engine) {
 }
 
 void GpuSplit::MultiMethod(Tegra::Engines::EngineInterface* engine, u32 method, const u32* words,
-                           u32 amount, u32 methods_pending, const GPUVAddr* segment) {
+                           u32 amount, u32 methods_pending, const GPUVAddr* segment,
+                           Writes writes) {
     SelectEngine(engine);
     // Long runs (constant buffer and inline uploads) go in pieces, as when a method's data
     // continues in the next GPFIFO entry.
@@ -295,6 +425,9 @@ void GpuSplit::MultiMethod(Tegra::Engines::EngineInterface* engine, u32 method, 
         words += piece;
         amount -= piece;
         methods_pending -= piece;
+    }
+    if (writes == Writes::Anywhere) {
+        NoteAnyWrite();
     }
 }
 

@@ -11,6 +11,8 @@
 #include <limits>
 #include <optional>
 #include <string>
+
+#include <boost/container/small_vector.hpp>
 #include "common/assert.h"
 #include "common/bit_util.h"
 #include "common/scope_exit.h"
@@ -1208,10 +1210,14 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
             break;
         }
     }
+    using Writes = VideoCommon::GpuSplit::Writes;
     if (from_macro) {
-        split.MacroWrite(this, method, argument);
+        split.MacroWrite(this, method, argument, Writes::Noted);
     } else {
-        split.Method(this, method, argument, is_last_call, nullptr);
+        split.Method(this, method, argument, is_last_call, nullptr, Writes::Noted);
+    }
+    if (split.TracksMemoryWrites() && (from_macro || execution_mask[method])) {
+        FrontNoteWrites(split, fs, method, 1);
     }
 }
 
@@ -1319,7 +1325,11 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
             }
         }
     }
-    split.MultiMethod(this, method, base_start, amount, methods_pending, nullptr);
+    split.MultiMethod(this, method, base_start, amount, methods_pending, nullptr,
+                      VideoCommon::GpuSplit::Writes::Noted);
+    if (split.TracksMemoryWrites()) {
+        FrontNoteWrites(split, fs, method, amount);
+    }
 }
 
 void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split,
@@ -1414,10 +1424,51 @@ bool Maxwell3D::FrontSkipsLoopWrite(FrontState& fs, u32 method, u32 value, bool 
     return method != MAXWELL3D_REG_INDEX(draw.end) || fs.instance_loop;
 }
 
+// Classify the completed ring entry for subsequent macro reads. Only state writes and
+// constant-buffer destinations can narrow the wait; unknown executable methods stay ordered.
+void Maxwell3D::FrontNoteWrites(VideoCommon::GpuSplit& split, const FrontState& fs, u32 method,
+                                u32 amount) {
+    constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
+    const auto address = [&fs](u32 high) {
+        return (GPUVAddr{fs.regs[high]} << 32) | fs.regs[high + 1];
+    };
+    if (fs.draw_pending) {
+        // A draw, or one an instance loop deferred to this entry (ProcessDirtyRegisters): where
+        // its shaders store, and what the caches download for it, only the back knows.
+        split.NoteAnyWrite();
+        return;
+    }
+    if (method >= cb_data && method < cb_data + 16) {
+        // FrontWrite and FrontCallMultiMethod advanced the offset past these words already.
+        const u64 bytes = u64{amount} * sizeof(u32);
+        const u32 offset = fs.regs[MAXWELL3D_REG_INDEX(const_buffer.offset)] - static_cast<u32>(bytes);
+        split.NoteWrite(memory_manager,
+                        address(MAXWELL3D_REG_INDEX(const_buffer.address_high)) + offset, bytes);
+        return;
+    }
+    if (!execution_mask[method]) {
+        // A macro's direct state write can flush a deferred draw; draw_pending above covers it.
+        return;
+    }
+    switch (method) {
+    case MAXWELL3D_REG_INDEX(shadow_ram_control):
+    case MAXWELL3D_REG_INDEX(load_mme.instruction_ptr):
+    case MAXWELL3D_REG_INDEX(load_mme.instruction):
+    case MAXWELL3D_REG_INDEX(load_mme.start_address):
+    case MAXWELL3D_REG_INDEX(falcon[4]):
+    case RootTables::SelectMethod:
+    case RootTables::LoadMethod:
+        return;
+    default:
+        // Reports can execute fence callbacks; the pitch/size of an inline upload is latched
+        // at launch. Other engines, barriers, condition changes and future methods stay ordered.
+        split.NoteAnyWrite();
+        return;
+    }
+}
+
 void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 macro,
                              u32 method, u32 count) {
-    // The words may be written by methods still queued for the back (indirect draw arguments
-    // from a culling dispatch), and the caches that may hold newer ones belong to it.
     const GPUVAddr source = (GPUVAddr{fs.regs[0x154] & 0x1ffffff} << 32) | fs.regs[0x155];
     const u32 ram = fs.regs[0x156];
     const u32 words = std::min<u32>(count, 0x1000);
@@ -1428,37 +1479,74 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
         memory_manager.ReadBlockUnsafe(source, diag_before.data(), read_bytes);
     }
     VideoCommon::Nx2Profile::CountDmaRead(macro);
-    split.Drain(VideoCommon::DrainSite::MacroDmaRead);
-    if (VideoCommon::QueryDma::TraceEnabled()) {
-        split.Run(
-            [this, macro, method, source, read_bytes] {
-                if (VideoCommon::QueryDma::HasPendingQueries(memory_manager, *rasterizer, source,
-                                                             read_bytes)) {
-                    VideoCommon::QueryDma::Trace(memory_manager, *rasterizer, macro, method,
-                                                 source, read_bytes);
-                }
-            },
-            VideoCommon::DrainSite::MacroDmaFlush);
-    }
     if (VideoCommon::Nx2Profile::Enabled()) {
         VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::DmaReadBytes, read_bytes);
     }
-    if (memory_manager.IsMemoryDirty(source, read_bytes, VideoCommon::CacheType::BufferCache)) {
+    // Drains the split, and has the back write out what its caches hold of the words: data the
+    // GPU wrote (indirect draw arguments from a culling dispatch), reports the query cache holds
+    // until their fence or host result (else the read returns stale occlusion counts).
+    const auto write_out = [&] {
+        split.Drain(VideoCommon::DrainSite::MacroDmaRead);
+        if (VideoCommon::QueryDma::TraceEnabled()) {
+            split.Run(
+                [this, macro, method, source, read_bytes] {
+                    if (VideoCommon::QueryDma::HasPendingQueries(memory_manager, *rasterizer,
+                                                                 source, read_bytes)) {
+                        VideoCommon::QueryDma::Trace(memory_manager, *rasterizer, macro, method,
+                                                     source, read_bytes);
+                    }
+                },
+                VideoCommon::DrainSite::MacroDmaFlush);
+        }
+        if (memory_manager.IsMemoryDirty(source, read_bytes, VideoCommon::CacheType::BufferCache)) {
+            split.Run(
+                [memory = &memory_manager, source, read_bytes] {
+                    memory->FlushRegion(source, read_bytes, VideoCommon::CacheType::BufferCache);
+                },
+                VideoCommon::DrainSite::MacroDmaFlush);
+        }
         split.Run(
-            [memory = &memory_manager, source, read_bytes] {
-                memory->FlushRegion(source, read_bytes, VideoCommon::CacheType::BufferCache);
+            [this, source, read_bytes] {
+                VideoCommon::QueryDma::FlushPending(memory_manager, *rasterizer, source,
+                                                    read_bytes);
             },
             VideoCommon::DrainSite::MacroDmaFlush);
+    };
+    // Only the work still queued that can write the words has to run first (FrontNoteWrites,
+    // GpuSplit::WaitForWrites). Past it no entry can make them GPU-written or add reports there,
+    // so the caches have nothing to write out unless they already hold it now.
+    bool candidate = split.SelectWriterFrontier() && words && (source & 3U) == 0 &&
+                     !Tegra::Nx2CmdPageDiag::g_enabled && !VideoCommon::QueryDma::TraceEnabled();
+    boost::container::small_vector<u32, 8> observed;
+    if (candidate) {
+        const u64 generation = memory_manager.DeviceMappingGeneration();
+        const bool waited = split.WaitForWrites(memory_manager, source, read_bytes);
+        if (!memory_manager.IsMemoryDirty(source, read_bytes, VideoCommon::CacheType::BufferCache) &&
+            !VideoCommon::QueryDma::HoldsReports(memory_manager, *rasterizer, source, read_bytes)) {
+            observed.resize(words);
+            // Both caches and the writer table are keyed by device address. If a second device
+            // address maps to any source physical page, none of those lookups proves it clean.
+            candidate = memory_manager.TryReadUniqueWords(
+                source, {observed.data(), observed.size()}, generation);
+        } else {
+            candidate = false;
+        }
+        split.CountWriterRead(waited, candidate, candidate && split.VerifyWriterReads());
     }
-    // Write out the reports held in the query cache, or the read returns stale occlusion counts.
-    split.Run(
-        [this, source, read_bytes] {
-            VideoCommon::QueryDma::FlushPending(memory_manager, *rasterizer, source, read_bytes);
-        },
-        VideoCommon::DrainSite::MacroDmaFlush);
+    const bool check = candidate && split.VerifyWriterReads();
+    if (!candidate || check) {
+        write_out();
+    }
     u32 changed{};
     for (u32 i = 0; i < words; ++i) {
-        const u32 word = memory_manager.Read<u32>(source + u64{i} * sizeof(u32));
+        const u32 word = candidate && !check ? observed[i]
+                         : memory_manager.Read<u32>(source + u64{i} * sizeof(u32));
+        if (check && !observed.empty() && observed[i] != word) {
+            LOG_ERROR(HW_GPU, "Macro writer verification failed: macro={:#x} method={:#x} "
+                      "word={}/{}; using the drained result and disabling fast reads", macro, method, i, words);
+            split.RejectWriterFrontier();
+            observed.clear();
+        }
         if (method == 0x158) {
             fs.parameters.push_back(word);
         } else if (ram + i < native_data_ram.size()) {

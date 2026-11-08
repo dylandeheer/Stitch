@@ -60,6 +60,27 @@ struct GpuSplitTestAccess {
             &split.ring[index], std::min<u64>(available - position, GpuSplit::RingWords - index));
         return position + (size != 0 ? size : GpuSplit::RingWords - index);
     }
+
+    static bool FrontWaits(const GpuSplit& split) {
+        return split.front_waiting.load(std::memory_order_seq_cst);
+    }
+
+    static void EnableWriterFrontier(GpuSplit& split, bool verify = false) {
+        split.writer_requested = true;
+        split.writer_verify = verify;
+        static_cast<void>(split.SelectWriterFrontier());
+    }
+
+    static u64 WritesTarget(const GpuSplit& split, const Tegra::MemoryManager& memory,
+                            GPUVAddr address, u64 size) {
+        return split.WritesTarget(memory, address, size);
+    }
+
+    /// Whether writes to two device addresses share a slot of the noted write positions.
+    static bool ShareWriteSlot(DAddr a, DAddr b) {
+        return GpuSplit::WriteSlot(a >> GpuSplit::WriteGranuleBits) ==
+               GpuSplit::WriteSlot(b >> GpuSplit::WriteGranuleBits);
+    }
 };
 
 } // namespace VideoCommon
@@ -196,6 +217,27 @@ u32 RandomArgument(std::mt19937& rng, u32 method, const Maxwell3D& engine) {
         return (rng() % 8) | ((rng() % 64 * 4) << 8);
     }
     return rng() % 64;
+}
+
+/// A Turing MME instruction that sends the next macro parameter to `method` (as in
+/// native_macro_fifo.cpp); `end` makes the instruction after it the macro's last.
+std::array<u32, 3> FifoInstruction(u32 method, bool end) {
+    std::array<u32, 3> bits{};
+    const auto field = [&](u32 offset, u32 count, u32 value) {
+        for (u32 bit = 0; bit < count; ++bit) {
+            bits[(offset + bit) / 32] |= ((value >> bit) & 1) << ((offset + bit) % 32);
+        }
+    };
+    field(0, 1, end);
+    for (u32 lane = 0; lane < 2; ++lane) {
+        field(15 + lane * 36, 5, 24);
+        field(20 + lane * 36, 5, 24);
+        field(25 + lane * 36, 5, 24);
+    }
+    field(30, 16, method);
+    field(82, 3, 5);
+    field(85, 4, 3);
+    return {bits[2], bits[1], bits[0]};
 }
 
 } // Anonymous namespace
@@ -836,4 +878,322 @@ TEST_CASE("Maxwell3D's split front uploads macro code sent as one multi-method r
     const auto& macros = engine.GetNativeMacroEngine();
     REQUIRE(macros.native_write_offset == pointer * 3 + code.size());
     CHECK(std::equal(code.begin(), code.end(), macros.native_code.begin() + pointer * 3));
+}
+
+TEST_CASE("Split macro DMA reads wait only for the queued work that can write the words",
+          "[video_core][gpu_split_dependencies]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    using Writes = VideoCommon::GpuSplit::Writes;
+    Fixture f;
+    f.system.Initialize();
+    Kernel::KProcess process{f.system.Kernel()};
+    SCOPE_EXIT {
+        f.system.Kernel().UnregisterKernelObject(&process);
+    };
+    auto& table = process.GetPageTable().GetImpl();
+    table.Resize(20, 12);
+    constexpr VAddr cpu_address = 0x4000;
+    constexpr DAddr device_address = 0x10000;
+    constexpr GPUVAddr gpu_address = 0x100000;
+    constexpr GPUVAddr alias = 0x200000; // The first page again
+    auto* backing = f.physical.GetPointerFromRaw<u8>(0x10000);
+    for (u64 page = 0; page < 2; ++page) {
+        const VAddr address = cpu_address + page * 0x1000;
+        table.entries.GetAndFault(address >> 12)
+            .Store(false, Common::PageType::Memory, 1,
+                   reinterpret_cast<uintptr_t>(backing + page * 0x1000) - address);
+    }
+    process.GetMemory().SetCurrentPageTable(process);
+    const auto asid = f.device_memory.RegisterProcess(&process.GetMemory());
+    f.device_memory.BindInterface(&f.rasterizer);
+    f.device_memory.Map(device_address, cpu_address, 0x2000, asid);
+    SCOPE_EXIT {
+        f.device_memory.Unmap(device_address, 0x2000);
+        f.device_memory.UnregisterProcess(asid);
+    };
+    f.memory.BindRasterizer(&f.rasterizer);
+    f.memory.Map(gpu_address, device_address, 0x2000, Tegra::PTEKind::PITCH, false);
+    f.memory.Map(alias, device_address, 0x1000, Tegra::PTEKind::PITCH, false);
+    std::memset(backing, 0, 0x2000);
+    // The words read below, in two 256-byte granules that do not share a write slot.
+    constexpr GPUVAddr word = gpu_address + 0x40;
+    constexpr GPUVAddr other = gpu_address + 0x140;
+    REQUIRE_FALSE(Access::ShareWriteSlot(device_address + 0x40, device_address + 0x140));
+
+    {
+        // Where reads wait: writes are placed by device memory, any GPU address of it.
+        VideoCommon::GpuSplit split;
+        Access::Initialize(split, f.system);
+        Access::EnableWriterFrontier(split);
+        split.Defer([] {}, Writes::Noted);
+        split.NoteWrite(f.memory, alias + 0x48, 4);
+        const u64 noted = Access::End(split);
+        CHECK(Access::WritesTarget(split, f.memory, word, 0x18) == noted);
+        CHECK(Access::WritesTarget(split, f.memory, other, 0x18) == 0);
+        split.Defer([] {}, Writes::Noted);
+        split.NoteWrite(f.memory, 0x300000, 16); // Incomplete mappings cannot narrow a writer.
+        CHECK(Access::WritesTarget(split, f.memory, other, 0x18) == Access::End(split));
+        // Writes too long to place, and work nobody noted the writes of, count as anywhere.
+        split.Defer([] {}, Writes::Noted);
+        split.NoteWrite(f.memory, gpu_address + 0x1000, 0x8000);
+        CHECK(Access::WritesTarget(split, f.memory, other, 0x18) == Access::End(split));
+        split.Defer([] {});
+        CHECK(Access::WritesTarget(split, f.memory, other, 0x18) == Access::End(split));
+    }
+
+    // The 3D engine's front, against a running back: macro 0 reads one word with
+    // MME_DMA_READ_FIFOED at the address in its first two parameters and sends it to a scratch
+    // register (the load after the read takes the word).
+    auto& engine = f.fast;
+    engine.SetNativeTuringMacroMode(true);
+    constexpr u32 state = MAXWELL3D_REG_INDEX(shadow_scratch) + 1;
+    VideoCommon::GpuSplit split;
+    Access::Start(split, f.system);
+    SCOPE_EXIT {
+        split.Stop();
+    };
+    Access::EnableWriterFrontier(split);
+    std::array<std::atomic<bool>, 7> release{};
+    std::atomic<bool> done{};
+    std::thread reader;
+    SCOPE_EXIT {
+        for (auto& flag : release) {
+            flag = true;
+        }
+        if (reader.joinable()) {
+            reader.join();
+        }
+    };
+    const auto front = [&](u32 method, u32 argument) {
+        engine.FrontCallMethod(f.system, split, method, argument, true);
+    };
+    std::vector<u32> code;
+    for (const auto instruction : {FifoInstruction(0x154, false), FifoInstruction(0x155, false),
+                                   FifoInstruction(0x158, true), FifoInstruction(state, false)}) {
+        code.insert(code.end(), instruction.begin(), instruction.end());
+    }
+    front(MAXWELL3D_REG_INDEX(load_mme.instruction_ptr), 0);
+    engine.FrontCallMultiMethod(f.system, split, MAXWELL3D_REG_INDEX(load_mme.instruction),
+                                code.data(), static_cast<u32>(code.size()),
+                                static_cast<u32>(code.size()));
+    front(MAXWELL3D_REG_INDEX(load_mme.start_address_ptr), 0);
+    front(MAXWELL3D_REG_INDEX(load_mme.start_address), 0);
+    const auto dma_read = [&](GPUVAddr address) {
+        engine.FrontCallMethod(f.system, split, 0xe00, static_cast<u32>(address >> 32), false);
+        engine.FrontCallMethod(f.system, split, 0xe01, static_cast<u32>(address), false);
+        engine.FrontCallMethod(f.system, split, 0xe01, 1, true);
+    };
+    const auto read_on_reader = [&](GPUVAddr address) {
+        done = false;
+        reader = std::thread([&, address] {
+            dma_read(address);
+            done = true;
+        });
+    };
+    const auto finishes = [&done] {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{5};
+        while (!done.load() && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds{1});
+        }
+        return done.load();
+    };
+    const auto waits = [&] {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{5};
+        while (!Access::FrontWaits(split) && !done.load() &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::yield();
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds{20});
+        return !done.load();
+    };
+    // A constant buffer word, sent through the front.
+    const auto upload = [&](GPUVAddr address, u32 value) {
+        front(CbAddressHigh, static_cast<u32>(address >> 32));
+        front(CbAddressLow, static_cast<u32>(address));
+        front(CbSize, 0x100);
+        front(CbOffset, 0);
+        front(CbData, value);
+    };
+    // An entry the back stays in until its flag is set.
+    const auto blocking = [&split](std::atomic<bool>& flag, Writes writes) {
+        split.Defer(
+            [&flag] {
+                while (!flag.load()) {
+                    std::this_thread::yield();
+                }
+            },
+            writes);
+        split.Publish();
+    };
+
+    // The first macro also ends the front's assumption that a draw may be pending.
+    upload(word, 0x11111111);
+    upload(other, 0x22222222);
+    dma_read(word);
+    split.Drain(VideoCommon::DrainSite::Other);
+    REQUIRE(engine.regs.reg_array[state] == 0x11111111);
+
+    // Work that writes nothing and a write of other words, still queued: the read goes ahead.
+    blocking(release[0], Writes::Noted);
+    upload(other, 0x33333333);
+    read_on_reader(word);
+    REQUIRE(finishes());
+    reader.join();
+    release[0] = true;
+    split.Drain(VideoCommon::DrainSite::Other);
+    CHECK(engine.regs.reg_array[state] == 0x11111111);
+    CHECK(f.memory.Read<u32>(other) == 0x33333333);
+
+    // A write of the word through its other GPU address: the read waits for it and sees it.
+    blocking(release[1], Writes::Noted);
+    upload(alias + 0x40, 0x44444444);
+    read_on_reader(word);
+    REQUIRE(waits());
+    release[1] = true;
+    REQUIRE(finishes());
+    reader.join();
+    split.Drain(VideoCommon::DrainSite::Other);
+    CHECK(engine.regs.reg_array[state] == 0x44444444);
+
+    // Work whose writes are not noted: the read waits for it.
+    blocking(release[2], Writes::Anywhere);
+    read_on_reader(other);
+    REQUIRE(waits());
+    release[2] = true;
+    REQUIRE(finishes());
+    reader.join();
+    split.Drain(VideoCommon::DrainSite::Other);
+    CHECK(engine.regs.reg_array[state] == 0x33333333);
+
+    // A 3D draw can first write any SSBO, including through the emulated task/mesh stages.
+    // Its query page need not have been marked GPU-written before execution on the back.
+    front(MAXWELL3D_REG_INDEX(draw.begin), 0);
+    CHECK(Access::WritesTarget(split, f.memory, other, 16) == Access::End(split));
+    front(MAXWELL3D_REG_INDEX(draw.end), 0);
+    CHECK(Access::WritesTarget(split, f.memory, word, 16) == Access::End(split));
+    // A macro closes the front's draw-pending window by queuing FinishFrontMacro.
+    dma_read(word);
+    split.Drain();
+
+    // Distinct device pages alias the same physical RAM. The buffer/query caches are keyed
+    // by device address, so the baseline must also run when there is no pending noted writer.
+    constexpr DAddr second_device = 0x30000;
+    constexpr GPUVAddr second_gpu = 0x300000;
+    REQUIRE_FALSE(Access::ShareWriteSlot(device_address + 0x40, second_device + 0x40));
+    {
+        f.device_memory.Map(second_device, cpu_address, 0x1000, asid);
+        SCOPE_EXIT { f.device_memory.Unmap(second_device, 0x1000); };
+        f.memory.Map(second_gpu, second_device, 0x1000, Tegra::PTEKind::PITCH, false);
+        REQUIRE(f.memory.GpuToCpuAddress(word) != f.memory.GpuToCpuAddress(second_gpu + 0x40));
+        REQUIRE(f.device_memory.GetPointer<u8>(device_address + 0x40) ==
+                f.device_memory.GetPointer<u8>(second_device + 0x40));
+        blocking(release[5], Writes::Noted);
+        upload(word, 0xabcdef01);
+        read_on_reader(second_gpu + 0x40);
+        CHECK(waits());
+        release[5] = true;
+        REQUIRE(finishes());
+        reader.join();
+        split.Drain();
+        CHECK(engine.regs.reg_array[state] == 0xabcdef01);
+        blocking(release[6], Writes::Noted);
+        read_on_reader(second_gpu + 0x40);
+        CHECK(waits());
+        release[6] = true;
+        REQUIRE(finishes());
+        reader.join();
+        split.Drain();
+    }
+
+    // Deliberately misclassify a writer to exercise the verification fail-safe. The front reads
+    // the old value, waits in the reference path, then must deliver the *new* value to the MME.
+    Access::EnableWriterFrontier(split, true);
+    split.Defer([&] {
+        while (!release[3].load()) {
+            std::this_thread::yield();
+        }
+        f.memory.Write<u32>(word, 0x55555555);
+    }, Writes::Noted);
+    split.Publish();
+    read_on_reader(word);
+    REQUIRE(waits());
+    release[3] = true;
+    REQUIRE(finishes());
+    reader.join();
+    split.Drain();
+    CHECK(engine.regs.reg_array[state] == 0x55555555);
+    REQUIRE_FALSE(split.TracksMemoryWrites());
+    // The latched mismatch survives later reads and marker polls.
+    blocking(release[4], Writes::Noted);
+    read_on_reader(other);
+    REQUIRE(waits());
+    release[4] = true;
+    REQUIRE(finishes());
+    reader.join();
+    split.Drain();
+    CHECK(engine.regs.reg_array[state] == 0x33333333);
+}
+
+TEST_CASE("MME fast reads require stable unique physical backing on every source page",
+          "[video_core][gpu_split_dependencies]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    Fixture f;
+    f.system.Initialize();
+    Kernel::KProcess process{f.system.Kernel()};
+    SCOPE_EXIT { f.system.Kernel().UnregisterKernelObject(&process); };
+    auto& table = process.GetPageTable().GetImpl();
+    table.Resize(20, 12);
+    constexpr VAddr cpu = 0x4000;
+    constexpr DAddr device = 0x10000, second = 0x30000;
+    constexpr GPUVAddr gpu = 0x100000;
+    auto* backing = f.physical.GetPointerFromRaw<u8>(0);
+    for (u64 i = 0; i < 2; ++i) {
+        const auto address = cpu + 0x1000 * i;
+        table.entries.GetAndFault(address >> 12)
+            .Store(false, Common::PageType::Memory, 1,
+                   reinterpret_cast<uintptr_t>(backing + 0x1000 * i) - address);
+    }
+    process.GetMemory().SetCurrentPageTable(process);
+    const auto asid = f.device_memory.RegisterProcess(&process.GetMemory());
+    f.device_memory.BindInterface(&f.rasterizer);
+    f.memory.BindRasterizer(&f.rasterizer);
+    f.memory.Map(gpu, device, 0x2000, Tegra::PTEKind::PITCH, false);
+    f.device_memory.Map(device, cpu, 0x1000, asid);
+    SCOPE_EXIT {
+        f.device_memory.Unmap(device, 0x1000);
+        f.device_memory.UnregisterProcess(asid);
+    };
+    REQUIRE(f.device_memory.GetPhysicalRawAddressFromDAddr(device) == 0);
+    REQUIRE(f.device_memory.GetPhysicalRawAddressFromDAddr(device + 0x1000) == 0);
+    const u64 first = f.memory.DeviceMappingGeneration();
+    f.memory.Write<u32>(gpu, 0xe145f127);
+    f.memory.Write<u32>(gpu + 0xffc, 0xaaaabbbb);
+    std::array<u32, 2> words{};
+    REQUIRE(f.memory.TryReadUniqueWords(gpu, words, first)); // Physical page zero really exists.
+    CHECK(words[0] == 0xe145f127);
+    REQUIRE_FALSE(f.memory.TryReadUniqueWords(gpu + 0xffc, words, first)); // Second PTE missing.
+    f.device_memory.Map(device + 0x1000, cpu + 0x1000, 0x1000, asid);
+    SCOPE_EXIT { f.device_memory.Unmap(device + 0x1000, 0x1000); };
+    const auto next = f.memory.DeviceMappingGeneration();
+    f.memory.Write<u32>(gpu + 0x1000, 0xccccdddd);
+    REQUIRE_FALSE(f.memory.TryReadUniqueWords(gpu + 0xffc, words, first)); // Stale cache checks.
+    REQUIRE(f.memory.TryReadUniqueWords(gpu + 0xffc, words, next));
+    CHECK(words[0] == 0xaaaabbbb);
+    CHECK(words[1] == 0xccccdddd);
+
+    VideoCommon::GpuSplit split;
+    Access::Initialize(split, f.system);
+    Access::EnableWriterFrontier(split);
+    split.Defer([] {}, VideoCommon::GpuSplit::Writes::Noted);
+    split.NoteWrite(f.memory, gpu + 0x40, 4);
+    const auto pending = Access::End(split);
+    CHECK(Access::WritesTarget(split, f.memory, gpu + 0x140, 4) == 0);
+    f.device_memory.Map(second, cpu + 0x1000, 0x1000, asid);
+    SCOPE_EXIT { f.device_memory.Unmap(second, 0x1000); };
+    const auto shared = f.memory.DeviceMappingGeneration();
+    REQUIRE_FALSE(f.memory.TryReadUniqueWords(gpu + 0xffc, words, shared)); // Only last page aliased.
+    CHECK(Access::WritesTarget(split, f.memory, gpu + 0x140, 4) == pending);
+    split.Defer([] {}, VideoCommon::GpuSplit::Writes::Noted);
+    split.NoteWrite(f.memory, gpu + 0x240, 4);
+    CHECK(Access::WritesTarget(split, f.memory, gpu + 0x140, 4) == pending);
 }
