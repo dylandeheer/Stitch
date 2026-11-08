@@ -9,6 +9,8 @@
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <filesystem>
+#include <string_view>
 #include <limits>
 #include <vector>
 
@@ -191,6 +193,52 @@ void TraceUpscalerDispatch(UpscalerTrace& trace, const Shader::Info& info, u64 s
 }
 } // namespace
 
+void TensorPipelineMode::Initialize(bool supported, const char* setting,
+                                   const char* baseline_file) {
+    enabled = supported && setting && std::string_view{setting} == "1";
+    if (enabled) {
+        marker = baseline_file ? baseline_file : "";
+        paired.store(ReadMarker(), std::memory_order_relaxed);
+    }
+}
+
+bool TensorPipelineMode::ReadMarker() const {
+    if (marker.empty()) {
+        return true;
+    }
+    std::error_code error;
+    return !std::filesystem::exists(marker, error) && !error;
+}
+
+void TensorPipelineMode::TickFrame(u64 frame) {
+    if (!enabled) {
+        return;
+    }
+    const bool previous = Paired();
+    const bool active = frame % 16 == 0 ? ReadMarker() : previous;
+    if (previous != active || frame % 120 == 0 || frame == 1) {
+        LOG_INFO(Render_Vulkan,
+                 "Tensor variant frame={} prior={} next={} eligible_builds={} ready_builds={} "
+                 "baseline_binds={} paired_binds={}", frame, previous ? "paired" : "baseline",
+                 active ? "paired" : "baseline", eligible_builds.load(std::memory_order_relaxed),
+                 ready_builds.load(std::memory_order_relaxed),
+                 baseline_binds.exchange(0, std::memory_order_relaxed),
+                 paired_binds.exchange(0, std::memory_order_relaxed));
+        paired.store(active, std::memory_order_relaxed);
+    }
+}
+
+void TensorPipelineMode::Built(bool success) {
+    eligible_builds.fetch_add(1, std::memory_order_relaxed);
+    if (success) {
+        ready_builds.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+void TensorPipelineMode::Bound(bool paired_variant) {
+    (paired_variant ? paired_binds : baseline_binds).fetch_add(1, std::memory_order_relaxed);
+}
+
 void ComputePipeline::TickUpscalerTrace() {
     auto& trace{GetUpscalerTrace()};
     if (trace.enabled) {
@@ -208,11 +256,13 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
                                  Common::ThreadWorker* thread_worker,
                                  PipelineStatistics* pipeline_statistics,
                                  VideoCore::ShaderNotify* shader_notify, const Shader::Info& info_,
-                                 vk::ShaderModule spv_module_, u64 shader_hash_)
+                                 vk::ShaderModule spv_module_, u64 shader_hash_,
+                                 vk::ShaderModule paired_spv_module_, TensorPipelineMode* tensor_mode_)
     : device{device_},
       pipeline_cache(pipeline_cache_), guest_descriptor_queue{guest_descriptor_queue_},
       descriptor_buffer_ring{descriptor_buffer_ring_}, info{info_},
-      shader_hash{shader_hash_}, spv_module(std::move(spv_module_)) {
+      shader_hash{shader_hash_}, spv_module(std::move(spv_module_)),
+      paired_spv_module{std::move(paired_spv_module_)}, tensor_mode{tensor_mode_} {
     if (shader_notify) {
         shader_notify->MarkShaderBuilding();
     }
@@ -314,6 +364,23 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
                 shader_notify->MarkShaderComplete();
             }
             return;
+        }
+
+        if (paired_spv_module) {
+            auto paired_ci = compute_ci;
+            paired_ci.stage.module = *paired_spv_module;
+            try {
+                paired_pipeline = device.GetLogical().CreateComputePipeline(paired_ci, *pipeline_cache);
+            } catch (const vk::Exception& exception) {
+                LOG_WARNING(Render_Vulkan, "Paired compute pipeline {:016x} unavailable: {}",
+                            shader_hash, exception.what());
+            }
+            tensor_mode->Built(static_cast<bool>(paired_pipeline));
+            if (paired_pipeline) {
+                LOG_INFO(Render_Vulkan, "Original and paired compute pipelines ready for {:016x}",
+                         shader_hash);
+            }
+            paired_spv_module.reset();
         }
 
         // Log compute pipeline creation
@@ -606,7 +673,7 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
         return false;
     }
 
-    if (!is_built.load(std::memory_order::relaxed)) {
+    if (!is_built.load(std::memory_order::acquire)) {
         // Wait for the pipeline to be built
         scheduler.Record([this](vk::CommandBuffer) {
             RunBuild();
@@ -656,6 +723,7 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     const bool is_rescaling = !info.texture_descriptors.empty() || !info.image_descriptors.empty();
     scheduler.Record([this, descriptor_data, is_rescaling, descriptor_buffer_offset,
                       descriptor_buffer_chunk, bind_descriptor_buffer,
+                      want_paired = tensor_mode && tensor_mode->Paired(),
                       rescaling_data = rescaling.Data()](vk::CommandBuffer cmdbuf) {
         if (bind_descriptor_buffer) {
             const VkDescriptorBufferBindingInfoEXT binding_info{
@@ -665,7 +733,11 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
         if (!pipeline) {
             return;
         }
-        cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *pipeline);
+        const bool bind_paired = want_paired && paired_pipeline;
+        cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, bind_paired ? *paired_pipeline : *pipeline);
+        if (tensor_mode) {
+            tensor_mode->Bound(bind_paired);
+        }
         if (!descriptor_set_layout) {
             return;
         }

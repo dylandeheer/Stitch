@@ -104,7 +104,7 @@ public:
 
     void Dump(u64 pipeline_hash, u64 shader_hash) override;
 
-    void Serialize(std::ofstream& file) const;
+    void Serialize(std::ostream& file) const;
 
     bool HasHLEMacroState() const override {
         return has_hle_engine_state;
@@ -226,7 +226,7 @@ public:
     FileEnvironment& operator=(const FileEnvironment&) = delete;
     FileEnvironment(const FileEnvironment&) = delete;
 
-    void Deserialize(std::ifstream& file);
+    void Deserialize(std::istream& file);
 
     [[nodiscard]] size_t MemorySize() const;
 

@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <iterator>
 #include <span>
 #include <tuple>
 #include <type_traits>
@@ -161,6 +162,74 @@ Id TypeId(const EmitContext& ctx, IR::Type type) {
     }
 }
 
+// Two independent 16x8 products sharing A can occupy the lower and upper columns of one
+// 16x16 cooperative matrix. Stay inside one IR block; predicate regions are separate blocks.
+IR::Inst* TryEmitTensorColumnPair(EmitContext& ctx, IR::Block::iterator first,
+                                  IR::Block::iterator end) {
+    using Op = IR::Opcode;
+    if (first->Flags<u32>() != 16) {
+        return nullptr;
+    }
+    auto second = std::next(first);
+    while (second != end && second->GetOpcode() != Op::TensorMulAdd) {
+        switch (second->GetOpcode()) {
+        case Op::Identity:
+        case Op::CompositeConstructU32x4:
+        case Op::CompositeConstructU32x2:
+        case Op::CompositeExtractU32x2:
+            ++second;
+            break;
+        default:
+            return nullptr;
+        }
+    }
+    if (second == end || second->Flags<u32>() != 16) {
+        return nullptr;
+    }
+    const auto first_a = first->Arg(0).Resolve();
+    const auto second_a = second->Arg(0).Resolve();
+    if (first_a != second_a) {
+        const auto* lhs = first_a.TryInstRecursive();
+        const auto* rhs = second_a.TryInstRecursive();
+        if (!lhs || !rhs || lhs->GetOpcode() != Op::CompositeConstructU32x4 ||
+            rhs->GetOpcode() != Op::CompositeConstructU32x4) {
+            return nullptr;
+        }
+        for (size_t i = 0; i < 4; ++i) {
+            if (lhs->Arg(i).Resolve() != rhs->Arg(i).Resolve()) {
+                return nullptr;
+            }
+        }
+    }
+    // The original SSA already proves dominance at the second multiply. Its argument words
+    // must also exist at the first one; an extract of the first result cannot be moved here.
+    const auto available = [&](const IR::Value& value) {
+        const auto* def = value.TryInstRecursive();
+        return std::none_of(first, second, [def](const IR::Inst& inst) { return &inst == def; });
+    };
+    const auto can_form = [&](const IR::Value& value) {
+        if (available(value)) {
+            return true;
+        }
+        const auto* v = value.TryInstRecursive();
+        return v->GetOpcode() == Op::CompositeConstructU32x2 && available(v->Arg(0)) &&
+               available(v->Arg(1));
+    };
+    if (!can_form(second->Arg(1)) || !can_form(second->Arg(2))) {
+        return nullptr;
+    }
+    const auto form = [&](const IR::Value& value) {
+        if (available(value)) {
+            return ctx.Def(value.Resolve());
+        }
+        const auto* v = value.TryInstRecursive();
+        return ctx.OpCompositeConstruct(ctx.U32[2], ctx.Def(v->Arg(0).Resolve()),
+                                        ctx.Def(v->Arg(1).Resolve()));
+    };
+    EmitTensorColumnPair(ctx, *first, *second, form(second->Arg(1)), form(second->Arg(2)));
+    return &*second;
+}
+
 void Traverse(EmitContext& ctx, IR::Program& program) {
     IR::Block* current_block{};
     for (const IR::AbstractSyntaxNode& node : program.syntax_list) {
@@ -172,8 +241,25 @@ void Traverse(EmitContext& ctx, IR::Program& program) {
             }
             current_block = node.data.block;
             ctx.AddLabel(label);
-            for (IR::Inst& inst : node.data.block->Instructions()) {
-                EmitInst(ctx, &inst);
+            if (ctx.tensor_scratch_word && ctx.profile.pair_cooperative_hmma_columns) {
+                IR::Inst* paired_second{};
+                for (auto it = current_block->begin(); it != current_block->end(); ++it) {
+                    if (&*it == paired_second) {
+                        paired_second = nullptr;
+                        continue;
+                    }
+                    if (it->GetOpcode() == IR::Opcode::TensorMulAdd) {
+                        paired_second = TryEmitTensorColumnPair(ctx, it, current_block->end());
+                        if (paired_second) {
+                            continue;
+                        }
+                    }
+                    EmitInst(ctx, &*it);
+                }
+            } else {
+                for (IR::Inst& inst : node.data.block->Instructions()) {
+                    EmitInst(ctx, &inst);
+                }
             }
             break;
         }

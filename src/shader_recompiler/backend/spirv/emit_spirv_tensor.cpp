@@ -117,11 +117,12 @@ void SubgroupBarrier(EmitContext& ctx) {
 }
 
 // One HMMA.16816.F16 (or .1688 with zero upper halves) of a 32-lane warp on 16x16x16 matrices: the
-// NVIDIA fragments go to row-major A, column-major B (columns 8-15 zero) and row-major C tiles in
+// NVIDIA fragments go to row-major A, column-major B and row-major C tiles in
 // shared memory, one cooperative-matrix multiply-add replaces the per-lane emulation, and each lane
 // reads its two D words back from where it wrote C.
 Id EmitCooperativeTensorMulAdd(EmitContext& ctx, const CooperativeHmmaTypes& types,
-                               u32 scratch_word, Id a, Id b, Id c) {
+                               u32 scratch_word, Id a, Id b, Id c, Id upper_b = {}, Id upper_c = {},
+                               Id* upper_d = nullptr) {
     const Id u32ty = ctx.U32[1];
     const auto imm = [&](u32 value) { return ctx.Const(value); };
     const auto add = [&](Id lhs, Id rhs) { return ctx.OpIAdd(u32ty, lhs, rhs); };
@@ -144,11 +145,19 @@ Id EmitCooperativeTensorMulAdd(EmitContext& ctx, const CooperativeHmmaTypes& typ
     store(tile_a, row_hi, ctx.OpCompositeExtract(u32ty, a, 1));
     store(tile_a, add(row_lo, imm(4)), ctx.OpCompositeExtract(u32ty, a, 2));
     store(tile_a, add(row_hi, imm(4)), ctx.OpCompositeExtract(u32ty, a, 3));
-    // B column g holds k pairs t (b0) and t+4 (b1); columns 8-15 (words 64-127) are zero.
+    // B column g holds k pairs t (b0) and t+4 (b1).
     store(tile_b, row_lo, ctx.OpCompositeExtract(u32ty, b, 0));
     store(tile_b, add(row_lo, imm(4)), ctx.OpCompositeExtract(u32ty, b, 1));
-    store(tile_b, add(lane, imm(64)), ctx.u32_zero_value);
-    store(tile_b, add(lane, imm(96)), ctx.u32_zero_value);
+    if (upper_d) {
+        // B is column-major (8 words per column); C and D are row-major (two fp16s per word).
+        store(tile_b, add(row_lo, imm(64)), ctx.OpCompositeExtract(u32ty, upper_b, 0));
+        store(tile_b, add(row_lo, imm(68)), ctx.OpCompositeExtract(u32ty, upper_b, 1));
+        store(tile_c, add(row_lo, imm(4)), ctx.OpCompositeExtract(u32ty, upper_c, 0));
+        store(tile_c, add(row_hi, imm(4)), ctx.OpCompositeExtract(u32ty, upper_c, 1));
+    } else {
+        store(tile_b, add(lane, imm(64)), ctx.u32_zero_value);
+        store(tile_b, add(lane, imm(96)), ctx.u32_zero_value);
+    }
     store(tile_c, row_lo, ctx.OpCompositeExtract(u32ty, c, 0));
     store(tile_c, row_hi, ctx.OpCompositeExtract(u32ty, c, 1));
     SubgroupBarrier(ctx);
@@ -168,6 +177,11 @@ Id EmitCooperativeTensorMulAdd(EmitContext& ctx, const CooperativeHmmaTypes& typ
     ctx.OpStore(SharedWord(ctx, tile_c), matrix_d,
                 std::span<const Sirit::MemoryAccessLiteral>(store_operands));
     SubgroupBarrier(ctx);
+    if (upper_d) {
+        const Id high0 = ctx.OpLoad(u32ty, SharedWord(ctx, add(tile_c, add(row_lo, imm(4)))));
+        const Id high1 = ctx.OpLoad(u32ty, SharedWord(ctx, add(tile_c, add(row_hi, imm(4)))));
+        *upper_d = ctx.OpCompositeConstruct(ctx.U32[2], high0, high1);
+    }
     const Id d0 = ctx.OpLoad(u32ty, SharedWord(ctx, add(tile_c, row_lo)));
     const Id d1 = ctx.OpLoad(u32ty, SharedWord(ctx, add(tile_c, row_hi)));
     return ctx.OpCompositeConstruct(ctx.U32[2], d0, d1);
@@ -347,6 +361,16 @@ void DefineSoftwareMatrixFunctions(EmitContext& ctx, const IR::Program& program)
         ctx.OpReturnValue(ctx.OpCompositeConstruct(ctx.U32[2], packed[0], packed[1]));
         ctx.OpFunctionEnd();
     }
+}
+
+void EmitTensorColumnPair(EmitContext& ctx, IR::Inst& first, IR::Inst& second, Id upper_b,
+                          Id upper_c) {
+    Id upper_d;
+    const Id lower_d = EmitCooperativeTensorMulAdd(
+        ctx, *ctx.cooperative_hmma, *ctx.tensor_scratch_word, ctx.Def(first.Arg(0)),
+        ctx.Def(first.Arg(1)), ctx.Def(first.Arg(2)), upper_b, upper_c, &upper_d);
+    first.SetDefinition(lower_d);
+    second.SetDefinition(upper_d);
 }
 
 Id EmitTensorMulAdd(EmitContext& ctx, IR::Inst* inst, Id a, Id b, Id c) {

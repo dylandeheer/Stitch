@@ -5,6 +5,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
+#include <sstream>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -585,6 +587,9 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
         device.IsCooperativeHmmaSupported() && TestCooperativeHmma(device);
     profile.support_cooperative_hmma_16x16x16 =
         !profile.support_cooperative_hmma && device.IsCooperativeHmma16x16x16Supported();
+    tensor_mode.Initialize(profile.support_cooperative_hmma_16x16x16,
+                           std::getenv("STITCH_PAIR_TENSOR_COLUMNS"),
+                           std::getenv("STITCH_TENSOR_BASELINE_FILE"));
     if (profile.support_cooperative_hmma_16x16x16) {
         LOG_INFO(Render_Vulkan, "Guest tensor operations run on 16x16x16 cooperative matrices");
     }
@@ -1340,6 +1345,7 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath() {
 
 void PipelineCache::TickFrame() {
     ++frame_count;
+    tensor_mode.TickFrame(frame_count);
     native_wait_budget_us =
         static_cast<s64>(Settings::values.native_pipeline_wait_ms.GetValue()) * 1000;
     while (!evicted_pipelines.empty() && scheduler.IsFree(evicted_pipelines.front().first)) {
@@ -2040,7 +2046,7 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(const ComputePipe
     env.KeepStoragePointers(keep_pointers);
 
     main_pools.ReleaseContents();
-    auto entry{CreateComputePipeline(main_pools, key, env, nullptr, true)};
+    auto entry{CreateComputePipeline(main_pools, key, env, nullptr, true, &env)};
     if (const char* directory = std::getenv("EDEN_NX2_SHADER_DUMP");
         directory && !entry.pipeline && env.CanBeSerialized()) {
         const auto path = std::filesystem::path{directory} /
@@ -2065,7 +2071,8 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(const ComputePipe
 
 ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
     ShaderPools& pools, const ComputePipelineCacheKey& key, Shader::Environment& env,
-    PipelineStatistics* statistics, bool build_in_parallel) try {
+    PipelineStatistics* statistics, bool build_in_parallel,
+    const VideoCommon::GenericEnvironment* live_env) try {
     auto hash = key.Hash();
     if (device.HasBrokenCompute()) {
         LOG_ERROR(Render_Vulkan, "Skipping {:#016x}", hash);
@@ -2099,6 +2106,52 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
     device.SaveShader(code);
     vk::ShaderModule spv_module{BuildShader(device, code)};
 
+    vk::ShaderModule paired_module;
+    if (tensor_mode.Enabled() && program.info.uses_cooperative_matrix) {
+        // The emitter consumes IR pseudo-instructions and extends the workgroup scratch area.
+        // Replay a fresh translation for each module, using only captured environment values.
+        const auto emit_variant = [&](Shader::Environment& captured, bool pair_columns) {
+            ShaderPools replay;
+            Shader::Maxwell::Flow::CFG variant_cfg{captured, replay.flow_block, captured.StartAddress()};
+            auto variant = TranslateProgram(replay.inst, replay.block, captured, variant_cfg, host_info);
+            if (needs_shared_mem_clamp) {
+                variant.shared_memory_size = (std::min)(variant.shared_memory_size, max_shared_memory);
+            }
+            auto variant_profile = profile;
+            variant_profile.pair_cooperative_hmma_columns = pair_columns;
+            return EmitSPIRV(variant_profile, variant);
+        };
+        try {
+            FileEnvironment snapshot;
+            Shader::Environment* captured = &env;
+            bool exact = true;
+            if (live_env) {
+                exact = live_env->CanBeSerialized();
+                if (exact) {
+                    std::stringstream stream{std::ios::in | std::ios::out | std::ios::binary};
+                    stream.exceptions(std::ios::failbit | std::ios::badbit);
+                    live_env->Serialize(stream);
+                    stream.seekg(0);
+                    snapshot.Deserialize(stream);
+                    captured = &snapshot;
+                    exact = emit_variant(*captured, false) == code;
+                }
+            }
+            if (!exact) {
+                LOG_INFO(Render_Vulkan, "Keeping original tensor pipeline {:016x}: live environment "
+                         "cannot reproduce the original shader", key.unique_hash);
+            } else {
+                const auto paired = emit_variant(*captured, true);
+                if (paired != code) {
+                    paired_module = BuildShader(device, paired);
+                }
+            }
+        } catch (const std::exception& exception) {
+            LOG_WARNING(Render_Vulkan, "Paired compute replay {:016x} unavailable: {}",
+                        key.unique_hash, exception.what());
+        }
+    }
+
     // Text log + .spv dump. Same split as the graphics path.
     const bool should_log = GPU::Logging::IsActive();
     const bool should_dump = Settings::values.gpu_log_shader_dumps.GetValue();
@@ -2120,10 +2173,11 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
         spv_module.SetObjectNameEXT(name.c_str());
     }
     Common::ThreadWorker* const thread_worker{build_in_parallel ? &workers : nullptr};
+    auto* const mode = paired_module ? &tensor_mode : nullptr;
     return {.pipeline = std::make_unique<ComputePipeline>(
                 device, scheduler, vulkan_pipeline_cache, descriptor_pool, guest_descriptor_queue,
                 descriptor_buffer_ring, thread_worker, statistics, &shader_notify, program.info,
-                std::move(spv_module), key.unique_hash),
+                std::move(spv_module), key.unique_hash, std::move(paired_module), mode),
             .null_pointer_slots = env.IsNativeProgram() ? env.NullStoragePointerSlots()
                                                         : std::vector<std::pair<u32, u32>>{},
             .mapped_pointers =

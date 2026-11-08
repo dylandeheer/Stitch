@@ -8,6 +8,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <filesystem>
 #include <functional>
 #include <mutex>
 #include <span>
@@ -35,6 +36,24 @@ class Device;
 class PipelineStatistics;
 class Scheduler;
 
+// Recording snapshots the marker; commands already enqueued keep their selected variant.
+class TensorPipelineMode {
+public:
+    void Initialize(bool supported, const char* setting, const char* baseline_file);
+    void TickFrame(u64 frame);
+    [[nodiscard]] bool Enabled() const { return enabled; }
+    [[nodiscard]] bool Paired() const { return paired.load(std::memory_order_relaxed); }
+    void Built(bool success);
+    void Bound(bool paired_variant);
+
+private:
+    [[nodiscard]] bool ReadMarker() const;
+    std::filesystem::path marker;
+    bool enabled{};
+    std::atomic_bool paired{};
+    std::atomic<u64> eligible_builds{}, ready_builds{}, baseline_binds{}, paired_binds{};
+};
+
 class ComputePipeline {
 public:
     explicit ComputePipeline(const Device& device, Scheduler& scheduler, vk::PipelineCache& pipeline_cache,
@@ -44,7 +63,8 @@ public:
                              Common::ThreadWorker* thread_worker,
                              PipelineStatistics* pipeline_statistics,
                              VideoCore::ShaderNotify* shader_notify, const Shader::Info& info,
-                             vk::ShaderModule spv_module, u64 shader_hash);
+                             vk::ShaderModule spv_module, u64 shader_hash,
+                             vk::ShaderModule paired_spv_module = {}, TensorPipelineMode* tensor_mode = nullptr);
 
     ComputePipeline& operator=(ComputePipeline&&) noexcept = delete;
     ComputePipeline(ComputePipeline&&) noexcept = delete;
@@ -107,6 +127,8 @@ private:
     VideoCommon::ComputeUniformBufferSizes uniform_buffer_sizes{};
 
     vk::ShaderModule spv_module;
+    vk::ShaderModule paired_spv_module;
+    TensorPipelineMode* tensor_mode{};
     vk::DescriptorSetLayout descriptor_set_layout;
     bool uses_push_descriptor{false};
     bool uses_descriptor_buffer{false};
@@ -115,6 +137,7 @@ private:
     vk::PipelineLayout pipeline_layout;
     vk::DescriptorUpdateTemplate descriptor_update_template;
     vk::Pipeline pipeline;
+    vk::Pipeline paired_pipeline;
 
     std::function<void()> build_task;
     std::atomic_bool build_claimed{false};
