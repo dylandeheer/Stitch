@@ -2056,6 +2056,7 @@ VideoCore::RasterizerDownloadArea RasterizerVulkan::GetFlushArea(DAddr addr, u64
         std::scoped_lock lock{texture_cache.mutex};
         auto area = texture_cache.GetFlushArea(addr, size);
         if (area) {
+            area->source = VideoCore::DownloadSource::Texture;
             return *area;
         }
     }
@@ -2063,6 +2064,7 @@ VideoCore::RasterizerDownloadArea RasterizerVulkan::GetFlushArea(DAddr addr, u64
         std::scoped_lock lock{buffer_cache.mutex};
         auto area = buffer_cache.GetFlushArea(addr, size);
         if (area) {
+            area->source = VideoCore::DownloadSource::Buffer;
             return *area;
         }
     }

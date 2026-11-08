@@ -33,6 +33,7 @@
 #include "video_core/engines/maxwell_dma.h"
 #include "video_core/gpu.h"
 #include "video_core/pending_maps.h"
+#include "video_core/readback_trace.h"
 #include "video_core/gpu_thread.h"
 #include "video_core/gpu_timestamp.h"
 #include "video_core/host1x/host1x.h"
@@ -263,13 +264,37 @@ struct GPU::Impl {
                      raster_area.start_address, raster_area.end_address,
                      reads.load(std::memory_order_relaxed));
         }
-        const u64 fence = RequestSyncOperation([this, raster_area]() {
-            // Apply collected guest writes before downloading GPU data over guest memory.
+        const auto flush = [this, raster_area] {
             InvalidateGPUCache();
-            renderer->ReadRasterizer()->FlushRegion(raster_area.start_address, raster_area.end_address - raster_area.start_address);
-        });
-        gpu_thread.TickGPU(is_async);
-        WaitForSyncOperation(fence);
+            renderer->ReadRasterizer()->FlushRegion(raster_area.start_address,
+                                                    raster_area.end_address - raster_area.start_address);
+        };
+        if (VideoCore::ReadbackTrace::Enabled()) {
+            namespace Trace = VideoCore::ReadbackTrace;
+            struct Record {
+                Trace::Flush event;
+                std::atomic<bool> complete{};
+            };
+            const auto record = std::make_shared<Record>();
+            const auto arrival = Trace::Clock::now();
+            const u64 fence = RequestSyncOperation([record, flush] {
+                {
+                    Trace::Scope scope{record->event};
+                    flush();
+                }
+                record->complete.store(true, std::memory_order_release);
+            });
+            gpu_thread.TickGPU(is_async);
+            WaitForSyncOperation(fence);
+            if (record->complete.load(std::memory_order_acquire)) {
+                const auto returned = Trace::Clock::now();
+                readback_windows.Add(raster_area, record->event, arrival, returned);
+            }
+        } else {
+            const u64 fence = RequestSyncOperation(flush);
+            gpu_thread.TickGPU(is_async);
+            WaitForSyncOperation(fence);
+        }
         return raster_area;
     }
 
@@ -391,6 +416,7 @@ struct GPU::Impl {
     u64 last_sync_fence{};
 
     VideoCommon::PendingMaps pending_maps;
+    VideoCore::ReadbackTrace::Windows readback_windows;
     std::mutex applying_writes_mutex;
     std::vector<const std::vector<std::pair<DAddr, u64>>*> applying_writes;
 
