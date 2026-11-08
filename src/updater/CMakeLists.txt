@@ -5,7 +5,7 @@ add_executable(lichii-updater main.cpp ../frontend_common/update_installer.cpp)
 target_include_directories(lichii-updater PRIVATE ${PROJECT_SOURCE_DIR}/src)
 target_compile_features(lichii-updater PRIVATE cxx_std_20)
 target_link_libraries(lichii-updater PRIVATE user32 shell32)
-set_target_properties(lichii-updater PROPERTIES WIN32_EXECUTABLE ON)
+set_target_properties(lichii-updater PROPERTIES WIN32_EXECUTABLE ON OUTPUT_NAME "stitch-updater")
 
 # The helper runs from a temporary folder, away from the DLLs next to lichii.exe.
 if (MSVC)

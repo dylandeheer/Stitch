@@ -26,7 +26,7 @@ constexpr int controller_column = 2;
 static QString HotkeyDisplayName(const QString& action) {
     // Keep the stored shortcut key compatible with existing configurations.
     if (action == QStringLiteral("Exit Eglantine")) {
-        return QCoreApplication::translate("Hotkeys", "Exit Lichii");
+        return QCoreApplication::translate("Hotkeys", "Exit Stitch");
     }
     return QCoreApplication::translate("Hotkeys", qPrintable(action));
 }

@@ -459,7 +459,7 @@ void NvidiaDlssPanel::Download() {
     dialog.setWindowTitle(Tr("Download NVIDIA DLSS"));
     QVBoxLayout* layout = new QVBoxLayout(&dialog);
     QLabel* intro = new QLabel(
-        Tr("Lichii will download %1 from NVIDIA's Streamline %2 release on GitHub into %3.<br>"
+        Tr("Stitch will download %1 from NVIDIA's Streamline %2 release on GitHub into %3.<br>"
            "These files are NVIDIA's, under NVIDIA's licence terms below.")
             .arg(names.join(QStringLiteral(" and ")), QString::fromLatin1(RELEASE_VERSION),
                  PathText(folder)),
