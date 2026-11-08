@@ -35,6 +35,7 @@
 #include "video_core/guest_memory.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/texture_cache/alias_copy.h"
+#include "video_core/texture_cache/atlas_upload_evidence.h"
 #include "video_core/texture_cache/clear_discard.h"
 #include "video_core/texture_cache/image_view_base.h"
 #include "video_core/texture_cache/conversion.h"
@@ -2016,8 +2017,17 @@ bool TextureCache<P>::UploadInChunks(Image& image) {
     const auto timing_begin = now();
     static const char* const snapshot_marker = std::getenv("STITCH_ATLAS_SNAPSHOT_BASELINE_FILE");
     static const char* const file_marker = std::getenv("STITCH_ATLAS_PREAD_BASELINE_FILE");
-    const bool eligible = image.info.native_tiling && image.info.format == PixelFormat::D16_UNORM;
-    const bool compare_file = eligible && file_marker && *file_marker;
+    const bool d16 = image.info.native_tiling && image.info.format == PixelFormat::D16_UNORM;
+    const bool compare_file = file_marker && *file_marker &&
+                              (d16 || IsR32AtlasFileRead(image.info, image.guest_size_bytes));
+    static const bool classify = [] {
+        const char* value = std::getenv("STITCH_D16_UPLOAD_EVIDENCE");
+        return value && std::string_view{value} == "1";
+    }();
+    std::optional<D16UploadEvidence> evidence;
+    if (classify && IsD16EvidenceAtlas(image.info, image.guest_size_bytes)) {
+        evidence.emplace(image.gpu_addr, image.guest_size_bytes);
+    }
     const auto absent = [](const char* path) {
         std::error_code ec;
         return !std::filesystem::exists(path, ec) && !ec;
@@ -2025,7 +2035,7 @@ bool TextureCache<P>::UploadInChunks(Image& image) {
     const bool read_backing_file = compare_file && absent(file_marker);
     // Both arms use identical mapping validation. Only the source of the owned snapshot changes.
     const bool bulk = compare_file ||
-                      (eligible && snapshot_marker && *snapshot_marker && absent(snapshot_marker));
+                      (d16 && snapshot_marker && *snapshot_marker && absent(snapshot_marker));
     u64 plan_ns{}, staging_ns{}, record_ns{}, chunks{};
     UnswizzleTimings unswizzle;
     for (u64 offset = 0; offset < image.guest_size_bytes; offset += chunk_size) {
@@ -2046,7 +2056,8 @@ bool TextureCache<P>::UploadInChunks(Image& image) {
         }
         auto staging = runtime.UploadStagingBuffer(plan.total_host_bytes);
         const auto staged = now();
-        ExecuteUnswizzlePlan(*gpu_memory, plan, staging.mapped_span, timed ? &unswizzle : nullptr, bulk, read_backing_file);
+        ExecuteUnswizzlePlan(*gpu_memory, plan, staging.mapped_span, timed ? &unswizzle : nullptr,
+                             bulk, read_backing_file, evidence ? &*evidence : nullptr);
         const auto decoded = now();
         image.UploadMemory(staging, plan.copies);
         staging_ns += elapsed(planned, staged);
@@ -2059,7 +2070,7 @@ bool TextureCache<P>::UploadInChunks(Image& image) {
         record_ns += elapsed(barrier_begin, now());
         const u64 total_ns = elapsed(timing_begin, now());
         const u64 accounted_ns = plan_ns + staging_ns + record_ns + unswizzle.allocation_ns +
-                                 unswizzle.read_ns + unswizzle.detile_ns;
+                                 unswizzle.read_ns + unswizzle.detile_ns + (evidence ? evidence->scan_ns : 0);
         const u64 residual_ns = total_ns - (std::min)(total_ns, accounted_ns);
         LOG_INFO(HW_GPU,
                  "Chunk upload phases: frame={} device_address={:#x} footprint_bytes={} "
@@ -2073,6 +2084,14 @@ bool TextureCache<P>::UploadInChunks(Image& image) {
                  unswizzle.detile_ns / 1.e6, record_ns / 1.e6, total_ns / 1.e6, residual_ns / 1.e6,
                  bulk, unswizzle.bulk_bytes, unswizzle.sampled_reads, unswizzle.read_minor_faults,
                  unswizzle.read_major_faults, read_backing_file, unswizzle.file_read_bytes);
+    }
+    if (evidence) {
+        LOG_INFO(HW_GPU,
+                 "D16 upload evidence: frame={} footprint_bytes={} complete={} scanned_bytes={} runs={} "
+                 "zero_run_bytes={} ff_run_bytes={} other_run_bytes={} non_file_bytes={} scan_ms={:.3f}",
+                 frame_tick, evidence->size, evidence->Complete(), evidence->scanned, evidence->runs,
+                 evidence->zero_bytes, evidence->ff_bytes, evidence->other_bytes,
+                 evidence->non_file_bytes, evidence->scan_ns / 1.e6);
     }
     return true;
 }

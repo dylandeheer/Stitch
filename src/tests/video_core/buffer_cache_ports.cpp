@@ -24,6 +24,8 @@
 #include "video_core/buffer_cache/memory_tracker_base.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/gpu.h"
+#include "video_core/texture_cache/atlas_upload_evidence.h"
+#include "video_core/texture_cache/util.h"
 #include "video_core/renderer_null/null_rasterizer.h"
 
 namespace {
@@ -1332,4 +1334,38 @@ TEST_CASE("A failed speculative loan or host invalidation keeps the complete man
     REQUIRE_FALSE(f.Demand());
     REQUIRE(f.bytes[0x10001] == 0x37);
     REQUIRE(Access::EarlyState(*f.cache).stats.unavailable == 1);
+}
+
+TEST_CASE("Source policy preserves decoded R32 bytes through both copy paths", "[atlas_upload_source]") {
+    Fixture f;
+    constexpr GPUVAddr va = 0x180000;
+    constexpr size_t bytes = 16384;
+    f.memory->Map(va, 0x20000, bytes, Tegra::PTEKind::PITCH, false);
+    f.memory->EnableNativeTiling();
+    for (size_t i = 0; i < 0x40000; ++i) f.bytes[i] = static_cast<u8>((i * 37) ^ (i >> 12));
+    VideoCommon::ImageInfo info;
+    info.type = VideoCommon::ImageType::e2D;
+    info.native_tiling = true;
+    info.format = VideoCommon::PixelFormat::R32_FLOAT;
+    info.size = {256, 16, 1};
+    info.resources = {1, 1};
+    info.block = {0, 1, 0};
+    info.layer_stride = VideoCommon::CalculateLayerStride(info);
+    const std::array range{std::pair<u64, u64>{0, bytes}};
+    const auto plan = VideoCommon::PlanUnswizzleImageRows(va, info, range);
+    REQUIRE(plan.layout_valid);
+    REQUIRE(plan.runs.size() == 1);
+    REQUIRE(plan.total_host_bytes == bytes);
+    for (const bool hole : {false, true}) {
+        if (hole) f.memory->MapSparse(va + 4096, 4096, false);
+        std::vector<u8> expected(bytes, 0xc9), actual(bytes, 0xf3);
+        VideoCommon::ExecuteUnswizzlePlan(*f.memory, plan, expected);
+        VideoCommon::UnswizzleTimings timing{};
+        VideoCommon::ExecuteUnswizzlePlan(*f.memory, plan, actual, &timing, true, true);
+        REQUIRE(actual == expected);
+        REQUIRE(timing.bulk_bytes == (hole ? 0 : bytes));
+#ifdef __linux__
+        REQUIRE(timing.file_read_bytes == (hole ? 0 : bytes));
+#endif
+    }
 }

@@ -38,6 +38,7 @@
 #include "video_core/texture_cache/format_lookup_table.h"
 #include "video_core/texture_cache/formatter.h"
 #include "video_core/texture_cache/samples_helper.h"
+#include "video_core/texture_cache/atlas_upload_evidence.h"
 #include "video_core/texture_cache/util.h"
 #include "video_core/textures/astc.h"
 #include "video_core/textures/bcn.h"
@@ -1269,7 +1270,8 @@ UnswizzlePlan PlanUnswizzleImageRows(
 }
 
 void ExecuteUnswizzlePlan(Tegra::MemoryManager& gpu_memory, const UnswizzlePlan& plan,
-                         std::span<u8> output, UnswizzleTimings* timings, bool bulk_snapshot, bool read_backing_file) {
+                         std::span<u8> output, UnswizzleTimings* timings, bool bulk_snapshot, bool read_backing_file,
+                         D16UploadEvidence* evidence) {
     using Clock = std::chrono::steady_clock;
     const auto now = [&] { return timings ? Clock::now() : Clock::time_point{}; };
     const auto elapsed = [](auto start, auto end) {
@@ -1298,6 +1300,13 @@ void ExecuteUnswizzlePlan(Tegra::MemoryManager& gpu_memory, const UnswizzlePlan&
         }
 #endif
         const auto read = now();
+        auto decode_begin = read;
+        if (evidence) {
+            const auto begin = Clock::now();
+            evidence->Observe(r.src_addr, run, file_read);
+            decode_begin = Clock::now();
+            evidence->scan_ns += elapsed(begin, decode_begin);
+        }
         Tegra::Texture::UnswizzleTexture(output.subspan(r.host_offset, r.host_bytes),
                                          run, 1U << plan.bpp_log2, r.run_tiles, r.tile_rows, 1,
                                          r.block.height, r.block.depth, r.run_alignment,
@@ -1309,7 +1318,7 @@ void ExecuteUnswizzlePlan(Tegra::MemoryManager& gpu_memory, const UnswizzlePlan&
             }
             timings->allocation_ns += elapsed(began, allocated);
             timings->read_ns += elapsed(allocated, read);
-            timings->detile_ns += elapsed(read, Clock::now());
+            timings->detile_ns += elapsed(decode_begin, Clock::now());
             ++timings->runs;
             timings->guest_bytes += r.guest_bytes;
         }

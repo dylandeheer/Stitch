@@ -56,6 +56,7 @@ add_executable(tests
     video_core/submission_policy.cpp
     video_core/native_pending_policy.cpp
     video_core/framebuffer_clear_layers.cpp
+    video_core/atlas_upload_evidence.cpp
     video_core/retired_image_pool.cpp
     video_core/framebuffer_limits.cpp
     video_core/unbacked_fallback.cpp
