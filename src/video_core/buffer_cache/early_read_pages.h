@@ -34,8 +34,8 @@ struct EarlyReadPages {
         bool canceled{};
     };
     struct Stats {
-        u64 copies{}, bytes{}, hits{}, hit_bytes{}, late{}, unsubmitted{}, ready_checks{}, late_checks{}, stale{}, blocked{}, comparisons{},
-            compared_bytes{}, masked_bytes{}, empty_checks{}, remapped_checks{}, noncoherent_reference{}, mismatches{}, caps{};
+        u64 copies{}, bytes{}, hits{}, hit_bytes{}, cpu_only{}, late{}, unsubmitted{}, ready_checks{}, late_checks{}, stale{}, blocked{}, comparisons{},
+            compared_bytes{}, masked_bytes{}, empty_checks{}, remapped_checks{}, noncoherent_reference{}, unavailable{}, mismatches{}, caps{};
     };
     struct Shadow {
         DAddr page;

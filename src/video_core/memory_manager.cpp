@@ -65,6 +65,7 @@ MemoryManager::MemoryManager(Core::System& system_, u64 address_space_bits_, GPU
 {}
 
 void MemoryManager::SetNativeSyncpointShim(GPUVAddr address) {
+    if (address) ExcludeEarlyReadReport(address, NumShimSyncpoints * sizeof(u32));
     native_syncpoint_shim.store(address, std::memory_order_release);
 }
 
@@ -125,6 +126,13 @@ void MemoryManager::BeginMappingUpdate() {
 
 void MemoryManager::FinishMappingUpdate(GPUVAddr address, size_t size) {
     UpdateContinuousRuns(address, size);
+    if (Core::EarlyBufferReadsRequested()) {
+        constexpr auto shim_size = NumShimSyncpoints * sizeof(u32);
+        const auto shim = native_syncpoint_shim.load(std::memory_order_acquire);
+        if (shim && address < shim + shim_size && shim < address + size) {
+            ExcludeEarlyReadReport(shim, shim_size);
+        }
+    }
     std::scoped_lock lock{runs_guard};
     map_serial.fetch_add(1, std::memory_order_release);
     --mapping_writers;
@@ -404,16 +412,17 @@ T MemoryManager::Read(GPUVAddr addr) const {
     return {};
 }
 
-template <typename T>
-void MemoryManager::Write(GPUVAddr addr, T data) {
+template <bool report, typename T>
+void MemoryManager::WriteScalar(GPUVAddr addr, T data) {
     if (auto page_pointer{GetPointer(addr)}; page_pointer) {
-        // NOTE: Avoid adding any extra logic to this fast-path block
+        if constexpr (report) memory.ExcludeEarlyReadPointer(page_pointer, sizeof(T));
         std::memcpy(page_pointer, &data, sizeof(T));
         return;
     }
     // A Switch 2 sparse block nobody wrote yet gets its memory now.
     Tegra::Nx2BackSparseWrite(addr, sizeof(T), &data);
     if (auto page_pointer{GetPointer(addr)}; page_pointer) {
+        if constexpr (report) memory.ExcludeEarlyReadPointer(page_pointer, sizeof(T));
         std::memcpy(page_pointer, &data, sizeof(T));
         return;
     }
@@ -422,21 +431,13 @@ void MemoryManager::Write(GPUVAddr addr, T data) {
 }
 
 template <typename T>
-void MemoryManager::WriteReport(GPUVAddr addr, T data) {
-    if (auto page_pointer{GetPointer(addr)}; page_pointer) {
-        memory.ExcludeEarlyReadPointer(page_pointer, sizeof(T));
-        std::memcpy(page_pointer, &data, sizeof(T));
-        return;
-    }
-    // A Switch 2 sparse block nobody wrote yet gets its memory now.
-    Tegra::Nx2BackSparseWrite(addr, sizeof(T), &data);
-    if (auto page_pointer{GetPointer(addr)}; page_pointer) {
-        memory.ExcludeEarlyReadPointer(page_pointer, sizeof(T));
-        std::memcpy(page_pointer, &data, sizeof(T));
-        return;
-    }
+void MemoryManager::Write(GPUVAddr addr, T data) {
+    WriteScalar<false>(addr, data);
+}
 
-    ASSERT(false);
+template <typename T>
+void MemoryManager::WriteReport(GPUVAddr addr, T data) {
+    WriteScalar<true>(addr, data);
 }
 
 template u8 MemoryManager::Read<u8>(GPUVAddr addr) const;

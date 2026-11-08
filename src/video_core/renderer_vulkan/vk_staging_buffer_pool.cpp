@@ -148,8 +148,12 @@ void StagingBufferPool::ReleaseLoan(StagingBufferRef& ref, u64 last_use) {
     loan.deferred = false;
 }
 
-void StagingBufferPool::InvalidateLoan(StagingBufferRef& ref) {
-    if (!ref.host_coherent) FindLoan(ref).buffer.Invalidate();
+bool StagingBufferPool::InvalidateLoan(StagingBufferRef& ref) {
+    if (ref.host_coherent) return true;
+    const auto result = FindLoan(ref).buffer.InvalidateMappedAllocation();
+    if (result == VK_ERROR_OUT_OF_HOST_MEMORY || result == VK_ERROR_OUT_OF_DEVICE_MEMORY) return false;
+    vk::Check(result);
+    return true;
 }
 
 void StagingBufferPool::TickFrame() {

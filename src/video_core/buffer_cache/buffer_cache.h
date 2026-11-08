@@ -137,11 +137,11 @@ void BufferCache<P>::TickFrame() {
         if ((frame_tick % 120) == 0) {
             const auto& s = early_reads->stats;
             LOG_INFO(HW_GPU, "Early buffer reads frame={} active={} verify={} failed={} copies={} "
-                     "recorded_bytes={} hits={} hit_bytes={} late={} unsubmitted={} ready_checks={} late_checks={} stale={} blocked={} "
-                     "compared_reads={} compared_bytes={} cpu_masked_bytes={} empty_checks={} remapped_checks={} noncoherent_reference={} mismatches={} capped={}",
+                     "recorded_bytes={} hits={} hit_bytes={} cpu_only={} late={} unsubmitted={} ready_checks={} late_checks={} stale={} blocked={} "
+                     "compared_reads={} compared_bytes={} cpu_masked_bytes={} empty_checks={} remapped_checks={} noncoherent_reference={} unavailable={} mismatches={} capped={}",
                      frame_tick, early_reads->active, early_reads->verify, early_reads->failed,
-                     s.copies, s.bytes, s.hits, s.hit_bytes, s.late, s.unsubmitted, s.ready_checks, s.late_checks, s.stale, s.blocked,
-                     s.comparisons, s.compared_bytes, s.masked_bytes, s.empty_checks, s.remapped_checks, s.noncoherent_reference, s.mismatches, s.caps);
+                     s.copies, s.bytes, s.hits, s.hit_bytes, s.cpu_only, s.late, s.unsubmitted, s.ready_checks, s.late_checks, s.stale, s.blocked,
+                     s.comparisons, s.compared_bytes, s.masked_bytes, s.empty_checks, s.remapped_checks, s.noncoherent_reference, s.unavailable, s.mismatches, s.caps);
         }
     }
     if (read_batch_baseline_file && *read_batch_baseline_file && frame_tick % 16 == 0) {
@@ -478,7 +478,15 @@ void BufferCache<P>::RecordEarlyCpuReads() {
             }
             // The entire small buffer page is private. Current dirty byte ranges and CPU
             // writes determine the bytes to land later, at the actual read.
-            auto staging = runtime.DownloadStagingBuffer(Early::PageSize, true);
+            auto loan = runtime.TryEarlyStaging(Early::PageSize);
+            if (!loan) {
+                ++state.stats.unavailable;
+                state.frame_bytes = 1024 * 1024;
+                break;
+            }
+            // If recording unwinds after a transfer was enqueued, preserve its real lifetime.
+            SCOPE_EXIT { if (loan) runtime.ReleaseEarlyHostRead(*loan, runtime.CurrentTick()); };
+            auto& staging = *loan;
             const BufferCopy copy{.src_offset=buffer.Offset(begin), .dst_offset=staging.offset,
                                   .size=Early::PageSize};
             buffer.MarkUsage(copy.src_offset, copy.size);
@@ -486,6 +494,7 @@ void BufferCache<P>::RecordEarlyCpuReads() {
             const u64 tick = runtime.QueueEarlyHostRead();
             dest->emplace(typename Early::Copy{begin, page.version, state.generation, tick, buffer.early_read_instance,
                                                page.writer, std::move(staging)});
+            loan.reset();
             ++state.stats.copies;
             state.stats.bytes += Early::PageSize;
             state.frame_bytes += Early::PageSize;
@@ -541,7 +550,11 @@ bool BufferCache<P>::TryEarlyCpuRead(DAddr address, u64 size) {
             } else if (!compared || !runtime.EarlyHostReadReady(copy.tick)) {
                 ++state.stats.empty_checks;
             } else {
-                runtime.InvalidateEarlyHostRead(copy.staging);
+                if (!runtime.InvalidateEarlyHostRead(copy.staging)) {
+                    ++state.stats.unavailable;
+                    copy.canceled = true;
+                    return true; // The original has already completed.
+                }
                 size_t different = 0;
                 for (size_t i=0; i<Early::PageSize; ++i) {
                     different += shadow.readable[i] && shadow.original[i] != copy.staging.mapped_span[i];
@@ -563,12 +576,17 @@ bool BufferCache<P>::TryEarlyCpuRead(DAddr address, u64 size) {
             return true;
         }
 
-        runtime.InvalidateEarlyHostRead(copy.staging);
+        if (!runtime.InvalidateEarlyHostRead(copy.staging)) {
+            ++state.stats.unavailable;
+            copy.canceled = true;
+            return false;
+        }
         // The guest store publishes its dirty range before checking this gate.
         // Do not take query/cache locks or wait on Vulkan under the mapping mutex.
         const Core::DownloadLanding::Scope landing{device_memory.download_landing, address, address + size};
         const auto cpu_written = PendingCpuWriteRanges();
         bool served = false;
+        const u64 before_bytes = state.stats.hit_bytes;
         const bool pinned = device_memory.WithEarlyReadPage(address, generation, [&] {
             memory_tracker.ForEachDownloadRangeAndClear(address, size, [&](DAddr page, u64 bytes) {
                 gpu_modified_ranges.ForEachInRange(page, bytes, [&](DAddr begin, DAddr end) {
@@ -585,7 +603,8 @@ bool BufferCache<P>::TryEarlyCpuRead(DAddr address, u64 size) {
         });
         if (!pinned) ++state.stats.blocked;
         if (!served) return false;
-        ++state.stats.hits;
+        if (before_bytes != state.stats.hit_bytes) ++state.stats.hits;
+        else ++state.stats.cpu_only;
         copy.canceled = true;
         download_cpu_read_ranges = false;
         return true;

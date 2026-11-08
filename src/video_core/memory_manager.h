@@ -225,6 +225,9 @@ private:
     };
 
     /// Rebuilds the runs through the big pages a page table operation touched.
+    template <bool report, typename T>
+    void WriteScalar(GPUVAddr addr, T data);
+
     void BeginMappingUpdate();
     void FinishMappingUpdate(GPUVAddr address, size_t size);
     void UpdateContinuousRuns(GPUVAddr gpu_addr, size_t size);

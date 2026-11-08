@@ -85,11 +85,17 @@ struct Runtime {
     bool EarlyHostReadReady(u64 tick) { return tick <= completed_tick; }
     u64 CompletedEarlyReadTick() { return completed_tick; }
     bool EarlyTickSubmitted(u64 tick) const { return tick <= completed_tick; }
-    void InvalidateEarlyHostRead(Staging& ref) {
+    std::optional<Staging> TryEarlyStaging(size_t bytes) {
+        if (fail_loan) return std::nullopt;
+        return DownloadStagingBuffer(bytes, true);
+    }
+    bool InvalidateEarlyHostRead(Staging& ref) {
+        if (fail_invalidate) return false;
         if (!ref.host_coherent) {
             std::copy_n(ref.buffer->bytes.data()+ref.offset,ref.mapped_span.size(),ref.mapped_span.data());
             ++early_invalidations;
         }
+        return true;
     }
     void ReleaseEarlyHostRead(Staging& ref, u64 tick) {
         last_release_tick = tick;
@@ -169,7 +175,7 @@ struct Runtime {
     }
 
     u64 current_tick{1}, completed_tick{}, deferred_releases{}, last_release_tick{}, early_invalidations{};
-    bool noncoherent_early{}, noncoherent_reference{};
+    bool noncoherent_early{}, noncoherent_reference{}, fail_loan{}, fail_invalidate{};
     std::vector<std::vector<u8>> noncoherent_views;
     std::vector<std::unique_ptr<Buffer>> deferred;
     u32 alignment{256};
@@ -1265,4 +1271,19 @@ TEST_CASE("Cache teardown returns an outstanding deferred loan with its original
     REQUIRE(f.runtime.deferred_releases==1);
     REQUIRE(f.runtime.last_release_tick==issuing_tick);
     REQUIRE(f.runtime.completed_tick < issuing_tick);
+}
+
+TEST_CASE("A failed speculative loan or host invalidation keeps the complete mandatory read",
+          "[early_buffer]") {
+    const bool loan_failure=GENERATE(false,true);
+    EarlyFixture f;
+    f.runtime.CompleteGpu();
+    REQUIRE(f.Demand());
+    f.runtime.fail_loan=loan_failure;
+    f.runtime.fail_invalidate=!loan_failure;
+    f.Compute(0x37);
+    f.runtime.CompleteGpu();
+    REQUIRE_FALSE(f.Demand());
+    REQUIRE(f.bytes[0x10001]==0x37);
+    REQUIRE(Access::EarlyState(*f.cache).stats.unavailable==1);
 }

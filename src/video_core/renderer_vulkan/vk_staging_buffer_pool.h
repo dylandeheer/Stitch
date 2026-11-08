@@ -41,7 +41,7 @@ public:
     StagingBufferRef Request(size_t size, MemoryUsage usage, bool deferred = false);
     void FreeDeferred(StagingBufferRef& ref);
     void ReleaseLoan(StagingBufferRef& ref, u64 last_use);
-    void InvalidateLoan(StagingBufferRef& ref);
+    bool InvalidateLoan(StagingBufferRef& ref);
 
     [[nodiscard]] VkBuffer StreamBuf() const noexcept {
         return *stream_buffer;

@@ -548,10 +548,12 @@ void Buffer::Flush() const {
     }
 }
 
+VkResult Buffer::InvalidateMappedAllocation() const {
+    return is_coherent ? VK_SUCCESS : vmaInvalidateAllocation(allocator, allocation, 0, VK_WHOLE_SIZE);
+}
+
 void Buffer::Invalidate() const {
-    if (!is_coherent) {
-        vmaInvalidateAllocation(allocator, allocation, 0, VK_WHOLE_SIZE);
-    }
+    (void)InvalidateMappedAllocation();
 }
 
 void Buffer::SetObjectNameEXT(const char* name) const {
