@@ -569,8 +569,8 @@ public:
         return sparse_layers.bound_bytes;
     }
 
-    bool CanInitializeZeroDepth() const;
-    void InitializeZeroDepth();
+    bool CanInitializeZeroAtlas() const;
+    void InitializeZeroAtlas();
 
     bool IsRescaled() const noexcept;
 

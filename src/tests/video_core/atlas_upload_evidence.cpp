@@ -2,10 +2,11 @@
 #include <array>
 #include <vector>
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
 #include "video_core/texture_cache/atlas_upload_evidence.h"
 #include "video_core/texture_cache/util.h"
-#include "video_core/texture_cache/zero_depth_upload.h"
+#include "video_core/texture_cache/zero_atlas_upload.h"
 
 namespace {
 using namespace VideoCommon;
@@ -46,7 +47,7 @@ TEST_CASE("R32 backing-file reads are limited to the observed plain atlas", "[at
 
 TEST_CASE("Owned snapshot evidence includes tails, mixed runs and fallback bytes", "[atlas_upload_evidence]") {
     constexpr GPUVAddr base = 4096;
-    D16UploadEvidence evidence{base, 12};
+    AtlasUploadEvidence evidence{base, 12};
     const std::array<u8, 1> zero{0};
     const std::array<u8, 3> high{0xff, 0xff, 0xff};
     const std::array<u8, 5> last{0, 0, 0, 0, 1};
@@ -67,20 +68,20 @@ TEST_CASE("Owned snapshot evidence includes tails, mixed runs and fallback bytes
 
 TEST_CASE("A footprint sum cannot disguise holes, duplicate source addresses or wrap", "[atlas_upload_evidence]") {
     const std::array<u8, 4> data{};
-    D16UploadEvidence gap{0x1000, 8};
+    AtlasUploadEvidence gap{0x1000, 8};
     gap.Observe(0x1000, data, true);
     gap.Observe(0x1005, data, true);
     REQUIRE(gap.scanned == 8);
     REQUIRE_FALSE(gap.Complete());
-    D16UploadEvidence overlap{0x1000, 8};
+    AtlasUploadEvidence overlap{0x1000, 8};
     overlap.Observe(0x1000, data, true);
     overlap.Observe(0x1000, data, false);
     REQUIRE(overlap.scanned == 8);
     REQUIRE_FALSE(overlap.Complete());
-    D16UploadEvidence overflow{~u64{0} - 2, 4};
+    AtlasUploadEvidence overflow{~u64{0} - 2, 4};
     overflow.Observe(~u64{0} - 2, data, true);
     REQUIRE_FALSE(overflow.Complete());
-    D16UploadEvidence large{0, (4U << 20) + 1};
+    AtlasUploadEvidence large{0, (4U << 20) + 1};
     const std::vector<u8> oversized((4U << 20) + 1);
     large.Observe(0, oversized, false);
     REQUIRE_FALSE(large.Complete());
@@ -95,7 +96,7 @@ TEST_CASE("All nine D16 chunks cover the full guest footprint exactly once", "[a
     info.layer_stride = CalculateLayerStride(info);
     REQUIRE(CalculateGuestSizeInBytes(info) == bytes);
     REQUIRE(IsD16EvidenceAtlas(info, bytes));
-    D16UploadEvidence observed{base, bytes};
+    AtlasUploadEvidence observed{base, bytes};
     std::vector<u8> scratch(4U << 20);
     for (size_t offset = 0; offset < bytes; offset += chunk_size) {
         const std::array range{std::pair<u64,u64>{offset, offset + chunk_size}};
@@ -117,13 +118,13 @@ TEST_CASE("All nine D16 chunks cover the full guest footprint exactly once", "[a
 }
 
 TEST_CASE("Only fresh backed D16 first-use storage can use a depth clear", "[zero_depth_upload]") {
-    REQUIRE(IsFirstDepthUpload(false, ImageFlagBits::Tracked));
-    REQUIRE_FALSE(IsFirstDepthUpload(true, ImageFlagBits::Tracked));
+    REQUIRE(IsFirstAtlasUpload(false, ImageFlagBits::Tracked));
+    REQUIRE_FALSE(IsFirstAtlasUpload(true, ImageFlagBits::Tracked));
     for (auto bit :
          {ImageFlagBits::Registered, ImageFlagBits::Remapped, ImageFlagBits::GpuModified,
           ImageFlagBits::Alias, ImageFlagBits::BadOverlap, ImageFlagBits::Sparse,
           ImageFlagBits::Rescaled, ImageFlagBits::Unbacked, ImageFlagBits::TrimmedLevels}) {
-        CHECK_FALSE(IsFirstDepthUpload(false, ImageFlagBits::Tracked | bit));
+        CHECK_FALSE(IsFirstAtlasUpload(false, ImageFlagBits::Tracked | bit));
     }
 }
 
@@ -139,7 +140,9 @@ TEST_CASE("A depth clear requires exact tiled source and full host subresource c
         const std::array range{std::pair<u64, u64>{offset, offset + chunk}};
         plans.emplace_back(PlanUnswizzleImageRows(base, info, range));
     }
-    const auto covers = [&] { return CoversWholeD16(plans, base, size, 12288, 12288); };
+    const auto covers = [&] {
+        return CoversWholeAtlas(plans, base, size, 12288, 12288, PixelFormat::D16_UNORM);
+    };
     REQUIRE(covers());
     SECTION("Guest gap at the end") {
         ++plans.back().runs.back().src_addr;
@@ -165,11 +168,13 @@ TEST_CASE("A depth clear requires exact tiled source and full host subresource c
     REQUIRE_FALSE(covers());
 }
 
-TEST_CASE("D16 owned runs survive source mutation and late mixed walker fallback",
-          "[zero_depth_upload]") {
+TEST_CASE("Owned scalar atlas runs survive source mutation and late mixed walker fallback",
+          "[zero_depth_upload][zero_atlas_upload]") {
     constexpr GPUVAddr base = 512;
     constexpr size_t width = 256, height = 512;
-    auto info = Target(PixelFormat::D16_UNORM, width);
+    const auto format = GENERATE(PixelFormat::D16_UNORM, PixelFormat::R32_FLOAT);
+    CAPTURE(static_cast<u32>(format));
+    auto info = Target(format, width);
     info.size.height = height;
     info.layer_stride = CalculateLayerStride(info);
     const auto size = CalculateGuestSizeInBytes(info);
@@ -179,7 +184,7 @@ TEST_CASE("D16 owned runs survive source mutation and late mixed walker fallback
         const std::array range{std::pair{offset, std::min<u64>(size, offset + chunk_size)}};
         plans.emplace_back(PlanUnswizzleImageRows(base, info, range));
     }
-    REQUIRE(CoversWholeD16(plans, base, size, width, height));
+    REQUIRE(CoversWholeAtlas(plans, base, size, width, height, info.format));
     std::vector<u8> source(size);
     bool expect_clear = false;
     SECTION("All zero") {
@@ -197,11 +202,21 @@ TEST_CASE("D16 owned runs survive source mutation and late mixed walker fallback
     SECTION("Every byte FF requires original upload") {
         std::fill(source.begin(), source.end(), 0xff);
     }
+    if (format == PixelFormat::R32_FLOAT) {
+        SECTION("Final fallback R32 texel is negative zero") {
+            constexpr u32 bits = 0x80000000;
+            std::memcpy(source.data() + size - 4, &bits, 4);
+        }
+        SECTION("Final fallback R32 texel has a NaN payload") {
+            constexpr u32 bits = 0x7fc01234;
+            std::memcpy(source.data() + size - 4, &bits, 4);
+        }
+    }
     const auto original = source;
     std::vector<u8> received;
     std::vector<u8> expected;
     size_t next_read = 0, allocations = 0;
-    D16UploadEvidence evidence{base, size};
+    AtlasUploadEvidence evidence{base, size};
     const auto capture = [&](const UnswizzleRowRun& r, std::vector<u8>& owned) {
         const size_t offset = r.src_addr - base;
         REQUIRE(offset == next_read);
@@ -228,7 +243,7 @@ TEST_CASE("D16 owned runs survive source mutation and late mixed walker fallback
         }
         expected.insert(expected.end(), baseline.begin(), baseline.end());
     };
-    const auto result = UploadD16Snapshots(
+    const auto result = UploadZeroAtlasSnapshots(
         plans, capture, allocate,
         [](const auto& p, const auto& r, auto& src, auto& dst) {
             DetileOwnedRun(p, r, src, dst, true);
@@ -241,4 +256,27 @@ TEST_CASE("D16 owned runs survive source mutation and late mixed walker fallback
     REQUIRE(allocations == (expect_clear ? 0 : plans.size()));
     REQUIRE(received == expected);
     REQUIRE(received.size() == (expect_clear ? 0 : size));
+}
+
+TEST_CASE("The observed R32 source and host rectangles cover the exact 64 MiB scalar image",
+          "[atlas_upload_evidence][zero_atlas_upload]") {
+    constexpr GPUVAddr base = 0x212345000;
+    constexpr u64 chunk = 32ULL << 20, bytes = 2 * chunk;
+    auto info = Target(PixelFormat::R32_FLOAT, 4096);
+    info.layer_stride = CalculateLayerStride(info);
+    REQUIRE(CalculateGuestSizeInBytes(info) == bytes);
+    REQUIRE(IsR32AtlasFileRead(info, bytes));
+    std::vector<UnswizzlePlan> plans;
+    size_t runs = 0;
+    for (u64 offset = 0; offset < bytes; offset += chunk) {
+        const std::array range{std::pair{offset, offset + chunk}};
+        plans.emplace_back(PlanUnswizzleImageRows(base, info, range));
+        runs += plans.back().runs.size();
+    }
+    REQUIRE(runs == 32);
+    REQUIRE(CoversWholeAtlas(plans, base, bytes, 4096, 4096, info.format));
+    CHECK_FALSE(CoversWholeAtlas(plans, base, bytes, 4096, 4096, PixelFormat::D16_UNORM));
+    CHECK_FALSE(CoversWholeAtlas(plans, base, bytes, 4096, 4096, PixelFormat::R32_UINT));
+    ++plans.back().copies.back().image_subresource.base_layer;
+    CHECK_FALSE(CoversWholeAtlas(plans, base, bytes, 4096, 4096, info.format));
 }

@@ -46,7 +46,7 @@
 #include "video_core/texture_cache/samples_helper.h"
 #include "video_core/texture_cache/texture_cache_base.h"
 #include "video_core/texture_cache/util.h"
-#include "video_core/texture_cache/zero_depth_upload.h"
+#include "video_core/texture_cache/zero_atlas_upload.h"
 #include "video_core/textures/decoders.h"
 
 namespace VideoCommon {
@@ -2019,14 +2019,16 @@ bool TextureCache<P>::UploadInChunks(Image& image) {
     static const char* const snapshot_marker = std::getenv("STITCH_ATLAS_SNAPSHOT_BASELINE_FILE");
     static const char* const file_marker = std::getenv("STITCH_ATLAS_PREAD_BASELINE_FILE");
     const bool d16 = image.info.native_tiling && image.info.format == PixelFormat::D16_UNORM;
-    const bool compare_file = file_marker && *file_marker &&
-                              (d16 || IsR32AtlasFileRead(image.info, image.guest_size_bytes));
+    const bool d16_atlas = IsD16EvidenceAtlas(image.info, image.guest_size_bytes);
+    const bool r32_atlas = IsR32AtlasFileRead(image.info, image.guest_size_bytes);
+    const bool compare_file = file_marker && *file_marker && (d16 || r32_atlas);
+    static const char* const r32_marker = std::getenv("STITCH_R32_ZERO_BASELINE_FILE");
     static const bool classify = [] {
         const char* value = std::getenv("STITCH_D16_UPLOAD_EVIDENCE");
         return value && std::string_view{value} == "1";
     }();
-    std::optional<D16UploadEvidence> evidence;
-    if (classify && IsD16EvidenceAtlas(image.info, image.guest_size_bytes)) {
+    std::optional<AtlasUploadEvidence> evidence;
+    if ((classify && d16_atlas) || (r32_atlas && r32_marker && *r32_marker)) {
         evidence.emplace(image.gpu_addr, image.guest_size_bytes);
     }
     const auto absent = [](const char* path) {
@@ -2060,20 +2062,21 @@ bool TextureCache<P>::UploadInChunks(Image& image) {
         ++chunks;
     };
     bool snapshot_upload = false;
-    bool depth_cleared = false;
+    bool atlas_cleared = false;
     if constexpr (requires {
-                      image.CanInitializeZeroDepth();
-                      image.InitializeZeroDepth();
+                      image.CanInitializeZeroAtlas();
+                      image.InitializeZeroAtlas();
                   }) {
-        static const char* const zero_marker = std::getenv("STITCH_D16_ZERO_BASELINE_FILE");
-        if (zero_marker && *zero_marker && IsD16EvidenceAtlas(image.info, image.guest_size_bytes) &&
-            absent(zero_marker) && image.CanInitializeZeroDepth()) {
+        static const char* const d16_marker = std::getenv("STITCH_D16_ZERO_BASELINE_FILE");
+        const char* const marker = d16_atlas ? d16_marker : r32_atlas ? r32_marker : nullptr;
+        if (marker && *marker && absent(marker) && image.CanInitializeZeroAtlas()) {
             std::vector<UnswizzlePlan> plans;
             for (u64 offset = 0; offset < image.guest_size_bytes; offset += chunk_size) {
                 plans.emplace_back(plan_chunk(offset));
             }
-            if (CoversWholeD16(plans, image.gpu_addr, image.guest_size_bytes, image.info.size.width,
-                               image.info.size.height)) {
+            if (CoversWholeAtlas(plans, image.gpu_addr, image.guest_size_bytes,
+                                 image.info.size.width, image.info.size.height,
+                                 image.info.format)) {
                 evidence.emplace(image.gpu_addr, image.guest_size_bytes);
                 const auto capture = [&](const UnswizzleRowRun& r, std::vector<u8>& bytes) {
                     const bool file =
@@ -2091,12 +2094,12 @@ bool TextureCache<P>::UploadInChunks(Image& image) {
                     DetileOwnedRun(plan, r, bytes, dst, gpu_memory->UsesNativeTiling());
                     unswizzle.detile_ns += elapsed(begin, now());
                 };
-                depth_cleared = UploadD16Snapshots(plans, capture, allocate, decode, upload);
-                if (depth_cleared) {
+                atlas_cleared = UploadZeroAtlasSnapshots(plans, capture, allocate, decode, upload);
+                if (atlas_cleared) {
                     // Coverage was proven from metadata; every contributing snapshot was zero.
                     ASSERT(evidence->Complete() && evidence->zero_bytes == evidence->size);
                     const auto begin = now();
-                    image.InitializeZeroDepth();
+                    image.InitializeZeroAtlas();
                     record_ns += elapsed(begin, now());
                 }
                 snapshot_upload = true;
@@ -2146,12 +2149,13 @@ bool TextureCache<P>::UploadInChunks(Image& image) {
     if (evidence) {
         LOG_INFO(
             HW_GPU,
-            "D16 upload evidence: frame={} footprint_bytes={} complete={} scanned_bytes={} runs={} "
+            "{} upload evidence: frame={} footprint_bytes={} complete={} scanned_bytes={} runs={} "
             "zero_run_bytes={} ff_run_bytes={} other_run_bytes={} non_file_bytes={} scan_ms={:.3f} "
-            "zero_candidate={} depth_cleared={}",
-            frame_tick, evidence->size, evidence->Complete(), evidence->scanned, evidence->runs,
-            evidence->zero_bytes, evidence->ff_bytes, evidence->other_bytes,
-            evidence->non_file_bytes, evidence->scan_ns / 1.e6, snapshot_upload, depth_cleared);
+            "zero_candidate={} {}={}",
+            d16_atlas ? "D16" : "R32", frame_tick, evidence->size, evidence->Complete(),
+            evidence->scanned, evidence->runs, evidence->zero_bytes, evidence->ff_bytes,
+            evidence->other_bytes, evidence->non_file_bytes, evidence->scan_ns / 1.e6,
+            snapshot_upload, d16_atlas ? "depth_cleared" : "color_cleared", atlas_cleared);
     }
     return true;
 }

@@ -48,8 +48,8 @@
 #ifdef EGLANTINE_STREAMLINE
 #include "video_core/vulkan_common/streamline.h"
 #endif
-#include "video_core/renderer_vulkan/vk_initial_depth_clear.h"
-#include "video_core/texture_cache/zero_depth_upload.h"
+#include "video_core/renderer_vulkan/vk_initial_atlas_clear.h"
+#include "video_core/texture_cache/zero_atlas_upload.h"
 #include "video_core/textures/decoders.h"
 #include "video_core/vulkan_common/unbacked_fallback.h"
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
@@ -3637,22 +3637,25 @@ bool Image::BindZeroBlock() {
     return true;
 }
 
-bool Image::CanInitializeZeroDepth() const {
+bool Image::CanInitializeZeroAtlas() const {
+    const VkFormat expected = info.format == PixelFormat::D16_UNORM   ? VK_FORMAT_D16_UNORM
+                              : info.format == PixelFormat::R32_FLOAT ? VK_FORMAT_R32_SFLOAT
+                                                                      : VK_FORMAT_UNDEFINED;
     return original_image && !original_image.IsUnbacked() && !recycle_ticket &&
            current_image == &Image::original_image && !host_level_offset && !info.is_sparse &&
-           VideoCommon::IsFirstDepthUpload(initialized, flags) &&
-           SupportsInitialZeroDepth(original_image.Format(), original_image.UsageFlags(),
+           VideoCommon::IsFirstAtlasUpload(initialized, flags) &&
+           SupportsInitialZeroAtlas(original_image.Format(), expected, original_image.UsageFlags(),
                                     aspect_mask) &&
-           runtime->device.IsFormatSupported(
-               VK_FORMAT_D16_UNORM, VK_FORMAT_FEATURE_TRANSFER_DST_BIT, FormatType::Optimal);
+           runtime->device.IsFormatSupported(expected, VK_FORMAT_FEATURE_TRANSFER_DST_BIT,
+                                             FormatType::Optimal);
 }
 
-void Image::InitializeZeroDepth() {
-    ASSERT(CanInitializeZeroDepth());
+void Image::InitializeZeroAtlas() {
+    ASSERT(CanInitializeZeroAtlas());
     scheduler->RequestOutsideRenderPassOperationContext();
     initialized = true;
-    scheduler->Record([image = *original_image](vk::CommandBuffer cmdbuf) {
-        RecordInitialZeroDepth(cmdbuf, image);
+    scheduler->Record([image = *original_image, aspect = aspect_mask](vk::CommandBuffer cmdbuf) {
+        RecordInitialZeroAtlas(cmdbuf, image, aspect);
     });
 }
 

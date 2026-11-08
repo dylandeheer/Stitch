@@ -1318,7 +1318,7 @@ void DetileOwnedRun(const UnswizzlePlan& plan, const UnswizzleRowRun& run,
 
 void ExecuteUnswizzlePlan(Tegra::MemoryManager& gpu_memory, const UnswizzlePlan& plan,
                           std::span<u8> output, UnswizzleTimings* timings, bool bulk_snapshot,
-                          bool read_backing_file, D16UploadEvidence* evidence) {
+                          bool read_backing_file, AtlasUploadEvidence* evidence) {
     using Clock = std::chrono::steady_clock;
     std::vector<u8> run;
     for (const auto& r : plan.runs) {

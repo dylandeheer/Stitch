@@ -29,8 +29,8 @@ inline bool IsD16EvidenceAtlas(const ImageInfo& info, u64 footprint) {
 
 // Aggregate classifications of complete, already copied runs. A sum of byte lengths alone
 // cannot distinguish a complete footprint from an overlap plus a missing interval.
-struct D16UploadEvidence {
-    explicit D16UploadEvidence(GPUVAddr base_, u64 size_) : base{base_}, size{size_} {}
+struct AtlasUploadEvidence {
+    explicit AtlasUploadEvidence(GPUVAddr base_, u64 size_) : base{base_}, size{size_} {}
 
     void Observe(GPUVAddr address, std::span<const u8> bytes, bool from_file) {
         constexpr size_t max_scan = 4ULL << 20;
