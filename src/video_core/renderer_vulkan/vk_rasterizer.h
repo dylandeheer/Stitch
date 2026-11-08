@@ -52,6 +52,7 @@ class Maxwell3D;
 } // namespace Tegra
 
 namespace Vulkan {
+class DrawCpuProbe;
 
 struct FramebufferTextureInfo;
 
@@ -289,6 +290,7 @@ private:
     };
     std::map<std::array<u64, 3>, MeshPerfStats> mesh_perf_programs;
     u32 mesh_perf_frames{};
+    std::unique_ptr<DrawCpuProbe> draw_cpu_probe;
     u64 render_trace_frame = 0;
     u32 render_trace_draws = 0;
     u32 render_trace_clears = 0;

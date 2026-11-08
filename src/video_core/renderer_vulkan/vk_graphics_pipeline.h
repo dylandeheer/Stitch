@@ -121,6 +121,12 @@ public:
 
     static std::chrono::nanoseconds TakeHoldTime() noexcept;
 
+    const GraphicsPipelineCacheKey& DiagnosticKey() const noexcept {
+        return key;
+    }
+    bool HasImageDescriptors() const noexcept {
+        return num_image_elements != 0;
+    }
     bool HasDynamicVertexInput() const noexcept { return key.state.dynamic_vertex_input; }
     const std::array<u64, 6>& ShaderHashes() const noexcept {
         return key.unique_hashes;

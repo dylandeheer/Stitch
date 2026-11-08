@@ -28,22 +28,26 @@
 
 #include "common/assert.h"
 #include "common/dkb_frame_trace.h"
-#include "shader_recompiler/exception.h"
 #include "common/logging.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
+#include "shader_recompiler/exception.h"
 #include "video_core/buffer_cache/buffer_cache.h"
-#include "video_core/gpu_logging/gpu_logging.h"
 #include "video_core/control/channel_state.h"
-#include "video_core/native_query_trace.h"
-#include "video_core/native_indirect_reset.h"
-#include "video_core/render_trace.h"
-#include "video_core/indirect_reset.h"
-#include "video_core/engines/maxwell_3d.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/gpu_logging/gpu_logging.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
+#include "video_core/indirect_reset.h"
+#include "video_core/memory_manager.h"
+#include "video_core/native_indirect_reset.h"
+#include "video_core/native_query_trace.h"
+#include "video_core/nx2.h"
+#include "video_core/nx2_debug_control.h"
+#include "video_core/nx2_profile.h"
+#include "video_core/render_trace.h"
 #include "video_core/renderer_vulkan/blit_image.h"
+#include "video_core/renderer_vulkan/draw_cpu_probe.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
 #include "video_core/renderer_vulkan/framebuffer_clear_layers.h"
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
@@ -55,19 +59,15 @@
 #include "video_core/renderer_vulkan/vk_query_cache.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
-#include "video_core/texture_cache/clear_discard.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/renderer_vulkan/vk_state_tracker.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
 #include "video_core/shader_cache.h"
+#include "video_core/texture_cache/clear_discard.h"
 #include "video_core/texture_cache/texture_cache_base.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
-#include "video_core/memory_manager.h"
-#include "video_core/nx2.h"
-#include "video_core/nx2_debug_control.h"
-#include "video_core/nx2_profile.h"
 
 namespace Vulkan {
 
@@ -427,6 +427,8 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
       accelerate_dma(buffer_cache, texture_cache, scheduler),
       fence_manager(*this, gpu, texture_cache, buffer_cache, query_cache, device, scheduler),
       frame_dump(device, memory_allocator, scheduler) {
+    if (const char* path = std::getenv("STITCH_DRAW_CPU_FILE"); path && *path)
+        draw_cpu_probe = std::make_unique<DrawCpuProbe>(path);
     scheduler.SetQueryCache(query_cache, query_cache_runtime);
     buffer_cache.SetPendingCpuWrites(
         [this](const std::function<void(DAddr, size_t)>& callback) {
@@ -540,6 +542,15 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         gpu.TickWork();
     };
     bool submitted = false;
+    auto* probe = draw_cpu_probe && VideoCommon::GpuSplit::OnBackThread() &&
+                          draw_cpu_probe->Begin(scheduler.CurrentTick(), scheduler.RecordingEpoch(),
+                                                scheduler.IsRenderPassActive())
+                      ? draw_cpu_probe.get()
+                      : nullptr;
+    SCOPE_EXIT {
+        if (probe)
+            probe->End(submitted);
+    };
     SCOPE_EXIT {
         auto& native = maxwell3d->GetNativeMacroEngine();
         if (native.native_turing && !submitted) {
@@ -555,6 +566,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     };
     namespace Profile = VideoCommon::Nx2Profile;
     {
+        DrawCpuProbe::Scope cpu{DrawCpuProbe::Zone::Preflush};
         Profile::Scope scope{Profile::Zone::FlushWork};
         FlushWork();
         gpu_memory->FlushCaching();
@@ -603,6 +615,8 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         return;
     }
     // Task/mesh pipelines: the draw's vertex count is the number of task workgroups.
+    if (probe)
+        probe->Found(pipeline->ShaderHashes());
     mesh_draw = pipeline->IsMeshPipeline();
     // EDEN_NX2_NO_MESH=1: skip task/mesh draws as before they were supported (A/B comparisons).
     // EDEN_NX2_NO_MESH_FILE=<path>: skip them while that file exists (checked every 1024 draws),
@@ -914,6 +928,19 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
             stats.vertex_lines = setup.vertex_lines;
             stats.primitive_lines = setup.primitive_lines;
         }
+        if (probe) {
+            const auto& state = maxwell3d->draw_manager.draw_state;
+            const bool basic = maxwell3d->GetNativeMacroEngine().native_turing &&
+                               pipeline->IsBuilt() && !maxwell3d->regs.transform_feedback_enabled &&
+                               !frame_dump.Capturing() && state.inline_index_draw_indexes.empty() &&
+                               state.topology != Maxwell::PrimitiveTopology::Quads &&
+                               state.topology != Maxwell::PrimitiveTopology::QuadStrip;
+            probe->Observe(pipeline->DiagnosticKey(), is_indexed, is_indirect,
+                           !mesh_draw && !pipeline->HasImageDescriptors(), basic,
+                           scheduler.CurrentTick(), scheduler.RecordingEpoch(),
+                           scheduler.IsRenderPassActive());
+        }
+        DrawCpuProbe::Scope cpu{DrawCpuProbe::Zone::DrawRecord};
         draw_func();
     }
     submitted = true;
@@ -2507,6 +2534,8 @@ void RasterizerVulkan::FrameDumpPass(const Framebuffer* framebuffer) {
 }
 
 void RasterizerVulkan::TickFrame() {
+    if (draw_cpu_probe)
+        draw_cpu_probe->Present();
     if (VideoCore::Nx2Debug::HasRequests()) {
         if (auto capture = VideoCore::Nx2Debug::TakeCapture()) {
             frame_dump.Arm(std::move(capture->directory), capture->sampled, capture->buffers,
@@ -3789,6 +3818,8 @@ void RasterizerVulkan::InitializeChannel(Tegra::Control::ChannelState& channel) 
 void RasterizerVulkan::BindChannel(Tegra::Control::ChannelState& channel) {
     const s32 channel_id = channel.bind_id;
     BindToChannel(channel_id);
+    if (draw_cpu_probe)
+        draw_cpu_probe->Bind(channel_id);
     {
         std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
         texture_cache.BindToChannel(channel_id);

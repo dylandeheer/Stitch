@@ -5,27 +5,27 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
-#include <cstdlib>
-#include <sstream>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cstddef>
+#include <cstdlib>
 #include <fstream>
 #include <functional>
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <optional>
 #include <span>
+#include <sstream>
 #include <thread>
 #include <unordered_set>
 #include <vector>
-#include <bit>
-#include <numeric>
 #include "common/cityhash.h"
-#include "common/scope_exit.h"
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
+#include "common/scope_exit.h"
 #include "common/thread_worker.h"
 #include "core/core.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
@@ -37,10 +37,12 @@
 #include "shader_recompiler/program_header.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/gpu_logging/gpu_logging.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/pipeline_cache_files.h"
 #include "video_core/renderer_vulkan/async_draw_policy.h"
+#include "video_core/renderer_vulkan/draw_cpu_probe.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
 #include "video_core/renderer_vulkan/pipeline_helper.h"
@@ -60,7 +62,6 @@
 #include "video_core/surface.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
-#include "video_core/gpu_logging/gpu_logging.h"
 
 #ifdef __ANDROID__
 #include "../../android/app/src/main/jni/android_settings.h"
@@ -865,11 +866,20 @@ void PipelineCache::SaveUsedPipelines() {
 
 GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
 
-    if (!RefreshStages(graphics_key.unique_hashes)) {
+    bool refreshed;
+    {
+        DrawCpuProbe::Scope cpu{DrawCpuProbe::Zone::Stages};
+        refreshed = RefreshStages(graphics_key.unique_hashes);
+    }
+    if (!refreshed) {
         current_pipeline = nullptr;
         return nullptr;
     }
-    graphics_key.state.Refresh(*maxwell3d, dynamic_features);
+    {
+        DrawCpuProbe::Scope cpu{DrawCpuProbe::Zone::Fixed};
+        graphics_key.state.Refresh(*maxwell3d, dynamic_features);
+    }
+    DrawCpuProbe::Scope cpu{DrawCpuProbe::Zone::Lookup};
 
     if (current_pipeline) {
         GraphicsPipeline* const next{current_pipeline->Next(graphics_key)};

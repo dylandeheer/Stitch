@@ -23,6 +23,7 @@
 #include "shader_recompiler/exception.h"
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/renderer_vulkan/draw_cpu_probe.h"
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
 #include "video_core/renderer_vulkan/mesh_lookup_mode.h"
 #include "video_core/renderer_vulkan/pipeline_statistics.h"
@@ -724,6 +725,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     }
 
     {
+        DrawCpuProbe::Scope cpu{DrawCpuProbe::Zone::Geometry};
         Profile::Scope scope{Profile::Zone::UpdateBuffers};
         buffer_cache.UpdateGraphicsBuffers(is_indexed);
         buffer_cache.BindHostGeometryBuffers(is_indexed);
@@ -740,6 +742,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     const VideoCommon::ImageViewInOut* views_it{views.data()};
     const auto prepare_stage{[&](size_t stage) LAMBDA_FORCEINLINE {
         {
+            DrawCpuProbe::Scope cpu{DrawCpuProbe::Zone::StageBuffers};
             Profile::Scope scope{Profile::Zone::BindStageBuffers};
             buffer_cache.BindHostStageBuffers(stage);
         }
@@ -794,6 +797,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         buffer_cache.any_buffer_uploaded = false;
     }
     {
+        DrawCpuProbe::Scope cpu{DrawCpuProbe::Zone::Targets};
         Profile::Scope scope{Profile::Zone::RenderTargets};
         texture_cache.UpdateRenderTargets(false);
         const std::span<const VideoCommon::ImageViewInOut> view_span{views.data(), views.size()};
@@ -1041,6 +1045,7 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
             last_descriptor_payload.assign(entries, entries + num_descriptor_entries);
         }
     }
+    DrawCpuProbe::Scope cpu_enqueue{DrawCpuProbe::Zone::ConfigureEnqueue};
     scheduler.Record([this, descriptor_data, bind_pipeline, update_descriptors,
                       descriptor_buffer_offset, descriptor_buffer_chunk, bind_descriptor_buffer,
                       rescaling_data = rescaling.Data(), is_rescaling, update_rescaling,
