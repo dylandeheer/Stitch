@@ -5,6 +5,7 @@
 
 #include "video_core/texture_cache/atlas_upload_evidence.h"
 #include "video_core/texture_cache/util.h"
+#include "video_core/texture_cache/zero_depth_upload.h"
 
 namespace {
 using namespace VideoCommon;
@@ -113,4 +114,131 @@ TEST_CASE("All nine D16 chunks cover the full guest footprint exactly once", "[a
     REQUIRE(observed.zero_bytes == bytes - observed.non_file_bytes);
     REQUIRE(observed.other_bytes == observed.non_file_bytes);
     REQUIRE(observed.ff_bytes == 0);
+}
+
+TEST_CASE("Only fresh backed D16 first-use storage can use a depth clear", "[zero_depth_upload]") {
+    REQUIRE(IsFirstDepthUpload(false, ImageFlagBits::Tracked));
+    REQUIRE_FALSE(IsFirstDepthUpload(true, ImageFlagBits::Tracked));
+    for (auto bit :
+         {ImageFlagBits::Registered, ImageFlagBits::Remapped, ImageFlagBits::GpuModified,
+          ImageFlagBits::Alias, ImageFlagBits::BadOverlap, ImageFlagBits::Sparse,
+          ImageFlagBits::Rescaled, ImageFlagBits::Unbacked, ImageFlagBits::TrimmedLevels}) {
+        CHECK_FALSE(IsFirstDepthUpload(false, ImageFlagBits::Tracked | bit));
+    }
+}
+
+TEST_CASE("A depth clear requires exact tiled source and full host subresource coverage",
+          "[zero_depth_upload]") {
+    constexpr GPUVAddr base = 0x12345000;
+    constexpr size_t size = 288ULL << 20;
+    constexpr size_t chunk = 32ULL << 20;
+    auto info = Target(PixelFormat::D16_UNORM, 12288);
+    info.layer_stride = CalculateLayerStride(info);
+    std::vector<UnswizzlePlan> plans;
+    for (size_t offset = 0; offset < size; offset += chunk) {
+        const std::array range{std::pair<u64, u64>{offset, offset + chunk}};
+        plans.emplace_back(PlanUnswizzleImageRows(base, info, range));
+    }
+    const auto covers = [&] { return CoversWholeD16(plans, base, size, 12288, 12288); };
+    REQUIRE(covers());
+    SECTION("Guest gap at the end") {
+        ++plans.back().runs.back().src_addr;
+    }
+    SECTION("Destination overlap and hole of equal area") {
+        --plans[1].copies.front().image_offset.x;
+    }
+    SECTION("Accidental second mip") {
+        ++plans.back().copies.back().image_subresource.base_level;
+    }
+    SECTION("Second layer") {
+        ++plans.front().copies.front().image_subresource.num_layers;
+    }
+    SECTION("Padded source") {
+        ++plans[2].runs.back().guest_bytes;
+    }
+    SECTION("Short staging allocation") {
+        --plans[1].total_host_bytes;
+    }
+    SECTION("Staging offset overlap") {
+        --plans.back().copies.back().buffer_offset;
+    }
+    REQUIRE_FALSE(covers());
+}
+
+TEST_CASE("D16 owned runs survive source mutation and late mixed walker fallback",
+          "[zero_depth_upload]") {
+    constexpr GPUVAddr base = 512;
+    constexpr size_t width = 256, height = 512;
+    auto info = Target(PixelFormat::D16_UNORM, width);
+    info.size.height = height;
+    info.layer_stride = CalculateLayerStride(info);
+    const auto size = CalculateGuestSizeInBytes(info);
+    std::vector<UnswizzlePlan> plans;
+    constexpr u64 chunk_size = 96 * 1024;
+    for (u64 offset = 0; offset < size; offset += chunk_size) {
+        const std::array range{std::pair{offset, std::min<u64>(size, offset + chunk_size)}};
+        plans.emplace_back(PlanUnswizzleImageRows(base, info, range));
+    }
+    REQUIRE(CoversWholeD16(plans, base, size, width, height));
+    std::vector<u8> source(size);
+    bool expect_clear = false;
+    SECTION("All zero") {
+        expect_clear = true;
+    }
+    SECTION("Short-distance from start") {
+        source.front() = 0x31;
+    }
+    SECTION("Last fallback snapshot is the only mixed one") {
+        source.back() = 0x71;
+    }
+    SECTION("Chunk boundary") {
+        source[chunk_size] = 0x51;
+    }
+    SECTION("Every byte FF requires original upload") {
+        std::fill(source.begin(), source.end(), 0xff);
+    }
+    const auto original = source;
+    std::vector<u8> received;
+    std::vector<u8> expected;
+    size_t next_read = 0, allocations = 0;
+    D16UploadEvidence evidence{base, size};
+    const auto capture = [&](const UnswizzleRowRun& r, std::vector<u8>& owned) {
+        const size_t offset = r.src_addr - base;
+        REQUIRE(offset == next_read);
+        next_read += r.guest_bytes;
+        owned.assign(source.begin() + offset, source.begin() + next_read);
+        std::fill(source.begin() + offset, source.begin() + next_read, 0xed);
+        const auto before = evidence.zero_bytes;
+        evidence.Observe(r.src_addr, owned, next_read != size);
+        return evidence.zero_bytes - before == r.guest_bytes;
+    };
+    struct Map {
+        std::vector<u8> mapped_span;
+    };
+    const auto allocate = [&](size_t n) {
+        ++allocations;
+        return Map{std::vector<u8>(n, 0x99)};
+    };
+    const auto upload = [&](Map& map, const UnswizzlePlan& p) {
+        received.insert(received.end(), map.mapped_span.begin(), map.mapped_span.end());
+        std::vector<u8> baseline(p.total_host_bytes);
+        for (const auto& r : p.runs) {
+            const auto pristine = std::span{original}.subspan(r.src_addr - base, r.guest_bytes);
+            DetileOwnedRun(p, r, pristine, baseline, true);
+        }
+        expected.insert(expected.end(), baseline.begin(), baseline.end());
+    };
+    const auto result = UploadD16Snapshots(
+        plans, capture, allocate,
+        [](const auto& p, const auto& r, auto& src, auto& dst) {
+            DetileOwnedRun(p, r, src, dst, true);
+        },
+        upload);
+    REQUIRE(result == expect_clear);
+    REQUIRE(next_read == size);
+    REQUIRE(evidence.Complete());
+    REQUIRE(evidence.non_file_bytes == plans.back().runs.back().guest_bytes);
+    REQUIRE(allocations == (expect_clear ? 0 : plans.size()));
+    REQUIRE(received == expected);
+    REQUIRE(received.size() == (expect_clear ? 0 : size));
 }

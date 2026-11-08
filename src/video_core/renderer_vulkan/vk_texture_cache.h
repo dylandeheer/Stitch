@@ -569,6 +569,9 @@ public:
         return sparse_layers.bound_bytes;
     }
 
+    bool CanInitializeZeroDepth() const;
+    void InitializeZeroDepth();
+
     bool IsRescaled() const noexcept;
 
     bool ScaleUp(bool ignore = false);

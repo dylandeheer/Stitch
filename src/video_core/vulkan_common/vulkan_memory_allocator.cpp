@@ -435,7 +435,7 @@ VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedica
         );
     }
 
-    image = vk::Image(handle, ci.usage, *device.GetLogical(), allocator, allocation,
+    image = vk::Image(handle, ci.format, ci.usage, *device.GetLogical(), allocator, allocation,
                       device.GetDispatchLoader());
     return VK_SUCCESS;
 }
@@ -454,7 +454,7 @@ vk::Image MemoryAllocator::CreateUnbackedImage(const VkImageCreateInfo &ci, bool
                                                  &sparse) != VK_SUCCESS) {
         return vk::Image{};
     }
-    return vk::Image(sparse, ci.usage, *device.GetLogical(), allocator, VK_NULL_HANDLE,
+    return vk::Image(sparse, ci.format, ci.usage, *device.GetLogical(), allocator, VK_NULL_HANDLE,
                      device.GetDispatchLoader());
 }
 

@@ -1269,58 +1269,72 @@ UnswizzlePlan PlanUnswizzleImageRows(
     return plan;
 }
 
-void ExecuteUnswizzlePlan(Tegra::MemoryManager& gpu_memory, const UnswizzlePlan& plan,
-                         std::span<u8> output, UnswizzleTimings* timings, bool bulk_snapshot, bool read_backing_file,
-                         D16UploadEvidence* evidence) {
+bool ReadOwnedUnswizzleRun(Tegra::MemoryManager& memory, const UnswizzleRowRun& run,
+                           std::vector<u8>& storage, UnswizzleTimings* timings, bool bulk_snapshot,
+                           bool read_backing_file) {
     using Clock = std::chrono::steady_clock;
     const auto now = [&] { return timings ? Clock::now() : Clock::time_point{}; };
-    const auto elapsed = [](auto start, auto end) {
-        return std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
-    };
+    const auto began = now();
+    storage.resize(run.guest_bytes);
+    const auto allocated = now();
+#ifdef __linux__
+    rusage before{}, after{};
+    const bool sampled = timings && getrusage(RUSAGE_THREAD, &before) == 0;
+#endif
+    bool file_read = false;
+    const bool bulk =
+        bulk_snapshot && memory.TrySnapshotTextureRun(run.src_addr, storage,
+                                                      read_backing_file ? &file_read : nullptr);
+    if (!bulk) {
+        memory.ReadBlockUnsafe(run.src_addr, storage.data(), storage.size());
+    }
+#ifdef __linux__
+    if (sampled && getrusage(RUSAGE_THREAD, &after) == 0) {
+        ++timings->sampled_reads;
+        timings->read_minor_faults += after.ru_minflt - before.ru_minflt;
+        timings->read_major_faults += after.ru_majflt - before.ru_majflt;
+    }
+#endif
+    if (timings) {
+        const auto read = now();
+        timings->read_ns +=
+            std::chrono::duration_cast<std::chrono::nanoseconds>(read - allocated).count();
+        timings->allocation_ns +=
+            std::chrono::duration_cast<std::chrono::nanoseconds>(allocated - began).count();
+        timings->bulk_bytes += bulk ? run.guest_bytes : 0;
+        timings->file_read_bytes += file_read ? run.guest_bytes : 0;
+        ++timings->runs;
+        timings->guest_bytes += run.guest_bytes;
+    }
+    return file_read;
+}
+
+void DetileOwnedRun(const UnswizzlePlan& plan, const UnswizzleRowRun& run,
+                    std::span<const u8> source, std::span<u8> output, bool native_tiling) {
+    Tegra::Texture::UnswizzleTexture(
+        output.subspan(run.host_offset, run.host_bytes), source, 1U << plan.bpp_log2, run.run_tiles,
+        run.tile_rows, 1, run.block.height, run.block.depth, run.run_alignment, native_tiling);
+}
+
+void ExecuteUnswizzlePlan(Tegra::MemoryManager& gpu_memory, const UnswizzlePlan& plan,
+                          std::span<u8> output, UnswizzleTimings* timings, bool bulk_snapshot,
+                          bool read_backing_file, D16UploadEvidence* evidence) {
+    using Clock = std::chrono::steady_clock;
     std::vector<u8> run;
     for (const auto& r : plan.runs) {
-        const auto began = now();
-        run.resize(r.guest_bytes);
-        const auto allocated = now();
-#ifdef __linux__
-        rusage before{}, after{};
-        const bool sampled = timings && getrusage(RUSAGE_THREAD, &before) == 0;
-#endif
-        bool file_read = false;
-        const bool bulk = bulk_snapshot && gpu_memory.TrySnapshotTextureRun(
-                                               r.src_addr, run, read_backing_file ? &file_read : nullptr);
-        if (!bulk) {
-            gpu_memory.ReadBlockUnsafe(r.src_addr, run.data(), r.guest_bytes);
-        }
-#ifdef __linux__
-        if (sampled && getrusage(RUSAGE_THREAD, &after) == 0) {
-            ++timings->sampled_reads;
-            timings->read_minor_faults += after.ru_minflt - before.ru_minflt;
-            timings->read_major_faults += after.ru_majflt - before.ru_majflt;
-        }
-#endif
-        const auto read = now();
-        auto decode_begin = read;
+        const bool file =
+            ReadOwnedUnswizzleRun(gpu_memory, r, run, timings, bulk_snapshot, read_backing_file);
         if (evidence) {
             const auto begin = Clock::now();
-            evidence->Observe(r.src_addr, run, file_read);
-            decode_begin = Clock::now();
-            evidence->scan_ns += elapsed(begin, decode_begin);
+            evidence->Observe(r.src_addr, run, file);
+            evidence->scan_ns +=
+                std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - begin).count();
         }
-        Tegra::Texture::UnswizzleTexture(output.subspan(r.host_offset, r.host_bytes),
-                                         run, 1U << plan.bpp_log2, r.run_tiles, r.tile_rows, 1,
-                                         r.block.height, r.block.depth, r.run_alignment,
-                                         gpu_memory.UsesNativeTiling());
+        const auto began = timings ? Clock::now() : Clock::time_point{};
+        DetileOwnedRun(plan, r, run, output, gpu_memory.UsesNativeTiling());
         if (timings) {
-            if (bulk) {
-                timings->bulk_bytes += r.guest_bytes;
-                if (file_read) timings->file_read_bytes += r.guest_bytes;
-            }
-            timings->allocation_ns += elapsed(began, allocated);
-            timings->read_ns += elapsed(allocated, read);
-            timings->detile_ns += elapsed(decode_begin, Clock::now());
-            ++timings->runs;
-            timings->guest_bytes += r.guest_bytes;
+            timings->detile_ns +=
+                std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - began).count();
         }
     }
 }

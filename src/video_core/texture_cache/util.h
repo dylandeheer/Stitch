@@ -106,6 +106,15 @@ struct UnswizzleTimings {
     u64 bulk_bytes{}, file_read_bytes{}, read_minor_faults{}, read_major_faults{}, sampled_reads{};
 };
 
+/// Reads one complete tiled run into caller-owned storage. Returns true for a full backing file
+/// read.
+bool ReadOwnedUnswizzleRun(Tegra::MemoryManager& memory, const UnswizzleRowRun& run,
+                           std::vector<u8>& storage, UnswizzleTimings* timings, bool bulk_snapshot,
+                           bool read_backing_file);
+
+void DetileOwnedRun(const UnswizzlePlan& plan, const UnswizzleRowRun& run,
+                    std::span<const u8> source, std::span<u8> output, bool native_tiling);
+
 /// Executes a precalculated unswizzle plan directly into destination memory (e.g. mapped staging span).
 void ExecuteUnswizzlePlan(Tegra::MemoryManager& gpu_memory, const UnswizzlePlan& plan,
                          std::span<u8> output, UnswizzleTimings* timings = nullptr,

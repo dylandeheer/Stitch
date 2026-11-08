@@ -34,18 +34,19 @@
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/guest_memory.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
+#include "video_core/nx2.h"
+#include "video_core/nx2_profile.h"
+#include "video_core/render_trace.h"
 #include "video_core/texture_cache/alias_copy.h"
 #include "video_core/texture_cache/atlas_upload_evidence.h"
 #include "video_core/texture_cache/clear_discard.h"
-#include "video_core/texture_cache/image_view_base.h"
 #include "video_core/texture_cache/conversion.h"
+#include "video_core/texture_cache/image_view_base.h"
 #include "video_core/texture_cache/retire_completed_images.h"
 #include "video_core/texture_cache/samples_helper.h"
 #include "video_core/texture_cache/texture_cache_base.h"
 #include "video_core/texture_cache/util.h"
-#include "video_core/nx2.h"
-#include "video_core/nx2_profile.h"
-#include "video_core/render_trace.h"
+#include "video_core/texture_cache/zero_depth_upload.h"
 #include "video_core/textures/decoders.h"
 
 namespace VideoCommon {
@@ -2038,31 +2039,88 @@ bool TextureCache<P>::UploadInChunks(Image& image) {
                       (d16 && snapshot_marker && *snapshot_marker && absent(snapshot_marker));
     u64 plan_ns{}, staging_ns{}, record_ns{}, chunks{};
     UnswizzleTimings unswizzle;
-    for (u64 offset = 0; offset < image.guest_size_bytes; offset += chunk_size) {
+    const auto plan_chunk = [&](u64 offset) {
         const std::array range{
             std::pair<u64, u64>{offset, std::min<u64>(offset + chunk_size, image.guest_size_bytes)}};
         const auto began = now();
         const auto plan = PlanUnswizzleImageRows(image.gpu_addr, image.info, range);
-        const auto planned = now();
-        plan_ns += elapsed(began, planned);
-        if (!plan.layout_valid) {
-            if (offset == 0) {
-                return false; // layout not handled: one staging buffer after all
-            }
-            continue;
-        }
-        if (plan.copies.empty()) {
-            continue; // padding between levels or layers
-        }
-        auto staging = runtime.UploadStagingBuffer(plan.total_host_bytes);
-        const auto staged = now();
-        ExecuteUnswizzlePlan(*gpu_memory, plan, staging.mapped_span, timed ? &unswizzle : nullptr,
-                             bulk, read_backing_file, evidence ? &*evidence : nullptr);
-        const auto decoded = now();
+        plan_ns += elapsed(began, now());
+        return plan;
+    };
+    const auto allocate = [&](size_t size) {
+        const auto begin = now();
+        auto staging = runtime.UploadStagingBuffer(size);
+        staging_ns += elapsed(begin, now());
+        return staging;
+    };
+    const auto upload = [&](auto& staging, const UnswizzlePlan& plan) {
+        const auto begin = now();
         image.UploadMemory(staging, plan.copies);
-        staging_ns += elapsed(planned, staged);
-        record_ns += elapsed(decoded, now());
+        record_ns += elapsed(begin, now());
         ++chunks;
+    };
+    bool snapshot_upload = false;
+    bool depth_cleared = false;
+    if constexpr (requires {
+                      image.CanInitializeZeroDepth();
+                      image.InitializeZeroDepth();
+                  }) {
+        static const char* const zero_marker = std::getenv("STITCH_D16_ZERO_BASELINE_FILE");
+        if (zero_marker && *zero_marker && IsD16EvidenceAtlas(image.info, image.guest_size_bytes) &&
+            absent(zero_marker) && image.CanInitializeZeroDepth()) {
+            std::vector<UnswizzlePlan> plans;
+            for (u64 offset = 0; offset < image.guest_size_bytes; offset += chunk_size) {
+                plans.emplace_back(plan_chunk(offset));
+            }
+            if (CoversWholeD16(plans, image.gpu_addr, image.guest_size_bytes, image.info.size.width,
+                               image.info.size.height)) {
+                evidence.emplace(image.gpu_addr, image.guest_size_bytes);
+                const auto capture = [&](const UnswizzleRowRun& r, std::vector<u8>& bytes) {
+                    const bool file =
+                        ReadOwnedUnswizzleRun(*gpu_memory, r, bytes, timed ? &unswizzle : nullptr,
+                                              bulk, read_backing_file);
+                    const auto begin = Clock::now();
+                    const auto before = evidence->zero_bytes;
+                    evidence->Observe(r.src_addr, bytes, file);
+                    evidence->scan_ns += elapsed(begin, Clock::now());
+                    return evidence->zero_bytes - before == r.guest_bytes;
+                };
+                const auto decode = [&](const UnswizzlePlan& plan, const UnswizzleRowRun& r,
+                                        std::span<const u8> bytes, std::span<u8> dst) {
+                    const auto begin = now();
+                    DetileOwnedRun(plan, r, bytes, dst, gpu_memory->UsesNativeTiling());
+                    unswizzle.detile_ns += elapsed(begin, now());
+                };
+                depth_cleared = UploadD16Snapshots(plans, capture, allocate, decode, upload);
+                if (depth_cleared) {
+                    // Coverage was proven from metadata; every contributing snapshot was zero.
+                    ASSERT(evidence->Complete() && evidence->zero_bytes == evidence->size);
+                    const auto begin = now();
+                    image.InitializeZeroDepth();
+                    record_ns += elapsed(begin, now());
+                }
+                snapshot_upload = true;
+            }
+        }
+    }
+    if (!snapshot_upload) {
+        for (u64 offset = 0; offset < image.guest_size_bytes; offset += chunk_size) {
+            const auto plan = plan_chunk(offset);
+            if (!plan.layout_valid) {
+                if (offset == 0) {
+                    return false; // layout not handled: one staging buffer after all
+                }
+                continue;
+            }
+            if (plan.copies.empty()) {
+                continue; // padding between levels or layers
+            }
+            auto staging = allocate(plan.total_host_bytes);
+            ExecuteUnswizzlePlan(*gpu_memory, plan, staging.mapped_span,
+                                 timed ? &unswizzle : nullptr, bulk, read_backing_file,
+                                 evidence ? &*evidence : nullptr);
+            upload(staging, plan);
+        }
     }
     const auto barrier_begin = now();
     runtime.InsertUploadMemoryBarrier();
@@ -2086,12 +2144,14 @@ bool TextureCache<P>::UploadInChunks(Image& image) {
                  unswizzle.read_major_faults, read_backing_file, unswizzle.file_read_bytes);
     }
     if (evidence) {
-        LOG_INFO(HW_GPU,
-                 "D16 upload evidence: frame={} footprint_bytes={} complete={} scanned_bytes={} runs={} "
-                 "zero_run_bytes={} ff_run_bytes={} other_run_bytes={} non_file_bytes={} scan_ms={:.3f}",
-                 frame_tick, evidence->size, evidence->Complete(), evidence->scanned, evidence->runs,
-                 evidence->zero_bytes, evidence->ff_bytes, evidence->other_bytes,
-                 evidence->non_file_bytes, evidence->scan_ns / 1.e6);
+        LOG_INFO(
+            HW_GPU,
+            "D16 upload evidence: frame={} footprint_bytes={} complete={} scanned_bytes={} runs={} "
+            "zero_run_bytes={} ff_run_bytes={} other_run_bytes={} non_file_bytes={} scan_ms={:.3f} "
+            "zero_candidate={} depth_cleared={}",
+            frame_tick, evidence->size, evidence->Complete(), evidence->scanned, evidence->runs,
+            evidence->zero_bytes, evidence->ff_bytes, evidence->other_bytes,
+            evidence->non_file_bytes, evidence->scan_ns / 1.e6, snapshot_upload, depth_cleared);
     }
     return true;
 }

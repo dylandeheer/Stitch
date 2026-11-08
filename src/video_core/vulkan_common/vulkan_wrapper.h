@@ -220,6 +220,7 @@ struct DeviceDispatch : InstanceDispatch {
     PFN_vkCmdBlitImage vkCmdBlitImage{};
     PFN_vkCmdClearAttachments vkCmdClearAttachments{};
     PFN_vkCmdClearColorImage vkCmdClearColorImage{};
+    PFN_vkCmdClearDepthStencilImage vkCmdClearDepthStencilImage{};
     PFN_vkCmdCopyBuffer vkCmdCopyBuffer{};
     PFN_vkCmdCopyBufferToImage vkCmdCopyBufferToImage{};
     PFN_vkCmdCopyImage vkCmdCopyImage{};
@@ -688,10 +689,10 @@ public:
 
 class Image {
 public:
-    explicit Image(VkImage handle_, VkImageUsageFlags usage_, VkDevice owner_,
+    explicit Image(VkImage handle_, VkFormat format_, VkImageUsageFlags usage_, VkDevice owner_,
                    VmaAllocator allocator_, VmaAllocation allocation_,
                    const DeviceDispatch& dld_) noexcept
-        : handle{handle_}, usage{usage_}, owner{owner_}, allocator{allocator_},
+        : handle{handle_}, format{format_}, usage{usage_}, owner{owner_}, allocator{allocator_},
           allocation{allocation_}, dld{&dld_} {}
     Image() = default;
 
@@ -704,12 +705,13 @@ public:
     Image& operator=(const Image&) = delete;
 
     Image(Image&& rhs) noexcept
-        : handle{std::exchange(rhs.handle, VkImage{})}, usage{rhs.usage}, owner{rhs.owner},
-          allocator{rhs.allocator}, allocation{rhs.allocation}, dld{rhs.dld} {}
+        : handle{std::exchange(rhs.handle, VkImage{})}, format{rhs.format}, usage{rhs.usage},
+          owner{rhs.owner}, allocator{rhs.allocator}, allocation{rhs.allocation}, dld{rhs.dld} {}
 
     Image& operator=(Image&& rhs) noexcept {
         Release();
         handle = std::exchange(rhs.handle, VkImage{});
+        format = rhs.format;
         usage = rhs.usage;
         owner = rhs.owner;
         allocator = rhs.allocator;
@@ -737,6 +739,10 @@ public:
 
     void SetObjectNameEXT(const char* name) const;
 
+    [[nodiscard]] VkFormat Format() const noexcept {
+        return format;
+    }
+
     [[nodiscard]] VkImageUsageFlags UsageFlags() const noexcept {
         return usage;
     }
@@ -754,6 +760,7 @@ private:
     void Release() const noexcept;
 
     VkImage handle{};
+    VkFormat format{};
     VkImageUsageFlags usage{};
     VkDevice owner = nullptr;
     VmaAllocator allocator = nullptr;
@@ -1370,6 +1377,12 @@ public:
                           Span<VkClearRect> rects) const noexcept {
         dld->vkCmdClearAttachments(handle, attachments.size(), attachments.data(), rects.size(),
                                    rects.data());
+    }
+
+    void ClearDepthStencilImage(VkImage image, VkImageLayout layout, VkClearDepthStencilValue value,
+                                Span<VkImageSubresourceRange> ranges) const noexcept {
+        dld->vkCmdClearDepthStencilImage(handle, image, layout, &value, ranges.size(),
+                                         ranges.data());
     }
 
     void ClearColorImage(VkImage image, VkImageLayout layout, VkClearColorValue color,

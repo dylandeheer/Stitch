@@ -48,10 +48,12 @@
 #ifdef EGLANTINE_STREAMLINE
 #include "video_core/vulkan_common/streamline.h"
 #endif
+#include "video_core/renderer_vulkan/vk_initial_depth_clear.h"
+#include "video_core/texture_cache/zero_depth_upload.h"
+#include "video_core/textures/decoders.h"
 #include "video_core/vulkan_common/unbacked_fallback.h"
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
-#include "video_core/textures/decoders.h"
 
 namespace Vulkan {
 
@@ -3633,6 +3635,25 @@ bool Image::BindZeroBlock() {
     // Every block now reads the shared block (and the tail its own memory): zero them all.
     ClearTiles();
     return true;
+}
+
+bool Image::CanInitializeZeroDepth() const {
+    return original_image && !original_image.IsUnbacked() && !recycle_ticket &&
+           current_image == &Image::original_image && !host_level_offset && !info.is_sparse &&
+           VideoCommon::IsFirstDepthUpload(initialized, flags) &&
+           SupportsInitialZeroDepth(original_image.Format(), original_image.UsageFlags(),
+                                    aspect_mask) &&
+           runtime->device.IsFormatSupported(
+               VK_FORMAT_D16_UNORM, VK_FORMAT_FEATURE_TRANSFER_DST_BIT, FormatType::Optimal);
+}
+
+void Image::InitializeZeroDepth() {
+    ASSERT(CanInitializeZeroDepth());
+    scheduler->RequestOutsideRenderPassOperationContext();
+    initialized = true;
+    scheduler->Record([image = *original_image](vk::CommandBuffer cmdbuf) {
+        RecordInitialZeroDepth(cmdbuf, image);
+    });
 }
 
 void Image::ClearTiles() {
