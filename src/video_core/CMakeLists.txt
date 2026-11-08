@@ -97,6 +97,8 @@ add_library(video_core STATIC
     macro.cpp
     macro.h
     macro_memo.h
+    macro_image_capture.cpp
+    macro_image_capture.h
     macro_turing.h
     fence_manager.h
     gpu.cpp
