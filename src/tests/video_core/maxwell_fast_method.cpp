@@ -12,6 +12,8 @@
 #include <vector>
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
+#include "tests/video_core/ordered_fifo_program.h"
 
 #include "common/page_table.h"
 #include "common/scope_exit.h"
@@ -65,6 +67,10 @@ struct GpuSplitTestAccess {
 
     static bool FrontWaits(const GpuSplit& split) {
         return split.front_waiting.load(std::memory_order_seq_cst);
+    }
+
+    static void OrderedMode(GpuSplit& split, GpuSplit::OrderedFifoMode mode) {
+        split.ordered_fifo_mode = mode;
     }
 
     static void EnableWriterFrontier(GpuSplit& split, bool verify = false) {
@@ -1294,4 +1300,196 @@ TEST_CASE("MME fast reads require stable unique physical backing on every source
     split.Defer([] {}, VideoCommon::GpuSplit::Writes::Noted);
     split.NoteWrite(f.memory, gpu + 0x240, 4);
     CHECK(Access::WritesTarget(split, f.memory, gpu + 0x140, 4) == pending);
+}
+
+// A real split ring, native engine and dual publication. The old dirty buffer disagrees with
+// the held report. Reversing the publication order changes the architectural condition.
+TEST_CASE("Ordered FIFO macros preserve report order, tracked state and captured command words",
+          "[video_core][ordered_fifo_ring]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    using Split = VideoCommon::GpuSplit;
+    constexpr u32 render = MAXWELL3D_REG_INDEX(render_enable.mode);
+    constexpr auto word = GPUVAddr{0x100020};
+    constexpr auto device = DAddr{0x10020};
+    enum class Route {
+        Original,
+        Verify,
+        Candidate,
+        StopHandoff,
+        PendingSink,
+        Instance,
+        Alias,
+        Replay
+    };
+    const auto route =
+        GENERATE(Route::Original, Route::Verify, Route::Candidate, Route::PendingSink,
+                 Route::Instance, Route::Alias, Route::Replay, Route::StopHandoff);
+    CAPTURE(static_cast<int>(route));
+    Fixture f;
+    f.system.Initialize();
+    Kernel::KProcess process{f.system.Kernel()};
+    SCOPE_EXIT {
+        f.system.Kernel().UnregisterKernelObject(&process);
+    };
+    auto& table = process.GetPageTable().GetImpl();
+    table.Resize(20, 12);
+    constexpr VAddr cpu = 0x4000;
+    auto* backing = f.physical.GetPointerFromRaw<u8>(0x10000);
+    table.entries.GetAndFault(cpu >> 12).Store(false, Common::PageType::Memory, 1,
+                                               reinterpret_cast<uintptr_t>(backing) - cpu);
+    process.GetMemory().SetCurrentPageTable(process);
+    auto asid = f.device_memory.RegisterProcess(&process.GetMemory());
+    struct Reports final : Null::RasterizerNull {
+        Reports(Tegra::GPU& gpu, u8* bytes) : RasterizerNull{gpu}, dest{bytes} {}
+        bool MustFlushRegion(DAddr at, u64 bytes, VideoCommon::CacheType kind) override {
+            return at == device && bytes == 24 && kind == VideoCommon::CacheType::BufferCache;
+        }
+        void FlushRegion(DAddr at, u64 bytes, VideoCommon::CacheType kind) override {
+            if (!MustFlushRegion(at, bytes, kind))
+                return;
+            events.push_back(1);
+            const std::array<u32, 6> unequal{1, 2, 3, 4, 5, 6};
+            std::memcpy(dest, unequal.data(), 24);
+        }
+        void FlushQueryResults(DAddr at, u64 bytes) override {
+            if (at != device || bytes != 24)
+                return;
+            events.push_back(2);
+            const std::array<u32, 6> equal{19, 23, 61, 71, 19, 23};
+            std::memcpy(dest, equal.data(), 24);
+        }
+        u8* dest;
+        std::vector<u32> events;
+    } reports{f.gpu, backing + 0x20};
+    f.device_memory.BindInterface(&reports);
+    f.device_memory.Map(0x10000, cpu, 0x1000, asid);
+    f.memory.BindRasterizer(&reports);
+    f.memory.Map(word - 0x20, 0x10000, 0x1000, Tegra::PTEKind::PITCH, false);
+    SCOPE_EXIT {
+        f.device_memory.Unmap(0x10000, 0x1000);
+        f.device_memory.UnregisterProcess(asid);
+    };
+    Split split;
+    Access::Start(split, f.system);
+    SCOPE_EXIT {
+        split.Stop();
+    };
+    auto& engine = f.fast;
+    engine.BindRasterizer(&reports);
+    engine.SetNativeTuringMacroMode(true);
+    const auto one = [&](u32 m, u32 v) { engine.FrontCallMethod(f.system, split, m, v, true); };
+    const auto upload = [&](u32 start, const std::vector<u32>& native) {
+        one(MAXWELL3D_REG_INDEX(load_mme.instruction_ptr), start);
+        engine.FrontCallMultiMethod(f.system, split, MAXWELL3D_REG_INDEX(load_mme.instruction),
+                                    native.data(), static_cast<u32>(native.size()),
+                                    static_cast<u32>(native.size()));
+    };
+    const auto call = [&](u32 p0) {
+        engine.FrontCallMethod(f.system, split, 0xe00, p0, false);
+        engine.FrontCallMethod(f.system, split, 0xe01, 0, false);
+        engine.FrontCallMethod(f.system, split, 0xe01, static_cast<u32>(word), true);
+    };
+    one(ShadowControl, 1);
+    const auto original = OrderedFifoTest::Instructions(render);
+    upload(0, OrderedFifoTest::Encode(original));
+    one(MAXWELL3D_REG_INDEX(load_mme.start_address_ptr), 0);
+    one(MAXWELL3D_REG_INDEX(load_mme.start_address), 0);
+    call(0);
+    split.Drain();
+    REQUIRE(reports.events == std::vector<u32>{1, 2});
+    REQUIRE(engine.regs.reg_array[render] == 0);
+    reports.events.clear();
+    Access::OrderedMode(split, route == Route::Original ? Split::OrderedFifoMode::Off
+                               : route == Route::Verify ? Split::OrderedFifoMode::Verify
+                                                        : Split::OrderedFifoMode::On);
+    if (route == Route::Alias)
+        f.device_memory.Map(0x20000, cpu, 0x1000, asid);
+    SCOPE_EXIT {
+        if (route == Route::Alias)
+            f.device_memory.Unmap(0x20000, 0x1000);
+    };
+    if (route == Route::PendingSink)
+        one(MAXWELL3D_REG_INDEX(shadow_scratch) + 1, 526);
+    if (route == Route::Instance)
+        one(DrawBegin, 1U << 26);
+    if (route == Route::Replay)
+        one(ShadowControl, 3);
+    std::atomic<bool> entered{}, release{}, returned{};
+    split.Defer([&] {
+        entered.store(true, std::memory_order_release);
+        while (!release.load(std::memory_order_acquire))
+            std::this_thread::yield();
+    });
+    split.Publish();
+    while (!entered.load(std::memory_order_acquire))
+        std::this_thread::yield();
+    std::thread frontend([&] {
+        call(1);
+        returned.store(true, std::memory_order_release);
+    });
+    SCOPE_EXIT {
+        release.store(true, std::memory_order_release);
+        if (frontend.joinable())
+            frontend.join();
+        split.Drain();
+    };
+    const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!returned.load(std::memory_order_acquire) && !Access::FrontWaits(split) &&
+           std::chrono::steady_clock::now() < until)
+        std::this_thread::yield();
+    if (route == Route::Candidate || route == Route::StopHandoff) {
+        REQUIRE(returned.load(std::memory_order_acquire));
+        frontend.join();
+        // Rebind and mutate the backing before the deferred callback is allowed to execute.
+        // The old front, back and proof cache must agree on the call that was already captured.
+        auto changed = original;
+        changed.back().output = 6;
+        changed.back().imm2 = 0;
+        upload(0, OrderedFifoTest::Encode(changed));
+    } else {
+        REQUIRE(Access::FrontWaits(split));
+        REQUIRE_FALSE(returned.load(std::memory_order_acquire));
+    }
+    u32 seen_by_following_work{};
+    if (route == Route::Candidate || route == Route::StopHandoff) {
+        split.Defer([&] {
+            seen_by_following_work = engine.regs.reg_array[render];
+            // A later operation may reuse the query address. The earlier call must have read it.
+            const std::array<u32, 6> overwritten{10, 20, 30, 40, 50, 60};
+            std::memcpy(backing + 0x20, overwritten.data(), sizeof(overwritten));
+        });
+    }
+    release.store(true, std::memory_order_release);
+    if (frontend.joinable())
+        frontend.join();
+    split.Drain();
+    REQUIRE(reports.events == std::vector<u32>{1, 2}); // VERIFY cannot run either effect twice.
+    REQUIRE(engine.regs.reg_array[render] == (route == Route::Replay ? 0 : 1));
+    REQUIRE(split.OrderedFifoStats().deferred ==
+            (route == Route::Candidate || route == Route::StopHandoff ? 1U : 0U));
+    REQUIRE(split.OrderedFifoStats().checked == (route == Route::Verify ? 1U : 0U));
+    REQUIRE(split.OrderedFifoStats().mismatches == 0);
+    if (route == Route::Candidate || route == Route::StopHandoff) {
+        REQUIRE(seen_by_following_work == 1);
+    }
+    if (route == Route::StopHandoff) {
+        split.Stop();
+        engine.CallMethod(f.system, ShadowControl, 3, true);
+        engine.CallMethod(f.system, render, 0, true);
+        REQUIRE(engine.regs.reg_array[render] == 1);
+        REQUIRE(engine.shadow_state.reg_array[render] == 1);
+    }
+    if (route == Route::Candidate) {
+        // Track->Replay must use the backend-owned result, and later out-of-split handoff
+        // must never copy a stale frontend shadow over it.
+        one(ShadowControl, 3);
+        one(render, 0);
+        split.Drain();
+        REQUIRE(engine.regs.reg_array[render] == 1);
+        REQUIRE(engine.shadow_state.reg_array[render] == 1);
+        one(ShadowControl, 1);
+        call(1); // Mutated code now emits a different constant and must use the ordinary path.
+        split.Drain();
+        REQUIRE(engine.regs.reg_array[render] == 0);
+    }
 }

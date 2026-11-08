@@ -402,6 +402,14 @@ void GpuSplit::MaybeStart(Core::System& system_) {
         const char* value = std::getenv(name);
         return value && std::string_view{value} == "1";
     };
+    const char* const fifo = std::getenv("STITCH_ORDERED_FIFO_MACRO");
+    ordered_fifo_mode = fifo && std::string_view{fifo} == "verify" ? OrderedFifoMode::Verify
+                        : fifo && std::string_view{fifo} == "1"    ? OrderedFifoMode::On
+                                                                   : OrderedFifoMode::Off;
+    ordered_fifo_marker = std::getenv("STITCH_ORDERED_FIFO_BASELINE_FILE");
+    ordered_fifo_polls = 0;
+    ordered_fifo_baseline = false;
+    ordered_fifo_stats = {};
     front_wait_probe.Start();
     writer_requested = enabled("STITCH_WRITER_FRONTIER");
     writer_verify = enabled("STITCH_WRITER_VERIFY");
@@ -506,6 +514,19 @@ void GpuSplit::Publish() {
         wake.fetch_add(1, std::memory_order_seq_cst);
         wake.notify_one();
     }
+}
+
+GpuSplit::OrderedFifoMode GpuSplit::SelectOrderedFifoMode() {
+    if (ordered_fifo_failed || ordered_fifo_mode == OrderedFifoMode::Off)
+        return OrderedFifoMode::Off;
+    if (ordered_fifo_marker && *ordered_fifo_marker && (ordered_fifo_polls++ % 4096) == 0) {
+        std::error_code ec;
+        const bool previous = ordered_fifo_baseline;
+        ordered_fifo_baseline = std::filesystem::exists(ordered_fifo_marker, ec) || ec;
+        if (ordered_fifo_baseline != previous)
+            LOG_INFO(HW_GPU, "Ordered FIFO baseline marker active={}", ordered_fifo_baseline);
+    }
+    return ordered_fifo_baseline ? OrderedFifoMode::Off : ordered_fifo_mode;
 }
 
 bool GpuSplit::MacroDmaTraceActive() const {

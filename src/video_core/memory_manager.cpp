@@ -366,6 +366,24 @@ bool MemoryManager::TrySnapshotTextureRun(GPUVAddr address, std::span<u8> output
     return memory.TrySnapshotContiguous(run.device_addr + (address - begin), output, file_read);
 }
 
+bool MemoryManager::IsUniqueQueryFifoSource(GPUVAddr address) const {
+    constexpr u64 bytes = 6 * sizeof(u32);
+    constexpr u64 mask = Core::DEVICE_PAGEMASK;
+    if ((address & 3) || (address & mask) + bytes > Core::DEVICE_PAGESIZE ||
+        page_bits < Core::DEVICE_PAGEBITS || big_page_bits < Core::DEVICE_PAGEBITS ||
+        address >= address_space_size || bytes > address_space_size - address)
+        return false;
+    const auto shim = native_syncpoint_shim.load(std::memory_order_acquire);
+    if (shim && address + bytes > shim &&
+        (address <= shim || address - shim < NumShimSyncpoints * sizeof(u32)))
+        return false;
+    const u64 generation = memory.MappingGeneration();
+    const auto device = GpuToCpuAddress(address);
+    if (!device || (*device & mask) != (address & mask))
+        return false;
+    return memory.WithUniquePhysicalPages(std::span{&*device, 1}, generation, [] {});
+}
+
 bool MemoryManager::TryReadUniqueWords(GPUVAddr address, std::span<u32> dest, u64 generation) const {
     constexpr size_t max_words = 0x1000; // MME DMA limit
     constexpr u64 mask = Core::DEVICE_PAGEMASK;

@@ -99,6 +99,8 @@ add_library(video_core STATIC
     macro_memo.h
     macro_image_capture.cpp
     macro_image_capture.h
+    ordered_fifo_macro.cpp
+    ordered_fifo_macro.h
     macro_turing.h
     fence_manager.h
     gpu.cpp

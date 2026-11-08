@@ -106,6 +106,20 @@ public:
     /// commands read without cache flushes). Called by the front between commands.
     void MaybeStart(Core::System& system);
     void Stop();
+    enum class OrderedFifoMode { Off, Verify, On };
+    OrderedFifoMode SelectOrderedFifoMode();
+    bool OrderedFifoConfigured() const {
+        return ordered_fifo_mode != OrderedFifoMode::Off;
+    }
+    void RejectOrderedFifo() {
+        ordered_fifo_failed = true;
+    }
+    struct OrderedFifoCounters {
+        u64 admitted{}, checked{}, deferred{}, reconciled{}, mismatches{}, uncertain_source{};
+    };
+    OrderedFifoCounters& OrderedFifoStats() {
+        return ordered_fifo_stats;
+    } // split front only
 
     /// What the sender of an entry tells about the guest memory the back writes running it, for
     /// the front's reads of guest memory (WaitForWrites).
@@ -325,6 +339,11 @@ private:
 
     // Front side.
     u64 write_position{};
+    OrderedFifoCounters ordered_fifo_stats{};
+    OrderedFifoMode ordered_fifo_mode{OrderedFifoMode::Off};
+    bool ordered_fifo_failed{}, ordered_fifo_baseline{};
+    u32 ordered_fifo_polls{};
+    const char* ordered_fifo_marker{};
     u64 last_writer_position{};
     u64 last_sync_position{};
     /// After the last entry that may write guest memory anywhere (NoteAnyWrite), the last one
