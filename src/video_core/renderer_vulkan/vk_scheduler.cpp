@@ -115,6 +115,9 @@ Scheduler::Scheduler(const Device& device_, StateTracker& state_tracker_)
       master_semaphore{std::make_unique<MasterSemaphore>(device)},
       command_pool{std::make_unique<CommandPool>(*master_semaphore, device)} {
 
+    const char* skip_xfb = std::getenv("EDEN_NX2_SKIP_UNUSED_XFB_BARRIERS");
+    skip_unused_xfb_barriers = device.IsExtTransformFeedbackSupported() && skip_xfb &&
+                               std::string_view{skip_xfb} == "1";
     if (Common::DkbFrameTrace::Enabled() || MeshPerfRequested()) {
         const auto physical = device.GetPhysical();
         trace_timestamp_bits =
@@ -933,10 +936,17 @@ void Scheduler::EndRenderPass()
         query_cache->CounterEnable(VideoCommon::QueryType::ZPassPixelCount64, false);
         query_cache->NotifySegment(false);
 
+        const bool used_xfb = std::exchange(render_pass_has_xfb, false);
+        if (skip_unused_xfb_barriers && !used_xfb && ++skipped_xfb_barriers % 16384 == 0) {
+            LOG_INFO(Render_Vulkan, "Skipped {} unused transform-feedback barriers",
+                     skipped_xfb_barriers);
+        }
         Record([num_images = num_renderpass_images,
                        images = renderpass_images,
                        ranges = renderpass_image_ranges,
-                       has_transform_feedback = device.IsExtTransformFeedbackSupported()](
+                       has_transform_feedback = skip_unused_xfb_barriers
+                                                    ? used_xfb
+                                                    : device.IsExtTransformFeedbackSupported()](
                           vk::CommandBuffer cmdbuf) {
             std::array<VkImageMemoryBarrier, 9> barriers;
             for (size_t i = 0; i < num_images; ++i) {

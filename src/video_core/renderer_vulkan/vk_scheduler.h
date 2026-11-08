@@ -138,6 +138,10 @@ public:
         render_pass_has_stores = true;
     }
 
+    void NoteRenderPassTransformFeedback() {
+        render_pass_has_xfb = true;
+    }
+
     bool RenderPassHasStores() const {
         return render_pass_has_stores;
     }
@@ -455,6 +459,9 @@ private:
     std::unique_ptr<MasterSemaphore> master_semaphore;
     FragmentBarrierState fragment_barrier;
     bool render_pass_has_stores{};
+    bool render_pass_has_xfb{};
+    bool skip_unused_xfb_barriers{};
+    u64 skipped_xfb_barriers{};
     bool compute_writes_pending{};
     bool graphics_pipeline_missing{};
     std::unique_ptr<CommandPool> command_pool;
