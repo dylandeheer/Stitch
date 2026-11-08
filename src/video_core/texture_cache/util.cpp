@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstring>
 #include <numeric>
 #include <optional>
@@ -1265,15 +1266,30 @@ UnswizzlePlan PlanUnswizzleImageRows(
 }
 
 void ExecuteUnswizzlePlan(Tegra::MemoryManager& gpu_memory, const UnswizzlePlan& plan,
-                         std::span<u8> output) {
+                         std::span<u8> output, UnswizzleTimings* timings) {
+    using Clock = std::chrono::steady_clock;
+    const auto now = [&] { return timings ? Clock::now() : Clock::time_point{}; };
+    const auto elapsed = [](auto start, auto end) {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
+    };
     std::vector<u8> run;
     for (const auto& r : plan.runs) {
+        const auto began = now();
         run.resize(r.guest_bytes);
+        const auto allocated = now();
         gpu_memory.ReadBlockUnsafe(r.src_addr, run.data(), r.guest_bytes);
+        const auto read = now();
         Tegra::Texture::UnswizzleTexture(output.subspan(r.host_offset, r.host_bytes),
                                          run, 1U << plan.bpp_log2, r.run_tiles, r.tile_rows, 1,
                                          r.block.height, r.block.depth, r.run_alignment,
                                          gpu_memory.UsesNativeTiling());
+        if (timings) {
+            timings->allocation_ns += elapsed(began, allocated);
+            timings->read_ns += elapsed(allocated, read);
+            timings->detile_ns += elapsed(read, Clock::now());
+            ++timings->runs;
+            timings->guest_bytes += r.guest_bytes;
+        }
     }
 }
 

@@ -2002,10 +2002,22 @@ bool TextureCache<P>::UploadInChunks(Image& image) {
         MapSizeBytes(image) < min_size) {
         return false;
     }
+    using Clock = std::chrono::steady_clock;
+    const bool timed = TextureUploadTimings();
+    const auto now = [&] { return timed ? Clock::now() : Clock::time_point{}; };
+    const auto elapsed = [](auto start, auto end) {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
+    };
+    const auto timing_begin = now();
+    u64 plan_ns{}, staging_ns{}, record_ns{}, chunks{};
+    UnswizzleTimings unswizzle;
     for (u64 offset = 0; offset < image.guest_size_bytes; offset += chunk_size) {
         const std::array range{
             std::pair<u64, u64>{offset, std::min<u64>(offset + chunk_size, image.guest_size_bytes)}};
+        const auto began = now();
         const auto plan = PlanUnswizzleImageRows(image.gpu_addr, image.info, range);
+        const auto planned = now();
+        plan_ns += elapsed(began, planned);
         if (!plan.layout_valid) {
             if (offset == 0) {
                 return false; // layout not handled: one staging buffer after all
@@ -2016,10 +2028,32 @@ bool TextureCache<P>::UploadInChunks(Image& image) {
             continue; // padding between levels or layers
         }
         auto staging = runtime.UploadStagingBuffer(plan.total_host_bytes);
-        ExecuteUnswizzlePlan(*gpu_memory, plan, staging.mapped_span);
+        const auto staged = now();
+        ExecuteUnswizzlePlan(*gpu_memory, plan, staging.mapped_span, timed ? &unswizzle : nullptr);
+        const auto decoded = now();
         image.UploadMemory(staging, plan.copies);
+        staging_ns += elapsed(planned, staged);
+        record_ns += elapsed(decoded, now());
+        ++chunks;
     }
+    const auto barrier_begin = now();
     runtime.InsertUploadMemoryBarrier();
+    if (timed) {
+        record_ns += elapsed(barrier_begin, now());
+        const u64 total_ns = elapsed(timing_begin, now());
+        const u64 accounted_ns = plan_ns + staging_ns + record_ns + unswizzle.allocation_ns +
+                                 unswizzle.read_ns + unswizzle.detile_ns;
+        const u64 residual_ns = total_ns - (std::min)(total_ns, accounted_ns);
+        LOG_INFO(HW_GPU,
+                 "Chunk upload phases: frame={} device_address={:#x} footprint_bytes={} "
+                 "chunks={} runs={} guest_read_bytes={} block_height={} plan_ms={:.3f} "
+                 "staging_ms={:.3f} scratch_ms={:.3f} read_ms={:.3f} detile_ms={:.3f} "
+                 "record_cpu_ms={:.3f} total_ms={:.3f} residual_ms={:.3f}",
+                 frame_tick, image.cpu_addr, image.guest_size_bytes, chunks, unswizzle.runs,
+                 unswizzle.guest_bytes, image.info.block.height, plan_ns / 1.e6, staging_ns / 1.e6,
+                 unswizzle.allocation_ns / 1.e6, unswizzle.read_ns / 1.e6,
+                 unswizzle.detile_ns / 1.e6, record_ns / 1.e6, total_ns / 1.e6, residual_ns / 1.e6);
+    }
     return true;
 }
 
