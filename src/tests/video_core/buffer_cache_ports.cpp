@@ -54,6 +54,7 @@ struct Staging {
     Buffer* buffer;
     u64 offset;
     std::span<u8> mapped_span;
+    bool host_coherent{true};
 };
 
 struct Runtime {
@@ -82,6 +83,18 @@ struct Runtime {
     u64 CurrentTick() const { return current_tick; }
     u64 QueueEarlyHostRead() { return current_tick; }
     bool EarlyHostReadReady(u64 tick) { return tick <= completed_tick; }
+    u64 CompletedEarlyReadTick() { return completed_tick; }
+    bool EarlyTickSubmitted(u64 tick) const { return tick <= completed_tick; }
+    void InvalidateEarlyHostRead(Staging& ref) {
+        if (!ref.host_coherent) {
+            std::copy_n(ref.buffer->bytes.data()+ref.offset,ref.mapped_span.size(),ref.mapped_span.data());
+            ++early_invalidations;
+        }
+    }
+    void ReleaseEarlyHostRead(Staging& ref, u64 tick) {
+        last_release_tick = tick;
+        FreeDeferredStagingBuffer(ref);
+    }
     void CompleteGpu() {
         for (auto& copy : pending) copy();
         pending.clear();
@@ -95,11 +108,15 @@ struct Runtime {
     Staging DownloadStagingBuffer(u64 size, bool keep = false) {
         if (keep) {
             auto& loan = deferred.emplace_back(std::make_unique<Buffer>(*this, 0, size + 128, false));
+            if (noncoherent_early) {
+                auto& cpu = noncoherent_views.emplace_back(size, 0xff);
+                return {loan.get(), 128, cpu, false};
+            }
             return {loan.get(), 128, std::span{loan->bytes}.subspan(128)};
         }
         staging = std::make_unique<Buffer>(*this, 0, size + 128, false);
         ++allocations;
-        return {staging.get(), 128, std::span{staging->bytes}.subspan(128)};
+        return {staging.get(), 128, std::span{staging->bytes}.subspan(128), !noncoherent_reference};
     }
     Staging UploadStagingBuffer(u64 size) {
         return DownloadStagingBuffer(size);
@@ -131,10 +148,7 @@ struct Runtime {
         if (before_completion) {
             before_completion();
         }
-        for (auto& copy : pending) {
-            copy();
-        }
-        pending.clear();
+        CompleteGpu();
         ++finishes;
     }
     void Wait(u64 tick) {
@@ -154,7 +168,9 @@ struct Runtime {
         return stream;
     }
 
-    u64 current_tick{1}, completed_tick{}, deferred_releases{};
+    u64 current_tick{1}, completed_tick{}, deferred_releases{}, last_release_tick{}, early_invalidations{};
+    bool noncoherent_early{}, noncoherent_reference{};
+    std::vector<std::vector<u8>> noncoherent_views;
     std::vector<std::unique_ptr<Buffer>> deferred;
     u32 alignment{256};
     u32 allocations{}, downloads{}, uploads{}, finishes{}, waits{};
@@ -1151,4 +1167,102 @@ TEST_CASE("Fully CPU-owned early verify bytes are not reported as compared",
     REQUIRE(stats.empty_checks==1);
     REQUIRE(stats.masked_bytes==4096);
     REQUIRE(f.bytes[0x10001]==0x12);
+}
+
+TEST_CASE("An early snapshot lands only the current dirty subranges and preserves the rest of its page",
+          "[early_buffer]") {
+    EarlyFixture f;
+    f.runtime.CompleteGpu();
+    REQUIRE(f.Demand());
+    std::fill_n(f.bytes + 0x10000, 4096, 0xde);
+    std::fill_n(Access::Get(*f.cache,f.id).bytes.begin(), 4096, 0x79);
+    Access::StorageWrite(*f.cache,f.id,f.page+0x120,0x60,true);
+    f.cache->RecordEarlyCpuReads();
+    f.runtime.CompleteGpu();
+    f.cache->SetPendingCpuWrites([&](const auto& visit){ visit(f.page+0x144,4); });
+    REQUIRE(f.Demand());
+    const auto* ptr=f.bytes+0x10000;
+    for (size_t i=0;i<4096;++i) {
+        const bool owned = i>=0x120 && i<0x180 && !(i>=0x144 && i<0x148);
+        REQUIRE(ptr[i] == (owned ? 0x79 : 0xde));
+    }
+}
+
+TEST_CASE("Early staging survives cancellation before submission and completion before a read",
+          "[early_buffer]") {
+    EarlyFixture f;
+    const auto start_tick=f.runtime.current_tick;
+    auto& state=Access::EarlyState(*f.cache);
+    // Do not submit or complete the copies. Observe more requests than the loan budget.
+    for (size_t i=0;i<40;++i) {
+        REQUIRE_FALSE(f.cache->GetFlushArea(f.page,4)->preemtive);
+        f.Compute(0xa4);
+    }
+    REQUIRE(f.runtime.deferred.size()==32);
+    REQUIRE(f.runtime.deferred_releases==0);
+    REQUIRE(state.stats.caps>0);
+    state.Reset();
+    f.cache->RecordEarlyCpuReads();
+    REQUIRE(f.runtime.deferred_releases==0);
+    f.runtime.CompleteGpu();
+    f.cache->RecordEarlyCpuReads();
+    REQUIRE(f.runtime.deferred_releases==32);
+    REQUIRE(f.runtime.last_release_tick==start_tick);
+    REQUIRE(f.bytes[0x10001]==0x12);
+    REQUIRE_FALSE(f.Demand()); // Full normal read remains after every speculative loan was canceled.
+    REQUIRE(f.bytes[0x10001]==0xa4);
+}
+
+TEST_CASE("Noncoherent early allocations invalidate host memory after the GPU tick",
+          "[early_buffer]") {
+    EarlyFixture f;
+    f.runtime.CompleteGpu();
+    REQUIRE(f.Demand());
+    f.runtime.noncoherent_early=true;
+    f.Compute(0x4b);
+    f.runtime.CompleteGpu();
+    f.cache->RecordEarlyCpuReads(); // A completed valid loan remains unavailable for pool reuse.
+    const auto held=f.runtime.deferred_releases;
+    REQUIRE(f.Demand());
+    REQUIRE(f.bytes[0x10001]==0x4b);
+    REQUIRE(f.runtime.early_invalidations==1);
+    REQUIRE(f.runtime.deferred_releases==held);
+}
+
+TEST_CASE("VERIFY never certifies an unqualified original noncoherent staging allocation",
+          "[early_buffer]") {
+    EarlyFixture f{true};
+    f.runtime.CompleteGpu();
+    f.runtime.noncoherent_reference=true;
+    REQUIRE(f.Demand());
+    const auto& s=Access::EarlyState(*f.cache).stats;
+    REQUIRE(s.noncoherent_reference==1);
+    REQUIRE(s.comparisons==0);
+    REQUIRE(s.compared_bytes==0);
+    REQUIRE(s.mismatches==0);
+}
+
+TEST_CASE("A late shadow comparison never counts as a ready acceleration opportunity",
+          "[early_buffer]") {
+    EarlyFixture f{true};
+    REQUIRE(f.Demand());
+    const auto& stats=Access::EarlyState(*f.cache).stats;
+    REQUIRE(stats.late==1);
+    REQUIRE(stats.unsubmitted==1);
+    REQUIRE(stats.ready_checks==0);
+    REQUIRE(stats.late_checks==1);
+    REQUIRE(stats.compared_bytes==4096);
+    REQUIRE(f.bytes[0x10000]==0x42);
+}
+
+TEST_CASE("Cache teardown returns an outstanding deferred loan with its original retirement tick",
+          "[early_buffer]") {
+    EarlyFixture f;
+    const auto issuing_tick=f.runtime.current_tick;
+    REQUIRE(f.runtime.completed_tick < issuing_tick);
+    // BufferCache never sends or waits for a speculative command when the session ends.
+    f.cache.reset();
+    REQUIRE(f.runtime.deferred_releases==1);
+    REQUIRE(f.runtime.last_release_tick==issuing_tick);
+    REQUIRE(f.runtime.completed_tick < issuing_tick);
 }

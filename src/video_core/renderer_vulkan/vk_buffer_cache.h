@@ -125,6 +125,10 @@ public:
 
     u64 QueueEarlyHostRead();
     bool EarlyHostReadReady(u64 tick);
+    u64 CompletedEarlyReadTick();
+    bool EarlyTickSubmitted(u64 tick) const;
+    void InvalidateEarlyHostRead(StagingBufferRef& ref) { staging_pool.InvalidateLoan(ref); }
+    void ReleaseEarlyHostRead(StagingBufferRef& ref, u64 last_use) { staging_pool.ReleaseLoan(ref, last_use); }
     bool IsFree(u64 tick);
 
     void Wait(u64 tick);

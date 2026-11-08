@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bitset>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -33,13 +34,15 @@ struct EarlyReadPages {
         bool canceled{};
     };
     struct Stats {
-        u64 copies{}, bytes{}, hits{}, hit_bytes{}, late{}, stale{}, blocked{}, comparisons{},
-            compared_bytes{}, masked_bytes{}, empty_checks{}, remapped_checks{}, mismatches{}, caps{};
+        u64 copies{}, bytes{}, hits{}, hit_bytes{}, late{}, unsubmitted{}, ready_checks{}, late_checks{}, stale{}, blocked{}, comparisons{},
+            compared_bytes{}, masked_bytes{}, empty_checks{}, remapped_checks{}, noncoherent_reference{}, mismatches{}, caps{};
     };
     struct Shadow {
         DAddr page;
-        const u8* bytes;
-        size_t compared{}, different{}, masked{};
+        std::array<u8, PageSize> original{};
+        std::bitset<PageSize> readable{};
+        size_t masked{};
+        bool uncertain{};
     };
     std::array<Page, Learned> pages{};
     std::array<std::optional<Copy>, Pending> copies{};
@@ -118,11 +121,9 @@ struct EarlyReadPages {
         const DAddr start = std::max(address, shadow->page);
         const DAddr end = std::min(address+size, shadow->page+PageSize);
         if (start >= end) return;
-        const auto bytes = end-start;
-        shadow->compared += bytes;
-        if (std::memcmp(data+(start-address), shadow->bytes+(start-shadow->page), bytes)) {
-            ++shadow->different;
-        }
+        const auto offset = start-shadow->page;
+        std::memcpy(shadow->original.data()+offset, data+(start-address), end-start);
+        for (size_t i=offset; i<offset+(end-start); ++i) shadow->readable.set(i);
     }
 };
 } // namespace VideoCommon

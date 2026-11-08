@@ -482,6 +482,16 @@ u64 BufferCacheRuntime::QueueEarlyHostRead() {
     return scheduler.CurrentTick();
 }
 
+bool BufferCacheRuntime::EarlyTickSubmitted(u64 tick) const {
+    return scheduler.IsSubmitted(tick);
+}
+
+u64 BufferCacheRuntime::CompletedEarlyReadTick() {
+    auto& semaphore = scheduler.GetMasterSemaphore();
+    semaphore.Refresh();
+    return semaphore.KnownGpuTick();
+}
+
 bool BufferCacheRuntime::EarlyHostReadReady(u64 tick) {
     auto& semaphore = scheduler.GetMasterSemaphore();
     if (!semaphore.IsFree(tick)) semaphore.Refresh();

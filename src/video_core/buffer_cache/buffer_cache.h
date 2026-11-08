@@ -83,7 +83,7 @@ BufferCache<P>::~BufferCache() {
     if constexpr (requires { runtime.QueueEarlyHostRead(); }) {
         if (early_reads) {
             for (auto& copy : early_reads->copies) {
-                if (copy) runtime.FreeDeferredStagingBuffer(copy->staging);
+                if (copy) runtime.ReleaseEarlyHostRead(copy->staging, copy->tick);
             }
         }
     }
@@ -137,11 +137,11 @@ void BufferCache<P>::TickFrame() {
         if ((frame_tick % 120) == 0) {
             const auto& s = early_reads->stats;
             LOG_INFO(HW_GPU, "Early buffer reads frame={} active={} verify={} failed={} copies={} "
-                     "recorded_bytes={} hits={} hit_bytes={} late={} stale={} blocked={} "
-                     "compared_reads={} compared_bytes={} cpu_masked_bytes={} empty_checks={} remapped_checks={} mismatches={} capped={}",
+                     "recorded_bytes={} hits={} hit_bytes={} late={} unsubmitted={} ready_checks={} late_checks={} stale={} blocked={} "
+                     "compared_reads={} compared_bytes={} cpu_masked_bytes={} empty_checks={} remapped_checks={} noncoherent_reference={} mismatches={} capped={}",
                      frame_tick, early_reads->active, early_reads->verify, early_reads->failed,
-                     s.copies, s.bytes, s.hits, s.hit_bytes, s.late, s.stale, s.blocked,
-                     s.comparisons, s.compared_bytes, s.masked_bytes, s.empty_checks, s.remapped_checks, s.mismatches, s.caps);
+                     s.copies, s.bytes, s.hits, s.hit_bytes, s.late, s.unsubmitted, s.ready_checks, s.late_checks, s.stale, s.blocked,
+                     s.comparisons, s.compared_bytes, s.masked_bytes, s.empty_checks, s.remapped_checks, s.noncoherent_reference, s.mismatches, s.caps);
         }
     }
     if (read_batch_baseline_file && *read_batch_baseline_file && frame_tick % 16 == 0) {
@@ -445,11 +445,14 @@ void BufferCache<P>::RecordEarlyCpuReads() {
         if (!early_reads) return;
         auto& state = *early_reads;
         state.ObserveGeneration(device_memory.MappingGeneration());
-        // FreeDeferred moves canceled loans back into the staging pool with CurrentTick,
-        // at or after the recorded copy. The pool still waits for completion before reuse.
+        // Canceled loans still occupy a slot until their real submission retires.
+        // A valid completed loan stays private until a guest read consumes it.
+        std::optional<u64> completed;
         for (auto& c : state.copies) {
             if (c && (!state.active || !state.Current(*c))) {
-                runtime.FreeDeferredStagingBuffer(c->staging);
+                if (!completed) completed = runtime.CompletedEarlyReadTick();
+                if (c->tick > *completed) continue;
+                runtime.ReleaseEarlyHostRead(c->staging, c->tick);
                 c.reset();
                 ++state.stats.stale;
             }
@@ -505,9 +508,12 @@ bool BufferCache<P>::TryEarlyCpuRead(DAddr address, u64 size) {
         });
         if (slot == state.copies.end()) return false;
         auto& copy = **slot;
-        if (!slot_buffers.contains(copy.buffer) || !runtime.EarlyHostReadReady(copy.tick)) {
+        if (!slot_buffers.contains(copy.buffer)) return false;
+        const bool ready = runtime.EarlyHostReadReady(copy.tick);
+        if (!ready) {
             ++state.stats.late;
-            return false;
+            if (!runtime.EarlyTickSubmitted(copy.tick)) ++state.stats.unsubmitted;
+            if (!state.verify) return false;
         }
         const auto& buffer = slot_buffers[copy.buffer];
         if (!copy.instance || copy.instance != buffer.early_read_instance ||
@@ -518,33 +524,46 @@ bool BufferCache<P>::TryEarlyCpuRead(DAddr address, u64 size) {
                 ++state.stats.blocked;
                 return false;
             }
-            typename Early::Shadow shadow{address, copy.staging.mapped_span.data()};
+            typename Early::Shadow shadow{address};
             state.shadow = &shadow;
             SCOPE_EXIT { state.shadow = nullptr; };
             // Only the original synchronous download writes guest memory in VERIFY mode.
             DownloadMemory(address, size);
             state.stats.masked_bytes += shadow.masked;
-            if (device_memory.MappingGeneration() != generation) {
+            if (shadow.uncertain) {
+                ++state.stats.noncoherent_reference;
+                copy.canceled = true;
+                return true; // Original returned; no proven coherent comparison.
+            }
+            const auto compared = shadow.readable.count();
+            if (!device_memory.WithEarlyReadPage(address, generation, []{})) {
                 ++state.stats.remapped_checks;
-            } else if (!shadow.compared) {
+            } else if (!compared || !runtime.EarlyHostReadReady(copy.tick)) {
                 ++state.stats.empty_checks;
             } else {
+                runtime.InvalidateEarlyHostRead(copy.staging);
+                size_t different = 0;
+                for (size_t i=0; i<Early::PageSize; ++i) {
+                    different += shadow.readable[i] && shadow.original[i] != copy.staging.mapped_span[i];
+                }
                 ++state.stats.comparisons;
-                state.stats.compared_bytes += shadow.compared;
-                if (shadow.different) {
+                if (ready) ++state.stats.ready_checks; else ++state.stats.late_checks;
+                state.stats.compared_bytes += compared;
+                if (different) {
                     state.failed = true;
                     state.active = false;
                     state.Reset();
                     ++state.stats.mismatches;
                     LOG_ERROR(HW_GPU, "Early buffer verification mismatch: page={:#x} "
-                              "compared={} differing_ranges={}; original retained",
-                              address, shadow.compared, shadow.different);
+                              "compared={} differing_bytes={}; original retained",
+                              address, compared, different);
                 }
             }
             copy.canceled = true;
             return true;
         }
 
+        runtime.InvalidateEarlyHostRead(copy.staging);
         // The guest store publishes its dirty range before checking this gate.
         // Do not take query/cache locks or wait on Vulkan under the mapping mutex.
         const Core::DownloadLanding::Scope landing{device_memory.download_landing, address, address + size};
@@ -641,6 +660,14 @@ void BufferCache<P>::DownloadRangesMemory(std::span<const std::pair<DAddr, u64>>
             const Common::RangeSet<DAddr> cpu_written = PendingCpuWriteRanges();
             if (staging != nullptr) {
                 for (const Download& download : staged) {
+                    if constexpr (requires { staging->host_coherent; }) {
+                        if (early_reads && early_reads->shadow && !staging->host_coherent) {
+                            const DAddr start = slot_buffers[download.buffer_id].CpuAddr() + download.copy.src_offset;
+                            const auto requested = early_reads->shadow->page;
+                            early_reads->shadow->uncertain |= start < requested + Early::PageSize &&
+                                                              requested < start + download.copy.size;
+                        }
+                    }
                     WriteDownloadedMemory(
                         cpu_written,
                         slot_buffers[download.buffer_id].CpuAddr() + download.copy.src_offset,
@@ -3105,6 +3132,11 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64
         }
         runtime.CopyBuffer(download_staging.buffer, buffer, copies_span, true);
         runtime.Finish();
+        if constexpr (requires { download_staging.host_coherent; }) {
+            if (early_reads && early_reads->shadow && !download_staging.host_coherent) {
+                early_reads->shadow->uncertain = true;
+            }
+        }
         const Core::DownloadLanding::Scope landing{device_memory.download_landing, landing_begin, landing_end};
         const Common::RangeSet<DAddr> cpu_written = PendingCpuWriteRanges();
         for (const BufferCopy& copy : copies) {
