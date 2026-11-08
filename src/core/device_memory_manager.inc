@@ -399,13 +399,11 @@ bool DeviceMemoryManager<Traits>::TrySnapshotContiguous(DAddr address, std::span
         return false;
     }
     const size_t last = (address + output.size() - 1) >> page_bits;
-    if (last - page > tracked_entries[page].continuity_tracker) {
-        // A valid mapping may have been created with track=false. Verify every physical page,
-        // including the middle, before copying any bytes.
-        for (size_t i = page + 1; i <= last; ++i) {
-            if (tracked_entries[i].compressed_physical_ptr != u64{first} + (i - page)) {
-                return false;
-            }
+    // TrackContinuity also describes preallocated guest VA. Only the installed device
+    // mappings establish which physical pages this snapshot may copy.
+    for (size_t i = page + 1; i <= last; ++i) {
+        if (tracked_entries[i].compressed_physical_ptr != u64{first} + (i - page)) {
+            return false;
         }
     }
     std::memcpy(output.data(), GetPointer<u8>(address), output.size());

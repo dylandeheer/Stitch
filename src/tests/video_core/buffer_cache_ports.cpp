@@ -374,6 +374,12 @@ TEST_CASE("Bulk texture snapshots use current contiguous GPU and physical mappin
     REQUIRE(expected[0xf00] == 0);
     f.device.Map(0x21000, 0x20000, 0x1000, f.asid);
     compare(false); // middle page aliases the first physical page
+    // Heap preallocation may describe contiguous guest virtual memory even though the
+    // installed DAddr mappings above currently repeat one physical page.
+    f.device.TrackContinuity(0x20000, 0x20000, 0x3000, f.asid);
+    compare(false); // A continuity hint must never substitute for installed physical PTEs.
+    REQUIRE(expected[0x0f00] == f.bytes[0x10000]);
+    REQUIRE(expected[0x0f00] != f.bytes[0x11000]);
     f.device.Unmap(0x21000, 0x1000);
     f.device.Map(0x21000, 0x21000, 0x1000, f.asid);
     compare(true);
