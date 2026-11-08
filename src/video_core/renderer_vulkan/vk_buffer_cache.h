@@ -123,6 +123,8 @@ public:
 
     u64 CurrentTick();
 
+    u64 QueueEarlyHostRead();
+    bool EarlyHostReadReady(u64 tick);
     bool IsFree(u64 tick);
 
     void Wait(u64 tick);

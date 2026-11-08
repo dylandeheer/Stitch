@@ -35,6 +35,7 @@
 #include "common/slot_vector.h"
 #include "shader_recompiler/shader_info.h"
 #include "video_core/buffer_cache/recent_read_pages.h"
+#include "video_core/buffer_cache/early_read_pages.h"
 #include "video_core/buffer_cache/buffer_base.h"
 #include "video_core/buffer_cache/read_trap_tracker.h"
 #include "video_core/buffer_cache/virtual_range_cache.h"
@@ -235,6 +236,9 @@ class BufferCache : public VideoCommon::ChannelSetupCaches<BufferCacheChannelInf
 public:
     explicit BufferCache(Tegra::MaxwellDeviceMemoryManager& device_memory_, Runtime& runtime_);
 
+    void OutdateEarlyCpuReads(DAddr address, u64 size);
+    void RecordEarlyCpuReads();
+    bool TryEarlyCpuRead(DAddr address, u64 size);
     ~BufferCache();
 
     void TickFrame();
@@ -791,6 +795,8 @@ private:
 
     /// A command list page (Nx2CopyListPages): the GPU writes noted to it and the last copy.
     using Nx2Staging = decltype(std::declval<Runtime&>().DownloadStagingBuffer(size_t{}, true));
+    using Early = EarlyReadPages<BufferId, Nx2Staging>;
+    std::unique_ptr<Early> early_reads;
     struct Nx2ListPage {
         u64 writes{};      ///< GPU writes noted to the page
         u64 copy_writes{}; ///< `writes` when the copy was made: the copy is current while equal

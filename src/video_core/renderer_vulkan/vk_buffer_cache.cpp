@@ -476,6 +476,18 @@ u64 BufferCacheRuntime::CurrentTick() {
     return scheduler.CurrentTick();
 }
 
+u64 BufferCacheRuntime::QueueEarlyHostRead() {
+    scheduler.RequestOutsideRenderPassOperationContext();
+    scheduler.Record(HostReadBarrier);
+    return scheduler.CurrentTick();
+}
+
+bool BufferCacheRuntime::EarlyHostReadReady(u64 tick) {
+    auto& semaphore = scheduler.GetMasterSemaphore();
+    if (!semaphore.IsFree(tick)) semaphore.Refresh();
+    return semaphore.IsFree(tick);
+}
+
 bool BufferCacheRuntime::IsFree(u64 tick) {
     return scheduler.IsFree(tick);
 }

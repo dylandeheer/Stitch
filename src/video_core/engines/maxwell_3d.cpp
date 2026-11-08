@@ -788,11 +788,12 @@ void Maxwell3D::ProcessFirmwareCall4() {
 
 void Maxwell3D::StampQueryResult(Core::System& system, u64 payload, bool long_query) {
     const GPUVAddr sequence_address{regs.report_semaphore.Address()};
+    memory_manager.ExcludeEarlyReadReport(sequence_address, 16);
     if (long_query) {
-        memory_manager.Write<u64>(sequence_address + sizeof(u64), system.GPU().GetTicks());
-        memory_manager.Write<u64>(sequence_address, payload);
+        memory_manager.WriteReport<u64>(sequence_address + sizeof(u64), system.GPU().GetTicks());
+        memory_manager.WriteReport<u64>(sequence_address, payload);
     } else {
-        memory_manager.Write<u32>(sequence_address, static_cast<u32>(payload));
+        memory_manager.WriteReport<u32>(sequence_address, static_cast<u32>(payload));
     }
     if (const u64 trace = VideoCommon::QueryTrace::Sample(VideoCommon::QueryTrace::Event::Write)) {
         LOG_INFO(HW_GPU,
@@ -808,6 +809,7 @@ void Maxwell3D::ProcessQueryGet() {
         flags |= VideoCommon::QueryPropertiesFlags::HasTimeout;
     }
     const GPUVAddr sequence_address{regs.report_semaphore.Address()};
+    memory_manager.ExcludeEarlyReadReport(sequence_address, 16);
     const VideoCommon::QueryType query_type =
         static_cast<VideoCommon::QueryType>(regs.report_semaphore.query.report.Value());
     const u32 payload = regs.report_semaphore.payload;

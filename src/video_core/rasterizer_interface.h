@@ -99,6 +99,10 @@ public:
     /// Notify rasterizer that all caches should be flushed to Switch memory
     virtual void FlushAll() = 0;
 
+    virtual void FlushCpuRead(const RasterizerDownloadArea& area) {
+        FlushRegion(area.start_address, area.end_address - area.start_address);
+    }
+
     /// Notify rasterizer that any caches of the specified region should be flushed to Switch memory
     virtual void FlushRegion(DAddr addr, u64 size,
                              VideoCommon::CacheType which = VideoCommon::CacheType::All) = 0;

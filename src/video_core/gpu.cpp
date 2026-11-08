@@ -269,8 +269,7 @@ struct GPU::Impl {
         }
         const auto flush = [this, raster_area] {
             InvalidateGPUCache();
-            renderer->ReadRasterizer()->FlushRegion(raster_area.start_address,
-                                                    raster_area.end_address - raster_area.start_address);
+            renderer->ReadRasterizer()->FlushCpuRead(raster_area);
         };
         if (VideoCore::ReadbackTrace::Enabled()) {
             namespace Trace = VideoCore::ReadbackTrace;

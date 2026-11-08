@@ -103,6 +103,8 @@ public:
     void BindGraphicsUniformBuffer(size_t stage, u32 index, GPUVAddr gpu_addr, u32 size) override;
     void DisableGraphicsUniformBuffer(size_t stage, u32 index) override;
     void FlushAll() override;
+    void FlushCpuRead(const VideoCore::RasterizerDownloadArea& area) override;
+    void FlushRegionImpl(DAddr addr, u64 size, VideoCommon::CacheType which, bool early_read);
     void FlushRegion(DAddr addr, u64 size,
                      VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
     GpuWrittenList ReadGpuWrittenCommandList(DAddr addr, std::span<u8> out,

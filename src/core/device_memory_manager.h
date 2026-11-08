@@ -17,6 +17,7 @@
 #include <span>
 
 #include "common/common_types.h"
+#include "core/early_read_report_pages.h"
 #include "core/download_landing.h"
 #include "common/range_mutex.h"
 #include "common/scratch_buffer.h"
@@ -56,6 +57,43 @@ public:
 
     void BindInterface(DeviceInterface* device_inter);
 
+    void ExcludeEarlyReadPointer(const u8* ptr, size_t size) {
+        if (!Core::EarlyBufferReadsRequested() || !ptr || !size || !IsPhysicalPointer(ptr)) return;
+        std::scoped_lock lock{mapping_guard};
+        const auto physical = GetRawPhysicalAddr(ptr);
+        const auto last = (physical + size - 1) >> page_bits;
+        for (auto page = physical >> page_bits; page <= last; ++page) {
+            early_read_reports.Exclude(static_cast<u32>(page));
+        }
+    }
+
+    void ExcludeEarlyReadReport(DAddr address, u64 size) {
+        if (!size || address >= device_as_size || size > device_as_size - address) return;
+        std::scoped_lock lock{mapping_guard};
+        const auto last = (address + size - 1) >> page_bits;
+        for (auto page = address >> page_bits; page <= last; ++page) {
+            const auto backing = tracked_entries[page].compressed_physical_ptr;
+            if (backing) {
+                early_read_reports.Exclude(backing - 1);
+                // Some report engines memcpy a scalar through the first host pointer.
+                if (page < last) early_read_reports.Exclude(backing);
+            }
+        }
+    }
+
+    template <typename Func>
+    bool WithEarlyReadPage(DAddr page, u64 generation, Func&& action) {
+        const std::array<DAddr, 1> addresses{page};
+        bool used{};
+        WithUniquePhysicalPages(addresses, generation, [&] {
+            const u32 backing = tracked_entries[page >> page_bits].compressed_physical_ptr;
+            if (!early_read_reports.Excluded(backing - 1)) {
+                action();
+                used = true;
+            }
+        });
+        return used;
+    }
     DownloadLanding download_landing;
 
     /// Marks the memory behind [address, address + size) cold (Common::HostMemory::HintCold),
@@ -296,6 +334,7 @@ private:
         static std::atomic<u64> next{1};
         return next.fetch_add(1, std::memory_order_relaxed);
     }
+    EarlyReadReportPages early_read_reports;
     std::atomic<u64> translation_generation{NextTranslationGeneration()}; ///< New at Map and Unmap
     using CounterType = u8;
     using CounterAtomicType = std::atomic_uint8_t;

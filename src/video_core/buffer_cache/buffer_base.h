@@ -121,6 +121,8 @@ public:
         return size_bytes;
     }
 
+    u64 early_read_instance{}; // Assigned on registration in an early-read experiment.
+
     u64 getWriteTick() const noexcept {
         return write_tick;
     }

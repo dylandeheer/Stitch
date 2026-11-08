@@ -1796,6 +1796,9 @@ void QueryCacheRuntime::SyncValues(std::span<SyncValuesType> values, VkBuffer ba
 
     // Vulkan part.
     std::scoped_lock lk(impl->buffer_cache.mutex);
+    for (const auto& value : values) {
+        impl->buffer_cache.OutdateEarlyCpuReads(value.address, value.size);
+    }
     impl->buffer_cache.BufferOperations([&] {
         impl->buffers_to_upload_to.clear();
         for (auto& pair : impl->little_cache) {
