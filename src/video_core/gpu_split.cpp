@@ -21,6 +21,7 @@
 #include <cstring>
 #include <string>
 
+#include "common/cityhash.h"
 #include "common/dkb_cpu_trace.h"
 #include "common/logging.h"
 #include "common/settings.h"
@@ -29,6 +30,8 @@
 #include "video_core/engines/engine_interface.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/gpu_split.h"
+#include "video_core/macro_dma_coverage.h"
+#include "video_core/macro_fifo_shape.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_profile.h"
@@ -72,6 +75,8 @@ public:
         }
         const char* file = std::getenv("STITCH_SPLIT_WAIT_TRACE_FILE");
         marker = file ? file : "";
+        const char* macro = std::getenv("STITCH_MACRO_DMA_COVERAGE");
+        macro_enabled = macro && std::string_view{macro} == "1";
         Poll(true);
     }
 
@@ -93,6 +98,10 @@ public:
         if (requested && !latched) {
             ++window;
             counts = {};
+            if (macro_enabled) {
+                coverage = {};
+                lists = {};
+            }
             begin = now;
             deadline = now + std::chrono::seconds{10};
             active = true;
@@ -102,7 +111,68 @@ public:
         latched = requested;
     }
 
+    bool MacroActive() const {
+        return active && macro_enabled;
+    }
+    void BeginMacro(s32 channel, u64 as_id, u32 method, u32 start, const void* owner,
+                    u64 generation, std::span<const u32> code, bool fifo, u32 words,
+                    size_t parameters, bool pending, bool instance, bool sink, u32 shadow,
+                    u32 render_mode, u64& seen) {
+        clean_entry = MacroDmaCoverage::CleanEntry(pending, instance, sink, shadow); // Passthrough
+        macro_read = coverage.Begin(
+            window, seen, fifo, words, {as_id, generation, 0, channel, method, start}, owner, code,
+            parameters, pending, instance, sink, shadow,
+            [](std::span<const u32> code_words) {
+                return Common::CityHash64(reinterpret_cast<const char*>(code_words.data()),
+                                          code_words.size_bytes());
+            },
+            [render_mode](auto words_, u32 entry) {
+                return MacroFifoShape(words_, entry, render_mode);
+            });
+    }
+    void EndMacro() {
+        macro_read = nullptr;
+    }
+    void ListSite(GpuSplit::ListWriterSite site) {
+        list_site = static_cast<size_t>(site);
+    }
+    void Rechecked(GpuSplit::ListWriterSite site, bool became_gpu_written) {
+        if (MacroActive()) {
+            auto& row = lists[static_cast<size_t>(site)];
+            ++row.rechecks;
+            row.changed += became_gpu_written;
+        }
+    }
+
     void Observe(size_t site, u64 pending_words) {
+        macro_wait = nullptr;
+        list_wait = nullptr;
+        if (macro_enabled && site == static_cast<size_t>(DrainSite::ListWriters) &&
+            list_site < lists.size()) {
+            auto& detail = lists[list_site];
+            ++detail.calls;
+            if (pending_words) {
+                ++detail.blocked;
+                list_wait = &detail;
+            }
+        }
+        if (macro_read) {
+            if (site == static_cast<size_t>(DrainSite::MacroDmaRead))
+                macro_kind = 0;
+            else if (site == static_cast<size_t>(DrainSite::MacroDmaFlush))
+                macro_kind = 1;
+            else if (site == static_cast<size_t>(DrainSite::MacroDmaWrites))
+                macro_kind = 2;
+            else
+                macro_kind = 3;
+            if (macro_kind < 3) {
+                ++macro_read->sync_calls[macro_kind];
+                if (pending_words) {
+                    ++macro_read->blocked[macro_kind];
+                    macro_wait = macro_read;
+                }
+            }
+        }
         auto& row = counts[site];
         ++row.calls;
         if (pending_words != 0) {
@@ -117,6 +187,18 @@ public:
     void FinishWait() {
         const auto now = Clock::now();
         const auto ns = Elapsed(wait_start, now);
+        if (list_wait) {
+            list_wait->ns += ns;
+            list_wait->max_ns = std::max(list_wait->max_ns, ns);
+            list_wait = nullptr;
+        }
+        if (macro_wait) {
+            macro_wait->wait_ns[macro_kind] += ns;
+            if (clean_entry && macro_kind == 0)
+                macro_wait->clean_entry_drain_ns += ns;
+            macro_wait->max_ns[macro_kind] = std::max(macro_wait->max_ns[macro_kind], ns);
+            macro_wait = nullptr;
+        }
         current->wait_ns += ns;
         current->max_ns = (std::max)(current->max_ns, ns);
         constexpr std::array<u64, 5> limits{2000, 10000, 50000, 250000, 1000000};
@@ -148,6 +230,65 @@ private:
 
     void Report(Clock::time_point now, const char* reason) {
         active = false;
+        macro_read = nullptr;
+        macro_wait = nullptr;
+        if (macro_enabled) {
+            auto report_group = [&](const MacroDmaCoverage::Group& row, bool excess) {
+                if (!row.invocations && !row.reads[0].requests && !row.reads[1].requests)
+                    return;
+                LOG_INFO(HW_GPU,
+                         "Macro DMA coverage window={} overflow={} channel={} as={} "
+                         "method={:#x} start={:#x} generation={} code_ram_hash={:016x} "
+                         "invocations={} parameter_words={} entry_draw_pending={} "
+                         "entry_instance_loop={} entry_sink_pending={} "
+                         "entry_shadow_modes={},{},{},{} shape={}",
+                         window, excess, row.key.channel, row.key.as_id, row.key.method,
+                         row.key.start, row.key.code_generation, row.key.ram_hash, row.invocations,
+                         row.parameter_words, row.draw_pending, row.instance_loop, row.sink_pending,
+                         row.shadow_modes[0], row.shadow_modes[1], row.shadow_modes[2],
+                         row.shadow_modes[3], row.shape);
+                for (size_t i = 0; i < 2; ++i) {
+                    const auto& r = row.reads[i];
+                    if (!r.requests)
+                        continue;
+                    LOG_INFO(
+                        HW_GPU,
+                        "Macro DMA waits window={} overflow={} channel={} as={} method={:#x} "
+                        "start={:#x} generation={} code_ram_hash={:016x} target={} dma_calls={} "
+                        "words={} "
+                        "drain_calls={} flush_calls={} writer_calls={} drain_blocked={} "
+                        "flush_blocked={} "
+                        "writer_blocked={} drain_ns={} flush_ns={} writer_ns={} max_drain_ns={} "
+                        "max_flush_ns={} max_writer_ns={} max_words={} clean_entry_drain_ns={}",
+                        window, excess, row.key.channel, row.key.as_id, row.key.method,
+                        row.key.start, row.key.code_generation, row.key.ram_hash,
+                        i ? "fifo" : "data_ram", r.requests, r.words, r.sync_calls[0],
+                        r.sync_calls[1], r.sync_calls[2], r.blocked[0], r.blocked[1], r.blocked[2],
+                        r.wait_ns[0], r.wait_ns[1], r.wait_ns[2], r.max_ns[0], r.max_ns[1],
+                        r.max_ns[2], r.max_words, r.clean_entry_drain_ns);
+                }
+            };
+            for (size_t i = 0; i < coverage.group_count; ++i)
+                report_group(coverage.groups[i], false);
+            report_group(coverage.overflow, true);
+            LOG_INFO(HW_GPU,
+                     "Macro DMA coverage summary window={} groups={} code_images={} "
+                     "mutated_image_reads={} excess_image_reads={} excess_group_reads={}",
+                     window, coverage.group_count, coverage.hash_count,
+                     coverage.changed_image_reads, coverage.excess_image_reads,
+                     coverage.excess_group_reads);
+            constexpr std::array list_names{"fresh-header", "continued-method", "resumed-entry",
+                                            "known-gpu-page"};
+            for (size_t i = 0; i < lists.size(); ++i) {
+                const auto& row = lists[i];
+                if (row.calls)
+                    LOG_INFO(HW_GPU,
+                             "List writer coverage window={} reason={} calls={} blocked={} "
+                             "wait_ns={} max_ns={} rechecked={} became_gpu_written={}",
+                             window, list_names[i], row.calls, row.blocked, row.ns, row.max_ns,
+                             row.rechecks, row.changed);
+            }
+        }
         LOG_INFO(HW_GPU, "Split front wait end window={} wall_ns={} reason={}", window,
                  Elapsed(begin, now), reason);
         for (size_t i = 0; i < counts.size(); ++i) {
@@ -167,6 +308,17 @@ private:
 
     std::array<Counts, RingSpace + 1> counts{};
     Counts* current{};
+    MacroDmaCoverage coverage;
+    MacroDmaCoverage::Direction* macro_read{};
+    MacroDmaCoverage::Direction* macro_wait{};
+    size_t macro_kind{};
+    bool macro_enabled{}, clean_entry{};
+    struct ListDetail {
+        u64 calls{}, blocked{}, ns{}, max_ns{}, rechecks{}, changed{};
+    };
+    std::array<ListDetail, static_cast<size_t>(GpuSplit::ListWriterSite::Count)> lists{};
+    ListDetail* list_wait{};
+    size_t list_site{};
     std::filesystem::path marker;
     Clock::time_point next_poll{}, begin{}, deadline{}, wait_start{}, park_start{};
     u64 window{};
@@ -356,6 +508,21 @@ void GpuSplit::Publish() {
     }
 }
 
+bool GpuSplit::MacroDmaTraceActive() const {
+    return front_wait_probe.MacroActive();
+}
+
+void GpuSplit::BeginMacroDmaTrace(s32 channel, u64 as_id, u32 method, u32 start, const void* owner,
+                                  u64 generation, std::span<const u32> code, bool fifo, u32 words,
+                                  size_t parameters, bool pending, bool instance, bool sink,
+                                  u32 shadow, u32 render_mode, u64& seen) {
+    front_wait_probe.BeginMacro(channel, as_id, method, start, owner, generation, code, fifo, words,
+                                parameters, pending, instance, sink, shadow, render_mode, seen);
+}
+void GpuSplit::EndMacroDmaTrace() {
+    front_wait_probe.EndMacro();
+}
+
 void GpuSplit::Drain(DrainSite site) {
     consumed_cache = consumed.load(std::memory_order_acquire);
     if (front_wait_probe.Active()) {
@@ -381,7 +548,13 @@ void GpuSplit::Drain(DrainSite site) {
     }
 }
 
-bool GpuSplit::WaitForWriters() {
+void GpuSplit::NoteListRecheck(ListWriterSite site, bool became_gpu_written) {
+    front_wait_probe.Rechecked(site, became_gpu_written);
+}
+
+bool GpuSplit::WaitForWriters(ListWriterSite site) {
+    if (front_wait_probe.MacroActive())
+        front_wait_probe.ListSite(site);
     return WaitFor(std::min(last_writer_position, write_position), DrainSite::ListWriters);
 }
 

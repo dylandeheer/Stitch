@@ -45,16 +45,17 @@ constexpr u32 MacroRegistersStart = 0xE00;
 // EDEN_NX2_3D_METHODS: log the first write to each 3D register (finds methods Eden doesn't model).
 static const bool g_trace_first_method_writes = std::getenv("EDEN_NX2_3D_METHODS") != nullptr;
 
-Maxwell3D::Maxwell3D(MemoryManager& memory_manager_)
-    : draw_manager()
-    , memory_manager{memory_manager_}
+Maxwell3D::Maxwell3D(MemoryManager& memory_manager_, s32 trace_channel)
+    : draw_manager(), memory_manager{memory_manager_}
 #ifdef ARCHITECTURE_x86_64
-    , macro_engine(bool(Settings::values.disable_macro_jit))
+      ,
+      macro_engine(bool(Settings::values.disable_macro_jit))
 #else
-    , macro_engine(true)
+      ,
+      macro_engine(true)
 #endif
-    , upload_state{memory_manager, regs.upload}
-{
+      ,
+      upload_state{memory_manager, regs.upload}, macro_trace_channel{trace_channel} {
     dirty.flags.flip();
     InitializeRegisterDefaults();
     execution_mask.reset();
@@ -1361,6 +1362,12 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
         VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Macro};
         engine.native_interpreter.active_dram = &native_data_ram;
         const auto parameter_count = fs.parameters.size();
+        const bool entry_pending = fs.draw_pending;
+        const bool entry_instance = fs.instance_loop;
+        const bool entry_sink = fs.sink_pending;
+        const auto entry_shadow = static_cast<u32>(fs.control);
+        const u64 entry_generation = engine.native_code_generation;
+        u64 trace_window{};
         const auto read = [&fs](u32 address) {
             return address < Regs::NUM_REGS ? fs.regs[address] : 0U;
         };
@@ -1371,7 +1378,9 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
             FrontWrite(split, fs, address, value, true, true);
             // MME_DMA_READ (into data RAM) and MME_DMA_READ_FIFOED (into the load FIFO).
             if (address == 0x157 || address == 0x158) {
-                FrontDmaRead(split, fs, method, address, value);
+                FrontDmaRead(split, fs, method, address, value, start, parameter_count,
+                             entry_pending, entry_instance, entry_sink, entry_shadow,
+                             entry_generation, trace_window);
             }
             return true;
         };
@@ -1487,12 +1496,27 @@ void Maxwell3D::FrontNoteWrites(VideoCommon::GpuSplit& split, const FrontState& 
     }
 }
 
-void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 macro,
-                             u32 method, u32 count) {
+void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 macro, u32 method,
+                             u32 count, u32 start, size_t parameters, bool entry_pending,
+                             bool entry_instance, bool entry_sink, u32 entry_shadow,
+                             u64 entry_generation, u64& trace_window) {
     const GPUVAddr source = (GPUVAddr{fs.regs[0x154] & 0x1ffffff} << 32) | fs.regs[0x155];
     const u32 ram = fs.regs[0x156];
     const u32 words = std::min<u32>(count, 0x1000);
     const size_t read_bytes = size_t{words} * sizeof(u32);
+    const bool traced = split.MacroDmaTraceActive();
+    if (traced) {
+        auto& engine = GetNativeMacroEngine();
+        split.BeginMacroDmaTrace(
+            macro_trace_channel, memory_manager.GetID(), macro, start,
+            engine.native_code_generation == entry_generation ? &engine : nullptr, entry_generation,
+            engine.native_code, method == 0x158, words, parameters, entry_pending, entry_instance,
+            entry_sink, entry_shadow, MAXWELL3D_REG_INDEX(render_enable.mode), trace_window);
+    }
+    SCOPE_EXIT {
+        if (traced)
+            split.EndMacroDmaTrace();
+    };
     std::vector<u32> diag_before;
     if (Tegra::Nx2CmdPageDiag::g_enabled) {
         diag_before.resize(words);

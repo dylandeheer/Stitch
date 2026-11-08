@@ -25,6 +25,8 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
+#include "video_core/macro_dma_coverage.h"
+#include "video_core/macro_fifo_shape.h"
 #include "video_core/memory_manager.h"
 #include "video_core/renderer_null/null_rasterizer.h"
 
@@ -789,6 +791,102 @@ TEST_CASE("Split consumption does not complete deferred downstream callbacks",
         deferred.clear();
     });
     REQUIRE(output == std::array<u32, 3>{1, 2, 3});
+}
+
+// A prototype callback with private code/FIFO and an explicit overlapping dirty-buffer/query
+// source. It exercises real split-ring ordering and MME decoding without enabling any title path.
+TEST_CASE("Captured FIFO macro keeps its ring position and Stitch read-publication order",
+          "[video_core][gpu_split_dependencies][macro_dma_coverage]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    constexpr u32 mode = MAXWELL3D_REG_INDEX(render_enable.mode);
+    std::vector<u32> code;
+    for (const auto instruction : {FifoInstruction(0x154, false), FifoInstruction(0x155, false),
+                                   FifoInstruction(0x158, true), FifoInstruction(mode, false)}) {
+        code.insert(code.end(), instruction.begin(), instruction.end());
+    }
+    REQUIRE(VideoCommon::MacroFifoShape(code, 0, mode) == "linear-fifo-shape");
+    REQUIRE(VideoCommon::MacroDmaCoverage::CleanEntry(false, false, false, 2));
+    REQUIRE_FALSE(VideoCommon::MacroDmaCoverage::CleanEntry(false, false, true, 2));
+    auto persistent = code;
+    const auto ram = FifoInstruction(0x157, true);
+    std::copy(ram.begin(), ram.end(), persistent.begin() + 6);
+    REQUIRE(VideoCommon::MacroFifoShape(persistent, 0, mode) == "dma-to-ram");
+    // Last instruction follows END. Both faults terminate the real interpreter after the FIFO
+    // read, but before the render-control write. The diagnostic cannot claim a complete shape.
+    auto fault = code;
+    fault[11] |= 7U << 10; // EXTENDED with zero X, which the interpreter rejects.
+    REQUIRE(VideoCommon::MacroFifoShape(fault, 0, mode) == "extended");
+    fault = code;
+    fault[11] |= 16U << 10; // MERGE, valid destination
+    REQUIRE(VideoCommon::MacroFifoShape(fault, 0, mode) == "linear-fifo-shape");
+    fault[10] |= 1U << 13; // immediate0 bit 15 in native RAM word order
+    REQUIRE(VideoCommon::MacroFifoShape(fault, 0, mode) == "invalid-merge");
+    auto parameters = std::vector<u32>{0, 0x4000, 1};
+    struct State {
+        u32 dirty_word{}, report_word{}, landed_word{}, mode_word{};
+        bool success{};
+        size_t consumed{};
+        std::vector<u32> events;
+        bool operator==(const State&) const = default;
+    };
+    const auto before = [](State& state) {
+        state.events.push_back(1);
+        state.dirty_word = 11;
+        state.report_word = 22;
+    };
+    const auto after = [](State& state) {
+        state.events.push_back(2);
+        state.dirty_word = 33;
+    };
+    const auto interpret = [=](State& state, const auto& image, auto fifo, bool buffer_first) {
+        Tegra::TuringMacroInterpreter interpreter;
+        const auto result = interpreter.Execute(image, 0, fifo, [](u32) { return 0U; },
+            [&](u32 method, u32 value) {
+                state.events.push_back(method);
+                if (method == 0x158 && value == 1) {
+                    const auto buffer = [&] { state.landed_word = state.dirty_word; };
+                    const auto query = [&] { state.landed_word = state.report_word; };
+                    if (buffer_first) {
+                        buffer();
+                        query();
+                    } else {
+                        query();
+                        buffer();
+                    }
+                    fifo.push_back(state.landed_word);
+                }
+                if (method == mode) {
+                    state.mode_word = value;
+                }
+                return true;
+            });
+        state.success = result.success;
+        state.consumed = result.consumed;
+    };
+    State front, wrong_order, back;
+    before(front);
+    interpret(front, code, parameters, true);
+    after(front);
+    REQUIRE(front.success);
+    REQUIRE(front.consumed == 4);
+    REQUIRE(front.mode_word == 22);
+    before(wrong_order);
+    interpret(wrong_order, code, parameters, false);
+    after(wrong_order);
+    REQUIRE(wrong_order.mode_word == 11);
+
+    Fixture f;
+    f.system.Initialize();
+    VideoCommon::GpuSplit split;
+    Access::Start(split, f.system);
+    SCOPE_EXIT { split.Stop(); };
+    split.Defer([&] { before(back); });
+    split.DeferFunction([&, image = code, fifo = parameters] { interpret(back, image, fifo, true); });
+    split.Defer([&] { after(back); });
+    code = std::move(persistent);
+    parameters.clear();
+    split.Drain(VideoCommon::DrainSite::MacroDmaRead);
+    REQUIRE(back == front);
 }
 
 TEST_CASE("Split restart resets writer positions without replaying old releases",

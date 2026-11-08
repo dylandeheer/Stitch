@@ -54,15 +54,11 @@ void BindNvkDefaultSubchannels(ChannelState::Payload& payload) {
 
 } // Anonymous namespace
 
-ChannelState::Payload::Payload(Core::System& system, MemoryManager& memory_manager, ChannelState& channel_state)
-    : maxwell_3d(memory_manager)
-    , fermi_2d(memory_manager)
-    , kepler_compute(memory_manager)
-    , maxwell_dma(memory_manager)
-    , kepler_memory(memory_manager)
-    , nv01_timer(memory_manager)
-    , dma_pusher(system, memory_manager, channel_state)
-{}
+ChannelState::Payload::Payload(Core::System& system, MemoryManager& memory_manager,
+                               ChannelState& channel_state)
+    : maxwell_3d(memory_manager, channel_state.bind_id), fermi_2d(memory_manager),
+      kepler_compute(memory_manager), maxwell_dma(memory_manager), kepler_memory(memory_manager),
+      nv01_timer(memory_manager), dma_pusher(system, memory_manager, channel_state) {}
 
 ChannelState::ChannelState(s32 bind_id_)
     : bind_id{bind_id_}

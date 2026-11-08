@@ -61,7 +61,7 @@ namespace Tegra::Engines {
 
 class Maxwell3D final : public EngineInterface {
 public:
-    explicit Maxwell3D(MemoryManager& memory_manager);
+    explicit Maxwell3D(MemoryManager& memory_manager, s32 trace_channel = -1);
     ~Maxwell3D();
 
     /// Binds a rasterizer to this engine.
@@ -3405,9 +3405,12 @@ private:
     bool FrontSkipsLoopWrite(FrontState& state, u32 method, u32 value, bool shadow_kept);
     void FrontNoteWrites(VideoCommon::GpuSplit& split, const FrontState& state, u32 method, u32 amount);
     void FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& state, u32 macro, u32 method,
-                      u32 count);
+                      u32 count, u32 start, size_t parameters, bool draw_pending,
+                      bool instance_loop, bool sink_pending, u32 shadow_mode, u64 entry_generation,
+                      u64& trace_window);
     void FrontVerify(VideoCommon::GpuSplit& split, FrontState& state);
     void FinishFrontMacro(Core::System& system);
+    s32 macro_trace_channel;
     std::unique_ptr<FrontState> front;
     bool front_macros{};
     // EDEN_NX2_SPLIT_VERIFY: the last SET_SHADOW_RAM_CONTROL writes each side saw (argument,
