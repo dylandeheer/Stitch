@@ -258,6 +258,9 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
     }
 #endif
 
+    if (scheduler.HasQueryExperiments()) {
+        scheduler.MarkQueryExperimentFrame();
+    }
     if (trace || Scheduler::MeshPerfRequested()) {
         scheduler.MarkFrameEnd(++trace_frame);
     }

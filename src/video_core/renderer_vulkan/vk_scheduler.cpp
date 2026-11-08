@@ -118,6 +118,17 @@ Scheduler::Scheduler(const Device& device_, StateTracker& state_tracker_)
     const char* skip_xfb = std::getenv("EDEN_NX2_SKIP_UNUSED_XFB_BARRIERS");
     skip_unused_xfb_barriers = device.IsExtTransformFeedbackSupported() && skip_xfb &&
                                std::string_view{skip_xfb} == "1";
+    const char* sparse = std::getenv("EDEN_NX2_SPARSE_SAMPLE_COPIES");
+    sparse_direct_copies = device.GetDriverID() == VK_DRIVER_ID_MESA_RADV && sparse &&
+                           std::string_view{sparse} == "1";
+    if (HasQueryExperiments()) {
+        query_baseline_file = std::getenv("STITCH_QUERY_BASELINE_FILE");
+        if (query_baseline_file && *query_baseline_file) {
+            std::error_code ec;
+            query_baseline.store(std::filesystem::exists(query_baseline_file, ec) || ec,
+                                 std::memory_order_relaxed);
+        }
+    }
     if (Common::DkbFrameTrace::Enabled() || MeshPerfRequested()) {
         const auto physical = device.GetPhysical();
         trace_timestamp_bits =
@@ -291,6 +302,43 @@ bool Scheduler::MeshPerfRequested() {
         return value && std::string_view{value} == "1";
     }();
     return enabled;
+}
+
+void Scheduler::CountSampleCopies(size_t slots, size_t runs, size_t omitted, bool sparse) {
+    if (!sparse_direct_copies) {
+        return;
+    }
+    query_counts.copied_slots.fetch_add(slots, std::memory_order_relaxed);
+    query_counts.copy_runs.fetch_add(runs, std::memory_order_relaxed);
+    if (sparse) {
+        query_counts.omitted_slots.fetch_add(omitted, std::memory_order_relaxed);
+        query_counts.sparse_batches.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+void Scheduler::MarkQueryExperimentFrame() {
+    ++query_present_count;
+    const bool prior = query_baseline.load(std::memory_order_relaxed);
+    bool baseline = prior;
+    if (query_present_count % 16 == 0 && query_baseline_file && *query_baseline_file) {
+        std::error_code ec;
+        baseline = std::filesystem::exists(query_baseline_file, ec) || ec;
+    }
+    if (prior != baseline || query_present_count % 120 == 0) {
+        auto& c = query_counts;
+        LOG_INFO(Render_Vulkan,
+                 "Query experiment frame={} prior={} next={} xfb_kept={} xfb_skipped={} "
+                 "copied_slots={} copy_runs={} omitted_slots={} sparse_batches={}",
+                 query_present_count, prior ? "baseline" : "candidate",
+                 baseline ? "baseline" : "candidate",
+                 c.xfb_kept.exchange(0, std::memory_order_relaxed),
+                 c.xfb_skipped.exchange(0, std::memory_order_relaxed),
+                 c.copied_slots.exchange(0, std::memory_order_relaxed),
+                 c.copy_runs.exchange(0, std::memory_order_relaxed),
+                 c.omitted_slots.exchange(0, std::memory_order_relaxed),
+                 c.sparse_batches.exchange(0, std::memory_order_relaxed));
+        query_baseline.store(baseline, std::memory_order_relaxed);
+    }
 }
 
 void Scheduler::MarkFrameEnd(u64 frame) {
@@ -936,17 +984,17 @@ void Scheduler::EndRenderPass()
         query_cache->CounterEnable(VideoCommon::QueryType::ZPassPixelCount64, false);
         query_cache->NotifySegment(false);
 
-        const bool used_xfb = std::exchange(render_pass_has_xfb, false);
-        if (skip_unused_xfb_barriers && !used_xfb && ++skipped_xfb_barriers % 16384 == 0) {
-            LOG_INFO(Render_Vulkan, "Skipped {} unused transform-feedback barriers",
-                     skipped_xfb_barriers);
+        bool xfb_barrier = device.IsExtTransformFeedbackSupported();
+        if (skip_unused_xfb_barriers) {
+            const bool used_xfb = std::exchange(render_pass_has_xfb, false);
+            xfb_barrier = used_xfb || query_baseline.load(std::memory_order_relaxed);
+            (xfb_barrier ? query_counts.xfb_kept : query_counts.xfb_skipped)
+                .fetch_add(1, std::memory_order_relaxed);
         }
         Record([num_images = num_renderpass_images,
                        images = renderpass_images,
                        ranges = renderpass_image_ranges,
-                       has_transform_feedback = skip_unused_xfb_barriers
-                                                    ? used_xfb
-                                                    : device.IsExtTransformFeedbackSupported()](
+                       has_transform_feedback = xfb_barrier](
                           vk::CommandBuffer cmdbuf) {
             std::array<VkImageMemoryBarrier, 9> barriers;
             for (size_t i = 0; i < num_images; ++i) {

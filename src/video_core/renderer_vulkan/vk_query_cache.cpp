@@ -6,12 +6,10 @@
 
 #include <algorithm>
 #include <cstddef>
-#include <cstdlib>
 #include <limits>
 #include <map>
 #include <memory>
 #include <span>
-#include <string_view>
 #include <type_traits>
 #include "common/container/unordered_map.h"
 #include <utility>
@@ -144,9 +142,6 @@ public:
                              DescriptorPool& descriptor_pool)
         : BaseStreamer(id_), texture_cache{texture_cache_}, runtime{runtime_}, rasterizer{rasterizer_}, device{device_},
           scheduler{scheduler_}, memory_allocator{memory_allocator_} {
-        const char* sparse = std::getenv("EDEN_NX2_SPARSE_SAMPLE_COPIES");
-        sparse_direct_copies = device.GetDriverID() == VK_DRIVER_ID_MESA_RADV && sparse &&
-                               std::string_view{sparse} == "1";
         current_bank = nullptr;
         current_query = nullptr;
         amend_value = 0;
@@ -280,7 +275,7 @@ public:
         resolve_buffers.clear();
         size_t resolve_buffer_index = ObtainBuffer<true>(num_slots_used);
         resolve_buffers.push_back(resolve_buffer_index);
-        if (!sparse_direct_copies ||
+        if (!scheduler.SparseSampleCopiesEnabled() ||
             !TryCopyDirectSamples(*buffers[resolve_buffer_index], offsets)) {
             CopySampleSpans(*buffers[resolve_buffer_index], offsets);
         }
@@ -425,6 +420,7 @@ private:
                                                  size_t amount) {
             size_t bank_id = bank->GetIndex();
             VkQueryPool query_pool = bank->GetInnerPool();
+            scheduler.CountSampleCopies(amount, 1, 0, false);
             scheduler.RequestOutsideRenderPassOperationContext();
             scheduler.Record([start, amount, base_offset, query_pool,
                               buffer](vk::CommandBuffer cmdbuf) {
@@ -477,9 +473,11 @@ private:
         constexpr size_t query_size = SamplesQueryBank::QUERY_SIZE;
         size_t base_offset = 0;
         std::vector<Run> runs;
+        size_t copied_slots = 0;
         for (auto& [bank_id, slots] : slots_by_bank) {
             std::sort(slots.begin(), slots.end());
             slots.erase(std::unique(slots.begin(), slots.end()), slots.end());
+            copied_slots += slots.size();
             const size_t first = slots.front();
             offsets[bank_id] = {first, base_offset};
             const VkQueryPool pool = bank_pool.GetBank(bank_id).GetInnerPool();
@@ -495,6 +493,8 @@ private:
             base_offset += (slots.back() - first + 1) * query_size;
         }
 
+        scheduler.CountSampleCopies(copied_slots, runs.size(), base_offset / query_size - copied_slots,
+                                  true);
         scheduler.RequestOutsideRenderPassOperationContext();
         scheduler.Record([buffer, runs = std::move(runs), base_offset](vk::CommandBuffer cmdbuf) {
             for (const Run& run : runs) {
@@ -713,7 +713,6 @@ private:
     SamplesQueryBank* current_bank;
     VkQueryPool current_query_pool;
     size_t current_query_id;
-    bool sparse_direct_copies{};
     size_t num_slots_used{};
     size_t first_accumulation_checkpoint{};
     size_t last_accumulation_checkpoint{};

@@ -80,6 +80,15 @@ public:
     /// safe to touch worker resources.
     void WaitWorker();
 
+    bool HasQueryExperiments() const {
+        return skip_unused_xfb_barriers || sparse_direct_copies;
+    }
+    bool SparseSampleCopiesEnabled() const {
+        return sparse_direct_copies && !query_baseline.load(std::memory_order_relaxed);
+    }
+    void MarkQueryExperimentFrame();
+    void CountSampleCopies(size_t slots, size_t runs, size_t omitted, bool sparse);
+
     static bool MeshPerfRequested();
     [[nodiscard]] bool MeshPerfActive() const {
         return mesh_perf_active.load(std::memory_order_relaxed);
@@ -461,7 +470,14 @@ private:
     bool render_pass_has_stores{};
     bool render_pass_has_xfb{};
     bool skip_unused_xfb_barriers{};
-    u64 skipped_xfb_barriers{};
+    bool sparse_direct_copies{};
+    const char* query_baseline_file{};
+    std::atomic<bool> query_baseline{};
+    u64 query_present_count{};
+    struct QueryExperimentCounts {
+        std::atomic<u64> xfb_kept{}, xfb_skipped{}, copied_slots{}, copy_runs{}, omitted_slots{},
+            sparse_batches{};
+    } query_counts;
     bool compute_writes_pending{};
     bool graphics_pipeline_missing{};
     std::unique_ptr<CommandPool> command_pool;
