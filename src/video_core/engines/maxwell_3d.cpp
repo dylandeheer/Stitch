@@ -1497,7 +1497,6 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
                 CallMethod(*system_ptr, render, recipe.Result(input, words), true);
             });
             split.NoteWriter(); // Publication may change a later fetched command list.
-            split.NoteSync();
             fs.mode_pending = true;
             fs.sink_pending = false;
             ++counts.deferred;
