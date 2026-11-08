@@ -179,7 +179,8 @@ namespace Vulkan {
         }
 
         /// CreateImage's fallbacks; the image is left null when the result is an error.
-        VkResult AllocateImage(const VkImageCreateInfo &ci, bool dedicated, vk::Image &image,
+        /// may_fail: a texture-cache caller can retry after collection instead of drawing unbacked.
+        VkResult AllocateImage(const VkImageCreateInfo &ci, bool dedicated, bool may_fail, vk::Image &image,
                                std::unique_ptr<RetiredImageTicket>* ticket = nullptr) const;
 
         struct PoolState;
