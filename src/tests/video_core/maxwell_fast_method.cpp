@@ -1316,14 +1316,17 @@ TEST_CASE("Ordered FIFO macros preserve report order, tracked state and captured
         Verify,
         Candidate,
         StopHandoff,
+        ObserveDirect,
         PendingSink,
         Instance,
         Alias,
         Replay
     };
-    const auto route =
-        GENERATE(Route::Original, Route::Verify, Route::Candidate, Route::PendingSink,
-                 Route::Instance, Route::Alias, Route::Replay, Route::StopHandoff);
+    const auto route = GENERATE(Route::Original, Route::Verify, Route::Candidate,
+                                Route::PendingSink, Route::Instance, Route::Alias, Route::Replay,
+                                Route::StopHandoff, Route::ObserveDirect);
+    const bool deferred =
+        route == Route::Candidate || route == Route::StopHandoff || route == Route::ObserveDirect;
     CAPTURE(static_cast<int>(route));
     Fixture f;
     f.system.Initialize();
@@ -1392,8 +1395,16 @@ TEST_CASE("Ordered FIFO macros preserve report order, tracked state and captured
     one(ShadowControl, 1);
     const auto original = OrderedFifoTest::Instructions(render);
     upload(0, OrderedFifoTest::Encode(original));
+    constexpr u32 witness = MAXWELL3D_REG_INDEX(shadow_scratch) + 1;
+    using Insn = OrderedFifoTest::Instruction;
+    // This independent macro observes the *frontend* MME register file, then publishes
+    // that value through an unrelated tracked register, making stale mirrors observable.
+    upload(64, OrderedFifoTest::Encode(
+                   {Insn{.a = {22, 0, 25, 24}, .imm = render, .end = true},
+                    Insn{.a = {0, 24, 0, 24}, .imm = witness, .method = 5, .output = 1}}));
     one(MAXWELL3D_REG_INDEX(load_mme.start_address_ptr), 0);
     one(MAXWELL3D_REG_INDEX(load_mme.start_address), 0);
+    one(MAXWELL3D_REG_INDEX(load_mme.start_address), 64);
     call(0);
     split.Drain();
     REQUIRE(reports.events == std::vector<u32>{1, 2});
@@ -1437,7 +1448,7 @@ TEST_CASE("Ordered FIFO macros preserve report order, tracked state and captured
     while (!returned.load(std::memory_order_acquire) && !Access::FrontWaits(split) &&
            std::chrono::steady_clock::now() < until)
         std::this_thread::yield();
-    if (route == Route::Candidate || route == Route::StopHandoff) {
+    if (deferred) {
         REQUIRE(returned.load(std::memory_order_acquire));
         frontend.join();
         // Rebind and mutate the backing before the deferred callback is allowed to execute.
@@ -1451,7 +1462,7 @@ TEST_CASE("Ordered FIFO macros preserve report order, tracked state and captured
         REQUIRE_FALSE(returned.load(std::memory_order_acquire));
     }
     u32 seen_by_following_work{};
-    if (route == Route::Candidate || route == Route::StopHandoff) {
+    if (deferred) {
         split.Defer([&] {
             seen_by_following_work = engine.regs.reg_array[render];
             // A later operation may reuse the query address. The earlier call must have read it.
@@ -1465,11 +1476,10 @@ TEST_CASE("Ordered FIFO macros preserve report order, tracked state and captured
     split.Drain();
     REQUIRE(reports.events == std::vector<u32>{1, 2}); // VERIFY cannot run either effect twice.
     REQUIRE(engine.regs.reg_array[render] == (route == Route::Replay ? 0 : 1));
-    REQUIRE(split.OrderedFifoStats().deferred ==
-            (route == Route::Candidate || route == Route::StopHandoff ? 1U : 0U));
+    REQUIRE(split.OrderedFifoStats().deferred == (deferred ? 1U : 0U));
     REQUIRE(split.OrderedFifoStats().checked == (route == Route::Verify ? 1U : 0U));
     REQUIRE(split.OrderedFifoStats().mismatches == 0);
-    if (route == Route::Candidate || route == Route::StopHandoff) {
+    if (deferred) {
         REQUIRE(seen_by_following_work == 1);
     }
     if (route == Route::StopHandoff) {
@@ -1478,6 +1488,12 @@ TEST_CASE("Ordered FIFO macros preserve report order, tracked state and captured
         engine.CallMethod(f.system, render, 0, true);
         REQUIRE(engine.regs.reg_array[render] == 1);
         REQUIRE(engine.shadow_state.reg_array[render] == 1);
+    }
+    if (route == Route::ObserveDirect) {
+        one(0xe02, 0);
+        split.Drain();
+        REQUIRE(engine.regs.reg_array[witness] == 1);
+        REQUIRE(split.OrderedFifoStats().reconciled == 1);
     }
     if (route == Route::Candidate) {
         // Track->Replay must use the backend-owned result, and later out-of-split handoff
@@ -1488,6 +1504,9 @@ TEST_CASE("Ordered FIFO macros preserve report order, tracked state and captured
         REQUIRE(engine.regs.reg_array[render] == 1);
         REQUIRE(engine.shadow_state.reg_array[render] == 1);
         one(ShadowControl, 1);
+        one(0xe02, 0);
+        split.Drain();
+        REQUIRE(engine.regs.reg_array[witness] == 1);
         call(1); // Mutated code now emits a different constant and must use the ordinary path.
         split.Drain();
         REQUIRE(engine.regs.reg_array[render] == 0);
