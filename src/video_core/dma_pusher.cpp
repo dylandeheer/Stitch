@@ -112,8 +112,8 @@ bool DmaPusher::Step() {
 
     if (prefetch_size > 0) {
         const std::span<const CommandHeader> commands{command_list.prefetch_command_list};
-        command_resume_offset +=
-            ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
+        command_resume_offset += ProcessCommands(commands.subspan(command_resume_offset),
+                                                 command_resume_offset, CommandSource::Owned);
         if (puller.HasPendingAcquire()) {
             return false;
         }
@@ -229,7 +229,7 @@ bool DmaPusher::Step() {
                 header.size};
             RecordParsedEntry(header, commands);
             Nx2CmdPageDiag::CountEntry(Nx2CmdPageDiag::Path::Submitted);
-            command_resume_offset += ProcessCommands(commands, 0);
+            command_resume_offset += ProcessCommands(commands, 0, CommandSource::Owned);
         } else if (use_safe) {
             Tegra::Memory::GpuGuestMemory<Tegra::CommandHeader, Tegra::Memory::GuestMemoryFlags::SafeRead>headers(memory_manager, dma_state.dma_get, header.size, &command_headers);
             const std::span<const CommandHeader> commands{headers.data(), headers.size()};
@@ -241,8 +241,8 @@ bool DmaPusher::Step() {
             const std::span<const CommandHeader> commands{command_headers.data(), header.size};
             RecordParsedEntry(header, commands);
             Nx2CmdPageDiag::CountEntry(Nx2CmdPageDiag::Path::Copy);
-            command_resume_offset +=
-                ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
+            command_resume_offset += ProcessCommands(commands.subspan(command_resume_offset),
+                                                     command_resume_offset, CommandSource::Owned);
         } else {
             FlushGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32));
             Tegra::Memory::GpuGuestMemory<Tegra::CommandHeader, Tegra::Memory::GuestMemoryFlags::UnsafeRead>headers(memory_manager, dma_state.dma_get, header.size, &command_headers);
@@ -304,7 +304,20 @@ static const u32 g_semaphore_watch = [] {
 // EDEN_NX2_PB_CHECK also keeps the last parsed entries, for DumpCurrentEntry.
 static const bool g_record_parsed_entries = std::getenv("EDEN_NX2_PB_CHECK") != nullptr;
 
-size_t DmaPusher::ProcessCommands(std::span<const CommandHeader> commands, size_t word_offset) {
+size_t DmaPusher::ProcessCommands(std::span<const CommandHeader> commands, size_t word_offset,
+                                  CommandSource source) {
+    auto& split = VideoCommon::GpuSplit::Get();
+    const bool scoped = split.Active() && split.OrderedFifoConfigured();
+    using Backing = VideoCommon::GpuSplit::CommandBacking;
+    const auto previous = scoped ? split.EnterFifoCommandScope(source == CommandSource::Owned
+                                                                   ? Backing::Owned
+                                                                   : Backing::GuestMayChange)
+                                 : Backing::GuestMayChange;
+    SCOPE_EXIT {
+        if (scoped)
+            split.LeaveFifoCommandScope(previous);
+    };
+
     for (size_t index = 0; index < commands.size();) {
         // Data word of methods command
         if (dma_state.method_count && dma_state.non_incrementing) {
@@ -459,6 +472,15 @@ bool DmaPusher::WantsSegment() const {
 }
 
 void DmaPusher::CallMethod(u32 argument) {
+    // Puller actions and other engines can observe or notify guest memory during this entry.
+    // Native 3D data reads already drain in FrontDmaRead; all other native 3D operations
+    // here use owned command words, tracked registers, or the ordered backend.
+    if (auto& fifo = VideoCommon::GpuSplit::Get();
+        fifo.HasFifoPublication() &&
+        (g_semaphore_watch || dma_state.method < non_puller_methods ||
+         subchannel_type[dma_state.subchannel] != Engines::EngineTypes::Maxwell3D))
+        fifo.JoinOrderedFifo(VideoCommon::GpuSplit::FifoJoin::FrontObserver);
+
     if (g_semaphore_watch != 0) [[unlikely]] {
         WatchArgument(dma_state.method, argument);
     }
@@ -520,6 +542,15 @@ void DmaPusher::CallMethod(u32 argument) {
 }
 
 void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
+    // Puller actions and other engines can observe or notify guest memory during this entry.
+    // Native 3D data reads already drain in FrontDmaRead; all other native 3D operations
+    // here use owned command words, tracked registers, or the ordered backend.
+    if (auto& fifo = VideoCommon::GpuSplit::Get();
+        fifo.HasFifoPublication() &&
+        (g_semaphore_watch || dma_state.method < non_puller_methods ||
+         subchannel_type[dma_state.subchannel] != Engines::EngineTypes::Maxwell3D))
+        fifo.JoinOrderedFifo(VideoCommon::GpuSplit::FifoJoin::FrontObserver);
+
     if (g_semaphore_watch != 0) [[unlikely]] {
         for (u32 i = 0; i < num_methods; ++i) {
             WatchArgument(dma_state.method + (dma_state.non_incrementing ? 0 : i), base_start[i]);

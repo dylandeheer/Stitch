@@ -21,7 +21,6 @@
 #include "core/core_timing.h"
 #include "video_core/dirty_flags.h"
 #include "video_core/engines/maxwell_3d.h"
-#include "video_core/engines/maxwell_3d.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
 #include "video_core/macro_image_capture.h"
@@ -30,6 +29,7 @@
 #include "video_core/nx2_cmdpage_diag.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/ordered_fifo_macro.h"
 #include "video_core/query_cache/frame_trace.h"
 #include "video_core/query_dma.h"
 #include "video_core/rasterizer_interface.h"
@@ -1051,6 +1051,15 @@ struct Maxwell3D::FrontState {
     /// The back holds state writes in its method sink, which its next executable method consumes
     /// (issuing a deferred draw a changed one ends). Front() consumes it before copying the state.
     bool sink_pending{};
+    struct FifoProgram {
+        const MacroEngine* owner{};
+        u64 generation{};
+        u32 start{};
+        std::optional<VideoCommon::OrderedFifoMacro> compiled;
+        bool verified{};
+    };
+    std::array<FifoProgram, 16> programs{};
+    bool mode_pending{};
     VideoCommon::MacroImageCapture::CheckedImage checked_capture{};
     u32 split_start{}; ///< GpuSplit::Starts() when this copy was made
     bool skip_same{}; ///< SkipSameValueWrites() && FrontSkipSame(), read once
@@ -1062,6 +1071,20 @@ namespace {
 
 // EDEN_NX2_SPLIT_VERIFY=1: every 4096 front macro calls, wait for the back and compare the
 // front's registers with the back's (logs and resynchronizes differences).
+// Preserve the selected front DMA publication order. The split front provides its synchronous
+// back runner after draining; an already ordered backend entry executes the same work in place.
+template <typename Run>
+void PublishMacroDma(Tegra::MemoryManager& memory, VideoCore::RasterizerInterface& rasterizer,
+                     GPUVAddr source, size_t bytes, Run&& run) {
+    if (memory.IsMemoryDirty(source, bytes, VideoCommon::CacheType::BufferCache))
+        run([&memory, source, bytes] {
+            memory.FlushRegion(source, bytes, VideoCommon::CacheType::BufferCache);
+        });
+    run([&memory, &rasterizer, source, bytes] {
+        VideoCommon::QueryDma::FlushPending(memory, rasterizer, source, bytes);
+    });
+}
+
 bool FrontVerifyEnabled() {
     static const bool verify = std::getenv("EDEN_NX2_SPLIT_VERIFY") != nullptr;
     return verify;
@@ -1146,6 +1169,12 @@ Maxwell3D::FrontState& Maxwell3D::Front(Core::System& system, VideoCommon::GpuSp
 void Maxwell3D::ReleaseFront() {
     executing_macro = front->executing_macro;
     macro_params = std::move(front->parameters);
+    // The live settings handoff drained and stopped (or shutdown joined) the old backend.
+    // Preserve its last actually executed tracked mode when releasing the front's mirror.
+    if (front->mode_pending) {
+        constexpr u32 mode = MAXWELL3D_REG_INDEX(render_enable.mode);
+        front->shadow[mode] = shadow_state.reg_array[mode];
+    }
     std::memcpy(shadow_state.reg_array.data(), front->shadow.data(), sizeof(front->shadow));
     shadow_state.shadow_ram_control = front->control;
     front.reset();
@@ -1153,8 +1182,24 @@ void Maxwell3D::ReleaseFront() {
     LOG_INFO(HW_GPU, "GPU thread split stopped: 3D macros back on the engine");
 }
 
+void Maxwell3D::ReconcileOrderedMode(VideoCommon::GpuSplit& split, FrontState& fs) {
+    if (!fs.mode_pending)
+        return;
+    // Prior callbacks own only this mode register and its tracked shadow. All front readers
+    // of them pass here before reading, overwriting, replaying or checking the mirror.
+    split.Drain(VideoCommon::DrainSite::FifoPublication);
+    constexpr u32 mode = MAXWELL3D_REG_INDEX(render_enable.mode);
+    fs.regs[mode] = regs.reg_array[mode];
+    fs.shadow[mode] = shadow_state.reg_array[mode];
+    fs.mode_pending = false;
+    ++split.OrderedFifoStats().reconciled;
+}
+
 void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 method,
                            u32 argument, bool is_last_call, bool from_macro) {
+    if (fs.mode_pending && (method == MAXWELL3D_REG_INDEX(render_enable.mode) ||
+                            method == MAXWELL3D_REG_INDEX(shadow_ram_control)))
+        ReconcileOrderedMode(split, fs);
     namespace Profile = VideoCommon::Nx2Profile;
     // As ProcessShadowRam does on the back.
     u32 value = argument;
@@ -1260,6 +1305,9 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
                                      u32 method, const u32* base_start, u32 amount,
                                      u32 methods_pending) {
     auto& fs = Front(system, split);
+    if (fs.mode_pending && (method == MAXWELL3D_REG_INDEX(render_enable.mode) ||
+                            method == MAXWELL3D_REG_INDEX(shadow_ram_control)))
+        ReconcileOrderedMode(split, fs);
     if (method >= MacroRegistersStart) {
         if (fs.executing_macro == 0) {
             fs.executing_macro = method;
@@ -1385,19 +1433,119 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
         const auto entry_shadow = static_cast<u32>(fs.control);
         const u64 entry_generation = engine.native_code_generation;
         u64 trace_window{};
-        const auto read = [&fs](u32 address) {
+        using Plan = VideoCommon::OrderedFifoMacro;
+        using Mode = VideoCommon::GpuSplit::OrderedFifoMode;
+        constexpr u32 render = MAXWELL3D_REG_INDEX(render_enable.mode);
+        // Run only in the ordinary, fully tracked, non-draw context. The sustained trace has
+        // other entry contexts too; those stay entirely on the original path.
+        const Plan* plan{};
+        Plan::Params input{};
+        Mode operation = split.OrderedFifoConfigured() ? split.SelectOrderedFifoMode() : Mode::Off;
+        if (operation != Mode::On && fs.mode_pending)
+            ReconcileOrderedMode(split, fs);
+        FrontState::FifoProgram* checking{};
+        auto& counts = split.OrderedFifoStats();
+        if (operation != Mode::Off && parameter_count == 3 && fs.parameters[0] <= 1 &&
+            fs.parameters[1] <= 0x1ffffff && !entry_pending && !entry_instance && !entry_sink &&
+            !fs.regs[MAXWELL3D_REG_INDEX(transform_feedback_enabled)] &&
+            fs.control == Regs::ShadowRamControl::TrackWithFilter && execution_mask[render] &&
+            !execution_mask[0x154] && !execution_mask[0x155] && !execution_mask[0x158] &&
+            rasterizer && !FrontVerifyEnabled() && !VideoCommon::Nx2Perf::Verify() &&
+            !split.TracksMemoryWrites() && !split.MacroDmaTraceActive() &&
+            !Tegra::Nx2CmdPageDiag::g_enabled && !VideoCommon::QueryDma::TraceEnabled()) {
+            auto& slot = fs.programs[start % fs.programs.size()];
+            if (slot.owner != &engine || slot.generation != entry_generation ||
+                slot.start != start ||
+                (slot.compiled &&
+                 !std::equal(slot.compiled->code.begin(),
+                             slot.compiled->code.begin() + slot.compiled->size,
+                             engine.native_code.begin() + static_cast<size_t>(start) * 3))) {
+                slot = {&engine, entry_generation, start,
+                        Plan::Certify(engine.native_code, start, render)};
+            }
+            if (slot.compiled) {
+                std::copy_n(fs.parameters.begin(), input.size(), input.begin());
+                const auto source = (GPUVAddr{input[1]} << 32) | input[2];
+                ++counts.considered;
+                if (!split.OwnedFifoCommands()) {
+                    // Live commands after this call may themselves be written by publication.
+                    ++counts.borrowed;
+                } else if (memory_manager.IsUniqueQueryFifoSource(source)) {
+                    ++counts.admitted;
+                    plan = &*slot.compiled;
+                    if (!slot.verified)
+                        operation = Mode::Verify;
+                    if (operation == Mode::Verify)
+                        checking = &slot;
+                } else {
+                    ++counts.uncertain_source;
+                }
+                if ((counts.considered & 0xffff) == 0)
+                    LOG_INFO(HW_GPU,
+                             "Ordered FIFO considered={} admitted={} checked={} deferred={} "
+                             "reconciled={} mismatches={} uncertain_source={} borrowed={}",
+                             counts.considered, counts.admitted, counts.checked, counts.deferred,
+                             counts.reconciled, counts.mismatches, counts.uncertain_source,
+                             counts.borrowed);
+            }
+        }
+        if (plan && operation == Mode::On) {
+            // Same three front writes, same skip/sink/track rules, exactly the same ring order.
+            FrontWrite(split, fs, 0x154, input[1], true, true);
+            FrontWrite(split, fs, 0x155, input[2], true, true);
+            FrontWrite(split, fs, 0x158, 6, true, true);
+            split.Defer([this, system_ptr = &system, input, recipe = plan->recipe] {
+                const GPUVAddr source = (GPUVAddr{input[1]} << 32) | input[2];
+                Plan::Data words{};
+                constexpr auto bytes = sizeof(words);
+                // The split back owns both caches. Like the original FrontDmaRead, download
+                // dirty buffer bytes first, then publish queries, then fetch all six words.
+                PublishMacroDma(memory_manager, *rasterizer, source, bytes,
+                                [](const auto& operation) { operation(); });
+                for (size_t i = 0; i < words.size(); ++i)
+                    words[i] = memory_manager.Read<u32>(source + sizeof(u32) * i);
+                // Same back action as GpuSplit's Direct method entry. Render mode is executable
+                // and the front never elides it in this context, even on an unchanged result.
+                ConsumeSink(*system_ptr);
+                CallMethod(*system_ptr, render, recipe.Result(input, words), true);
+            });
+            split.NoteOrderedFifoWriter();
+            VideoCommon::Nx2Profile::CountDmaRead(method);
+            if (VideoCommon::Nx2Profile::Enabled())
+                VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::DmaReadBytes,
+                                             sizeof(Plan::Data));
+            fs.mode_pending = true;
+            fs.sink_pending = false;
+            ++counts.deferred;
+            fs.parameters.clear();
+            return;
+        }
+        Plan::Events observed{};
+        Plan::Data returned{};
+        size_t emits{}, collected{};
+        const auto read = [&](u32 address) {
+            if (fs.mode_pending && address == render)
+                ReconcileOrderedMode(split, fs);
             return address < Regs::NUM_REGS ? fs.regs[address] : 0U;
         };
         const auto emit = [&](u32 address, u32 value) {
             if (address >= MacroRegistersStart) {
                 return false;
             }
+            if (plan && emits < observed.size())
+                observed[emits++] = {address, value};
+            else if (plan)
+                ++emits;
             FrontWrite(split, fs, address, value, true, true);
-            // MME_DMA_READ (into data RAM) and MME_DMA_READ_FIFOED (into the load FIFO).
             if (address == 0x157 || address == 0x158) {
+                const size_t before = fs.parameters.size();
                 FrontDmaRead(split, fs, method, address, value, start, parameter_count,
                              entry_pending, entry_instance, entry_sink, entry_shadow,
                              entry_generation, trace_window);
+                if (plan && address == 0x158 && fs.parameters.size() - before == returned.size()) {
+                    std::copy_n(fs.parameters.begin() + before, returned.size(), returned.begin());
+                    ++collected;
+                }
             }
             return true;
         };
@@ -1412,6 +1560,24 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
         const auto result =
             engine.native_interpreter.Execute(engine.native_code, start, fs.parameters, read, emit);
 #endif
+        if (plan) {
+            // Observe only the original's results. The shadow has no rasterizer, memory or
+            // externally visible side effects. All four original writes have already run once.
+            const Plan::Events expected{{{0x154, input[1]},
+                                         {0x155, input[2]},
+                                         {0x158, 6},
+                                         {render, plan->recipe.Result(input, returned)}}};
+            if (result.success && result.consumed == 9 && emits == expected.size() &&
+                collected == 1 && observed == expected) {
+                checking->verified = true;
+                ++counts.checked;
+            } else {
+                ++counts.mismatches;
+                split.RejectOrderedFifo();
+                LOG_ERROR(HW_GPU,
+                          "Ordered FIFO verification mismatch; original execution retained");
+            }
+        }
         if (!result.success) {
             engine.native_execution_failed = true;
             LOG_ERROR(HW_GPU, "Native MME (split front) failed: start={:#x}, consumed={}/{}, error={}",
@@ -1559,19 +1725,10 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                 },
                 VideoCommon::DrainSite::MacroDmaFlush);
         }
-        if (memory_manager.IsMemoryDirty(source, read_bytes, VideoCommon::CacheType::BufferCache)) {
-            split.Run(
-                [memory = &memory_manager, source, read_bytes] {
-                    memory->FlushRegion(source, read_bytes, VideoCommon::CacheType::BufferCache);
-                },
-                VideoCommon::DrainSite::MacroDmaFlush);
-        }
-        split.Run(
-            [this, source, read_bytes] {
-                VideoCommon::QueryDma::FlushPending(memory_manager, *rasterizer, source,
-                                                    read_bytes);
-            },
-            VideoCommon::DrainSite::MacroDmaFlush);
+        PublishMacroDma(memory_manager, *rasterizer, source, read_bytes,
+                        [&](const auto& operation) {
+                            split.Run(operation, VideoCommon::DrainSite::MacroDmaFlush);
+                        });
     };
     // Only the work still queued that can write the words has to run first (FrontNoteWrites,
     // GpuSplit::WaitForWrites). Past it no entry can make them GPU-written or add reports there,
@@ -1628,6 +1785,7 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
 }
 
 void Maxwell3D::FrontVerify(VideoCommon::GpuSplit& split, FrontState& fs) {
+    ReconcileOrderedMode(split, fs);
     split.Drain(VideoCommon::DrainSite::FrontVerify);
     static u64 checks{};
     static u64 differences{};

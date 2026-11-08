@@ -1,3 +1,4 @@
+#include <fstream>
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -402,6 +403,15 @@ void GpuSplit::MaybeStart(Core::System& system_) {
         const char* value = std::getenv(name);
         return value && std::string_view{value} == "1";
     };
+    const char* const fifo = std::getenv("STITCH_ORDERED_FIFO_MACRO");
+    ordered_fifo_mode =
+        fifo && std::string_view{fifo} == "verify" ? OrderedFifoMode::Verify : OrderedFifoMode::Off;
+    ordered_fifo_marker = std::getenv("STITCH_ORDERED_FIFO_MODE_FILE");
+    ordered_fifo_polls = 0;
+    ordered_fifo_selected = OrderedFifoMode::Verify;
+    ordered_fifo_stats = {};
+    fifo_position = fifo_batch = fifo_observer_joins = 0;
+    fifo_backing = CommandBacking::GuestMayChange;
     front_wait_probe.Start();
     writer_requested = enabled("STITCH_WRITER_FRONTIER");
     writer_verify = enabled("STITCH_WRITER_VERIFY");
@@ -433,6 +443,8 @@ void GpuSplit::Stop() {
     // wrap at a time and never reached the old write position (the next game's first GPU work
     // never ran, it waited on its syncpoint forever), and the engines it held were freed.
     ring.reset();
+    fifo_position = fifo_batch = 0;
+    fifo_backing = CommandBacking::GuestMayChange;
     write_position = 0;
     last_writer_position = 0;
     last_sync_position = 0;
@@ -506,6 +518,81 @@ void GpuSplit::Publish() {
         wake.fetch_add(1, std::memory_order_seq_cst);
         wake.notify_one();
     }
+}
+
+GpuSplit::CommandBacking GpuSplit::EnterFifoCommandScope(CommandBacking backing) {
+    JoinOrderedFifo(FifoJoin::FrontObserver);
+    return std::exchange(fifo_backing, backing);
+}
+void GpuSplit::LeaveFifoCommandScope(CommandBacking previous) {
+    // Push can refresh deferred entries / re-snapshot after suspension before the next
+    // list-writer gate. Never expose such frontend observers to an unfinished publication.
+    JoinOrderedFifo(FifoJoin::EndOfEntry);
+    fifo_backing = previous;
+}
+void GpuSplit::NoteOrderedFifoWriter() {
+    NoteWriter();
+    fifo_position = write_position;
+    ++fifo_batch;
+}
+void GpuSplit::JoinOrderedFifo(FifoJoin reason) {
+    if (!fifo_position)
+        return;
+    const auto target = std::exchange(fifo_position, 0);
+    const auto batch = std::exchange(fifo_batch, 0);
+    auto& c = ordered_fifo_stats;
+    ++c.groups;
+    c.peak_group = std::max(c.peak_group, batch);
+    c.later_ring_words += write_position - target;
+    fifo_observer_joins += reason == FifoJoin::FrontObserver;
+    const auto start = std::chrono::steady_clock::now();
+    if (WaitFor(target, DrainSite::FifoPublication)) {
+        ++c.waited_groups;
+        c.wait_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                         std::chrono::steady_clock::now() - start)
+                         .count();
+    }
+    if ((c.groups & 0xffff) == 0)
+        LOG_INFO(HW_GPU,
+                 "Ordered FIFO publication groups={} blocked={} wait_ns={} "
+                 "observer_joins={} deferred={} peak_group={} queued_words_after_fifo={}",
+                 c.groups, c.waited_groups, c.wait_ns, fifo_observer_joins, c.deferred,
+                 c.peak_group, c.later_ring_words);
+}
+
+GpuSplit::OrderedFifoMode GpuSplit::SelectOrderedFifoMode() {
+    if (ordered_fifo_failed || ordered_fifo_mode == OrderedFifoMode::Off)
+        return OrderedFifoMode::Off;
+    if (!ordered_fifo_marker || !*ordered_fifo_marker)
+        return ordered_fifo_mode;
+    if ((ordered_fifo_polls++ % 4096) == 0) {
+        OrderedFifoMode next = OrderedFifoMode::Off;
+        const std::filesystem::path file{ordered_fifo_marker};
+        std::error_code ec;
+        if (file.is_absolute() && std::filesystem::is_regular_file(file, ec) && !ec) {
+            std::ifstream stream(file, std::ios::binary);
+            std::array<char, 12> bytes{};
+            stream.read(bytes.data(), bytes.size());
+            if (stream.eof() && !stream.bad()) {
+                std::string_view value(bytes.data(), static_cast<size_t>(stream.gcount()));
+                if (value.ends_with("\n"))
+                    value.remove_suffix(1);
+                if (value == "verify")
+                    next = OrderedFifoMode::Verify;
+                else if (value == "candidate")
+                    next =
+                        ordered_fifo_stats.checked ? OrderedFifoMode::On : OrderedFifoMode::Verify;
+            }
+        }
+        if (next != ordered_fifo_selected)
+            LOG_INFO(HW_GPU, "Ordered FIFO mode={} checked={} mismatches={}",
+                     next == OrderedFifoMode::On       ? "candidate"
+                     : next == OrderedFifoMode::Verify ? "verify"
+                                                       : "baseline",
+                     ordered_fifo_stats.checked, ordered_fifo_stats.mismatches);
+        ordered_fifo_selected = next;
+    }
+    return ordered_fifo_selected;
 }
 
 bool GpuSplit::MacroDmaTraceActive() const {

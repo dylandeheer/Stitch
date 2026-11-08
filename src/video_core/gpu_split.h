@@ -31,27 +31,41 @@ namespace VideoCommon {
 /// Why the split's front waited for its back (EDEN_NX2_GPU_PROFILE counts each).
 enum class DrainSite : u32 {
     Other,
-    FetchDrain,     ///< EDEN_NX2_FETCH_DRAIN: before every entry
-    Acquire,        ///< A semaphore acquire reads the value the back may release
-    SemaphoreFlush, ///< The acquired semaphore is in the buffer cache
-    FenceRelease,   ///< The puller's acquires release the pending fences
-    ListWriters,    ///< GPU-written command lists: the dispatches and copies sent before them
-    ListSync,       ///< Command lists on draw-written pages: the work before the last host sync
-    ListFlush,      ///< Command lists on GPU-written pages: drain and flush the pages
-    MacroDmaRead,   ///< The front's macros read memory (MME DMA) the caches may still write
-    MacroDmaWrites, ///< Those reads: the queued work that can write the words (WaitForWrites)
-    MacroDmaFlush,  ///< Those words are in the buffer cache
-    GpSyncFence,    ///< A GP entry's sync bit (sync_memory_operations)
-    Map,            ///< GPU memory maps before later command reads
-    FrontStart,     ///< The front takes an engine's macros over
-    FrontVerify,    ///< EDEN_NX2_FRONT_VERIFY
+    FetchDrain,      ///< EDEN_NX2_FETCH_DRAIN: before every entry
+    Acquire,         ///< A semaphore acquire reads the value the back may release
+    SemaphoreFlush,  ///< The acquired semaphore is in the buffer cache
+    FenceRelease,    ///< The puller's acquires release the pending fences
+    ListWriters,     ///< GPU-written command lists: the dispatches and copies sent before them
+    ListSync,        ///< Command lists on draw-written pages: the work before the last host sync
+    ListFlush,       ///< Command lists on GPU-written pages: drain and flush the pages
+    MacroDmaRead,    ///< The front's macros read memory (MME DMA) the caches may still write
+    MacroDmaWrites,  ///< Those reads: the queued work that can write the words (WaitForWrites)
+    MacroDmaFlush,   ///< Those words are in the buffer cache
+    GpSyncFence,     ///< A GP entry's sync bit (sync_memory_operations)
+    Map,             ///< GPU memory maps before later command reads
+    FrontStart,      ///< The front takes an engine's macros over
+    FrontVerify,     ///< EDEN_NX2_FRONT_VERIFY
+    FifoPublication, ///< Deferred query/dirty publication before a frontend observer
     Count,
 };
 
 inline constexpr std::array<const char*, static_cast<size_t>(DrainSite::Count)> drain_site_names{
-    "other",           "fetch drain",   "acquire",    "semaphore flush", "fence release",
-    "list writers",    "list sync",     "list flush", "macro dma read",  "macro dma writes",
-    "macro dma flush", "gp sync fence", "map",        "front start",     "front verify",
+    "other",
+    "fetch drain",
+    "acquire",
+    "semaphore flush",
+    "fence release",
+    "list writers",
+    "list sync",
+    "list flush",
+    "macro dma read",
+    "macro dma writes",
+    "macro dma flush",
+    "gp sync fence",
+    "map",
+    "front start",
+    "front verify",
+    "fifo publication",
 };
 
 // Splits the GPU thread in two (NX2_GPU_THREAD_SPLIT.md). The GPU thread (the front) takes the
@@ -106,6 +120,36 @@ public:
     /// commands read without cache flushes). Called by the front between commands.
     void MaybeStart(Core::System& system);
     void Stop();
+    enum class CommandBacking { GuestMayChange, Owned };
+    enum class FifoJoin { EndOfEntry, FrontObserver };
+    // ProcessCommands supplies the source type and restores the previous scope. A scope
+    // may end only after prior FIFO publications are complete, including query-only writes.
+    CommandBacking EnterFifoCommandScope(CommandBacking backing);
+    void LeaveFifoCommandScope(CommandBacking previous);
+    void NoteOrderedFifoWriter();
+    void JoinOrderedFifo(FifoJoin reason);
+    bool HasFifoPublication() const {
+        return fifo_position != 0;
+    }
+    bool OwnedFifoCommands() const {
+        return fifo_backing == CommandBacking::Owned;
+    }
+    enum class OrderedFifoMode { Off, Verify, On };
+    OrderedFifoMode SelectOrderedFifoMode();
+    bool OrderedFifoConfigured() const {
+        return ordered_fifo_mode != OrderedFifoMode::Off;
+    }
+    void RejectOrderedFifo() {
+        ordered_fifo_failed = true;
+    }
+    struct OrderedFifoCounters {
+        u64 admitted{}, checked{}, deferred{}, reconciled{}, mismatches{}, uncertain_source{};
+        u64 considered{}, borrowed{}, groups{}, waited_groups{}, wait_ns{}, peak_group{},
+            later_ring_words{};
+    };
+    OrderedFifoCounters& OrderedFifoStats() {
+        return ordered_fifo_stats;
+    } // split front only
 
     /// What the sender of an entry tells about the guest memory the back writes running it, for
     /// the front's reads of guest memory (WaitForWrites).
@@ -325,6 +369,14 @@ private:
 
     // Front side.
     u64 write_position{};
+    OrderedFifoCounters ordered_fifo_stats{};
+    CommandBacking fifo_backing{CommandBacking::GuestMayChange};
+    u64 fifo_position{}, fifo_batch{}, fifo_observer_joins{};
+    OrderedFifoMode ordered_fifo_mode{OrderedFifoMode::Off};
+    bool ordered_fifo_failed{};
+    OrderedFifoMode ordered_fifo_selected{OrderedFifoMode::Verify};
+    u32 ordered_fifo_polls{};
+    const char* ordered_fifo_marker{};
     u64 last_writer_position{};
     u64 last_sync_position{};
     /// After the last entry that may write guest memory anywhere (NoteAnyWrite), the last one

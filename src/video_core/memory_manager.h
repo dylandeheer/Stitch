@@ -84,6 +84,10 @@ public:
     /// addresses throughout the read and no device mapping changed since the cache checks.
     bool TryReadUniqueWords(GPUVAddr address, std::span<u32> dest, u64 generation) const;
 
+    /// At admission only. The deferred callback must still perform all ordinary buffer/query
+    /// publication and reads at its actual position. Reject split pages and syncpoint shims.
+    bool IsUniqueQueryFifoSource(GPUVAddr addr) const;
+
     template <typename T>
     [[nodiscard]] T Read(GPUVAddr addr) const;
 
