@@ -110,17 +110,33 @@ struct GPU::Impl {
     /// Synchronizes CPU writes with Host GPU memory.
     void InvalidateGPUCache() {
         std::vector<std::pair<DAddr, u64>> writes;
-        std::function<void(PAddr, size_t)> callback_writes(
-            [&writes](PAddr address, size_t size) { writes.emplace_back(address, size); });
-        system.GatherGPUDirtyMemory(callback_writes);
-        if (!writes.empty()) {
-            renderer->ReadRasterizer()->OnCacheInvalidations(writes);
+        {
+            // Gathered writes stay pending (ForEachPendingCpuWrite) until they are applied: a
+            // download written to guest memory meanwhile on another thread would
+            // otherwise write the GPU's older bytes over them.
+            std::scoped_lock lock{applying_writes_mutex};
+            std::function<void(PAddr, size_t)> callback_writes(
+                [&writes](PAddr address, size_t size) { writes.emplace_back(address, size); });
+            system.GatherGPUDirtyMemory(callback_writes);
+            if (writes.empty()) {
+                return;
+            }
+            applying_writes.push_back(&writes);
         }
+        renderer->ReadRasterizer()->OnCacheInvalidations(writes);
+        std::scoped_lock lock{applying_writes_mutex};
+        std::erase(applying_writes, &writes);
     }
 
     void ForEachPendingCpuWrite(const std::function<void(DAddr, size_t)>& callback) {
+        std::scoped_lock lock{applying_writes_mutex};
         for (auto& manager : system.GetGPUDirtyMemoryManager()) {
             manager.ForEachPending(callback);
+        }
+        for (const auto* writes : applying_writes) {
+            for (const auto& [address, size] : *writes) {
+                callback(address, size);
+            }
         }
     }
 
@@ -375,6 +391,9 @@ struct GPU::Impl {
     u64 last_sync_fence{};
 
     VideoCommon::PendingMaps pending_maps;
+    std::mutex applying_writes_mutex;
+    std::vector<const std::vector<std::pair<DAddr, u64>>*> applying_writes;
+
     std::mutex sync_request_mutex;
     std::condition_variable sync_request_cv;
 
