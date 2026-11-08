@@ -1369,3 +1369,32 @@ TEST_CASE("Source policy preserves decoded R32 bytes through both copy paths", "
 #endif
     }
 }
+
+TEST_CASE("Native write marks cover shader-visible padding independent of the CPU snapshot",
+          "[buffer_ports][storage_extent]") {
+    Fixture f;
+    constexpr GPUVAddr base = 0x200000;
+    f.memory->Map(base, 0x20000, 0x10000, Tegra::PTEKind::PITCH, true);
+    const auto buffer = Access::Add(*f.cache, 0x20000, 0x10000);
+    const u32 alignment = GENERATE(16, 256, 4096);
+    f.runtime.alignment = alignment;
+    for (int pass = 0; pass < 2; ++pass) { // Cold construction, then the cached binding.
+        f.Descriptor(base, 0); // CPU sees no padding.
+        const auto binding = f.Bind(true, true);
+        REQUIRE(binding.gpu_addr == base);
+        REQUIRE(binding.size == 0x10000); // Reads retain the complete binding.
+        const Shader::StorageWriteExtent extent{.bounded = true, .const_end = 4090};
+        const auto reach = Shader::ResolveStorageWriteExtent(
+            extent, {1, 1, 1}, std::array<u32, 3>{1, 1, 1});
+        REQUIRE(reach.has_value());
+        const auto mark = static_cast<u32>(
+            Shader::AlignedStorageWriteMark(*reach, alignment, binding.size));
+        // Every shader-visible pointer pad is covered even if its UBO differs from the CPU word.
+        for (u32 shader_pad = 0; shader_pad < alignment; ++shader_pad) {
+            REQUIRE(mark >= *reach + shader_pad);
+        }
+        Access::StorageWrite(*f.cache, buffer, binding.device_addr, mark, true);
+        REQUIRE(Access::Pending(*f.cache, binding.device_addr + mark - 1, 1));
+        REQUIRE_FALSE(Access::Pending(*f.cache, binding.device_addr + mark, 1));
+    }
+}
