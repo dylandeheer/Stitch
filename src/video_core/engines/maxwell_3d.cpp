@@ -24,6 +24,7 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
+#include "video_core/macro_image_capture.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_cmdpage_diag.h"
@@ -1050,6 +1051,7 @@ struct Maxwell3D::FrontState {
     /// The back holds state writes in its method sink, which its next executable method consumes
     /// (issuing a deferred draw a changed one ends). Front() consumes it before copying the state.
     bool sink_pending{};
+    VideoCommon::MacroImageCapture::CheckedImage checked_capture{};
     u32 split_start{}; ///< GpuSplit::Starts() when this copy was made
     bool skip_same{}; ///< SkipSameValueWrites() && FrontSkipSame(), read once
     /// The back's draw manager is in an instance loop (DrawMode::Instance): draw.end does nothing.
@@ -1357,6 +1359,21 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
     auto& engine = GetNativeMacroEngine();
     const auto positions = GetNativeMacroPositions();
     const u32 start = positions[((method - MacroRegistersStart) >> 1) % positions.size()];
+    static const char* const capture_path = std::getenv("STITCH_PRIVATE_MME_IMAGE");
+    if (capture_path && *capture_path && method == 0xe2c && start == 0x142) {
+        using Capture = VideoCommon::MacroImageCapture;
+        static Capture capture;
+        static const std::filesystem::path file{capture_path};
+        const auto result = capture.Try(
+            file, {macro_trace_channel, memory_manager.GetID(), method, start,
+                   engine.native_code_generation},
+            &engine, engine.native_code, fs.checked_capture);
+        if (result == Capture::Result::Saved || result == Capture::Result::Failed) {
+            LOG_INFO(HW_GPU, "Private MME instruction capture {} (generation {}, hash {:016x})",
+                     result == Capture::Result::Saved ? "saved" : "failed",
+                     engine.native_code_generation, Capture::TargetHash);
+        }
+    }
     VideoCommon::Nx2Profile::CountMethod(method, false);
     {
         VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Macro};

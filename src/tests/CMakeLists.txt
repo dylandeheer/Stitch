@@ -82,6 +82,7 @@ add_executable(tests
     video_core/split_fence_wait.cpp
     video_core/command_snapshot_suspensions.cpp
     video_core/pending_maps.cpp
+    video_core/macro_image_capture.cpp
     video_core/maxwell_fast_method.cpp
     hid_core/sensor_info.cpp
     common/paged_scalar.cpp
