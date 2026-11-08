@@ -6,6 +6,8 @@
 
 #pragma once
 
+#include "video_core/readback_trace.h"
+
 #include "video_core/buffer_cache/uniform_cache_history.h"
 
 #include <algorithm>
@@ -1050,6 +1052,7 @@ template <class P>
 void BufferCache<P>::WriteDownloadedMemory(const Common::RangeSet<DAddr>& cpu_written,
                                            DAddr device_addr, const u8* data, u64 size) {
     if (!cpu_written.Intersects(device_addr, size)) {
+        if (auto* trace = VideoCore::ReadbackTrace::active) trace->buffer_bytes += size;
         device_memory.WriteBlockUnsafe(device_addr, data, size);
         return;
     }
@@ -1059,6 +1062,7 @@ void BufferCache<P>::WriteDownloadedMemory(const Common::RangeSet<DAddr>& cpu_wr
         parts.Subtract(start, end - start);
     });
     parts.ForEach([&](DAddr start, DAddr end) {
+        if (auto* trace = VideoCore::ReadbackTrace::active) trace->buffer_bytes += end - start;
         device_memory.WriteBlockUnsafe(start, data + (start - device_addr), end - start);
     });
 }

@@ -7,10 +7,13 @@
 
 namespace VideoCore {
 
+enum class DownloadSource : u8 { Other, Texture, Buffer };
+
 struct RasterizerDownloadArea {
     VAddr start_address;
     VAddr end_address;
     bool preemtive;
+    DownloadSource source{};
 };
 
 } // namespace VideoCore
