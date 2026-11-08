@@ -34,6 +34,7 @@
 #include "common/settings.h"
 #include "common/slot_vector.h"
 #include "shader_recompiler/shader_info.h"
+#include "video_core/buffer_cache/recent_read_pages.h"
 #include "video_core/buffer_cache/buffer_base.h"
 #include "video_core/buffer_cache/read_trap_tracker.h"
 #include "video_core/buffer_cache/virtual_range_cache.h"
@@ -738,6 +739,11 @@ private:
     /// writes in all of them, so the reads that usually follow it find nothing left to flush.
     Common::RangeSet<DAddr> cpu_read_ranges;
     bool download_cpu_read_ranges{};
+    RecentReadPages recent_read_pages;
+    u64 history_pages{};
+    u64 recent_read_generation{};
+    const char* read_batch_baseline_file = std::getenv("STITCH_BOUNDED_READ_BATCH_BASELINE_FILE");
+    bool bounded_read_batch = false;
     Common::RangeSet<DAddr> gpu_modified_ranges;
     std::deque<Common::RangeSet<DAddr>> committed_gpu_modified_ranges;
 

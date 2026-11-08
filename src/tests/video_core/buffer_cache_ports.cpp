@@ -177,6 +177,12 @@ using Cache = VideoCommon::BufferCache<Policy>;
 namespace VideoCommon {
 
 struct BufferCacheTestAccess {
+    static void DemandBatch(Cache& cache, u64 frame, bool bounded) {
+        cache.frame_tick = frame;
+        cache.read_batch_baseline_file = "test";
+        cache.bounded_read_batch = bounded;
+    }
+
     static Binding Bind(Cache& cache, Tegra::MemoryManager& memory, GPUVAddr descriptor,
                         bool written = false, bool native = false, bool table = false) {
         cache.gpu_memory = &memory;
@@ -757,4 +763,70 @@ TEST_CASE("Readback tracing recognizes exact page reuse after compute storage wr
     constexpr DAddr collision = page + 64 * 4096;
     REQUIRE_FALSE(trace.Read(collision, collision + 4096));
     REQUIRE_FALSE(trace.Read(page, page + 4096));
+}
+
+
+TEST_CASE("Bounded buffer readback lands full demand and leaves cold GPU data pending",
+          "[buffer_ports][bounded_read_batch]") {
+    Fixture f;
+    const bool mapped = GENERATE(false, true);
+    const bool bounded = GENERATE(false, true);
+    const auto id = Access::Add(*f.cache, 0x20000, 0x10000, mapped);
+    std::ranges::fill(Access::Get(*f.cache, id).bytes, 0xa5);
+    const bool old = Tegra::g_nx2_ampere.exchange(true);
+    SCOPE_EXIT { Tegra::g_nx2_ampere = old; };
+    Access::Dirty(*f.cache, 0x20000, 0x10000);
+    Access::DemandBatch(*f.cache, 3, bounded);
+    REQUIRE_FALSE(f.cache->GetFlushArea(0x20100, 4)->preemtive);
+    Access::DemandBatch(*f.cache, 12, bounded);
+    for (u64 page = 1; page < 11; ++page) {
+        REQUIRE_FALSE(f.cache->GetFlushArea(0x20000 + 4096 * page, 4)->preemtive);
+    }
+    // Eight small recent optional pages plus the complete three-page demand.
+    REQUIRE_FALSE(f.cache->GetFlushArea(0x2d000, 0x3000)->preemtive);
+    f.cache->DownloadMemory(0x2d000, 0x3000);
+    REQUIRE(f.runtime.finishes == 1);
+    REQUIRE(f.bytes[0x10000] == (bounded ? 0 : 0xa5));
+    REQUIRE(f.bytes[0x11000] == (bounded ? 0 : 0xa5));
+    REQUIRE(f.bytes[0x13000] == 0xa5);
+    REQUIRE(f.bytes[0x1afff] == 0xa5);
+    REQUIRE(f.bytes[0x1b000] == 0);
+    REQUIRE(f.bytes[0x1d000] == 0xa5);
+    REQUIRE(f.bytes[0x1ffff] == 0xa5);
+    REQUIRE(Access::Pending(*f.cache, 0x20000, 0x1000) == bounded);
+    // A cold page remains fully coherent on a later demand.
+    f.cache->DownloadMemory(0x20000, 0x1000);
+    REQUIRE(f.bytes[0x10000] == 0xa5);
+    REQUIRE_FALSE(Access::Pending(*f.cache, 0x20000, 0x1000));
+}
+
+
+TEST_CASE("Optional buffer pages cannot follow a remap or identical physical alias",
+          "[buffer_ports][bounded_read_batch]") {
+    Fixture f;
+    const bool remap_after_learning = GENERATE(false, true);
+    constexpr DAddr demand = 0x20000;
+    constexpr DAddr extra = 0x21000;
+    const bool old = Tegra::g_nx2_ampere.exchange(true);
+    SCOPE_EXIT { Tegra::g_nx2_ampere = old; };
+    if (!remap_after_learning) f.device.Map(0x60000, extra, 0x1000, f.asid);
+    SCOPE_EXIT {
+        if (!remap_after_learning) f.device.Unmap(0x60000, 0x1000);
+    };
+    const auto id = Access::Add(*f.cache, demand, 0x2000);
+    std::ranges::fill(Access::Get(*f.cache, id).bytes, 0xa8);
+    Access::Dirty(*f.cache, demand, 0x2000);
+    Access::DemandBatch(*f.cache, 1, true);
+    REQUIRE_FALSE(f.cache->GetFlushArea(extra, 4)->preemtive);
+    REQUIRE_FALSE(f.cache->GetFlushArea(demand, 4)->preemtive);
+    if (remap_after_learning) {
+        f.device.Unmap(extra, 0x1000);
+        f.device.Map(extra, 0x30000, 0x1000, f.asid);
+    }
+    f.cache->DownloadMemory(demand, 0x1000);
+    REQUIRE(f.bytes[0x10000] == 0xa8);
+    REQUIRE(f.bytes[0x11000] == 0);
+    REQUIRE(f.bytes[0x20000] == 0);
+    REQUIRE(Access::Pending(*f.cache, extra, 0x1000));
+    REQUIRE(f.runtime.finishes == 1);
 }

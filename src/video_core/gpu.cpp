@@ -279,6 +279,8 @@ struct GPU::Impl {
                 std::atomic<bool> complete{};
             };
             const auto record = std::make_shared<Record>();
+            record->event.demand_begin = raster_area.start_address;
+            record->event.demand_end = raster_area.end_address;
             const auto arrival = Trace::Clock::now();
             const u64 fence = RequestSyncOperation([record, flush] {
                 {

@@ -31,7 +31,14 @@ inline u64 ElapsedNs(Clock::time_point begin, Clock::time_point end) {
 
 struct Flush {
     Clock::time_point began{}, ended{};
-    u64 wait_ns{}, buffer_bytes{};
+    u64 wait_ns{}, buffer_bytes{}, demanded_buffer_bytes{}, history_pages_skipped{};
+    DAddr demand_begin{}, demand_end{};
+    void Landed(DAddr begin, u64 size) {
+        buffer_bytes += size;
+        const auto start = std::max(demand_begin, begin);
+        const auto end = std::min(demand_end, begin + size);
+        if (start < end) demanded_buffer_bytes += end - start;
+    }
 };
 
 inline thread_local Flush* active{};
@@ -88,7 +95,7 @@ class Windows {
     };
     struct Totals {
         u64 reads{}, bytes{}, queue{}, flush{}, wake{}, wait{}, buffer_bytes{}, overflow{};
-        u64 repeat_compute{}, repeat_wall{};
+        u64 repeat_compute{}, repeat_wall{}, demanded_buffer_bytes{}, history_pages_skipped{};
         std::array<u64, Core::Hardware::NUM_CPU_CORES + 1> core_wall{};
         std::array<Range, 128> ranges{};
         size_t count{};
@@ -111,6 +118,8 @@ public:
         }
         source.bytes += area.end_address - area.start_address;
         source.buffer_bytes += event.buffer_bytes;
+        source.demanded_buffer_bytes += event.demanded_buffer_bytes;
+        source.history_pages_skipped += event.history_pages_skipped;
         source.queue += ElapsedNs(arrival, event.began);
         source.flush += ElapsedNs(event.began, event.ended);
         source.wake += ElapsedNs(event.ended, returned);
@@ -145,11 +154,13 @@ public:
                 "landed_buffer_bytes={} queue_ms={:.3f} flush_ms={:.3f} wake_ms={:.3f} "
                 "vk_finish_wait_ms={:.3f} hottest=[{:#x},{:#x}) hot_reads={} hot_wall_ms={:.3f} "
                 "untracked_reads={} read_after_compute_rewrite={} rewrite_wall_ms={:.3f} "
-                "top_host_core_bucket={} top_core_wall_ms={:.3f}",
+                "top_host_core_bucket={} top_core_wall_ms={:.3f} landed_demand_bytes={} "
+                "landed_extra_bytes={} skipped_history_page_visits={}",
                 ElapsedNs(since, now) / 1.e6, names[i], t.reads, t.bytes, t.buffer_bytes,
                 t.queue / 1.e6, t.flush / 1.e6, t.wake / 1.e6, t.wait / 1.e6,
                 hottest->begin, hottest->end, hottest->reads, hottest->wall / 1.e6, t.overflow, t.repeat_compute,
-                t.repeat_wall / 1.e6, slowest - t.core_wall.begin(), *slowest / 1.e6);
+                t.repeat_wall / 1.e6, slowest - t.core_wall.begin(), *slowest / 1.e6, t.demanded_buffer_bytes,
+                t.buffer_bytes - t.demanded_buffer_bytes, t.history_pages_skipped);
         }
         sources = {};
         since = now;

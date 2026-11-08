@@ -6,6 +6,8 @@
 
 #pragma once
 
+#include <filesystem>
+
 #include "video_core/readback_trace.h"
 
 #include "video_core/buffer_cache/uniform_cache_history.h"
@@ -112,6 +114,14 @@ void BufferCache<P>::TickFrame() {
     // Homebrew console apps don't create or bind any channels, so this will be nullptr.
     if (!channel_state) {
         return;
+    }
+    if (read_batch_baseline_file && *read_batch_baseline_file && frame_tick % 16 == 0) {
+        std::error_code ec;
+        const bool bounded = !std::filesystem::exists(read_batch_baseline_file, ec) && !ec;
+        if (bounded != bounded_read_batch || frame_tick == 0) {
+            LOG_INFO(HW_GPU, "Reactive buffer batch: {}", bounded ? "recent pages" : "historical ranges");
+        }
+        bounded_read_batch = bounded;
     }
     runtime.TickFrame(slot_buffers);
     native_indirect_uniforms_this_frame.clear();
@@ -300,7 +310,22 @@ std::optional<VideoCore::RasterizerDownloadArea> BufferCache<P>::GetFlushArea(DA
                 device_addr_start_aligned, device_addr_end_aligned - device_addr_start_aligned);
         } else {
             if constexpr (USE_MEMORY_MAPS) {
+                if (read_batch_baseline_file && VideoCore::ReadbackTrace::Enabled()) {
+                    u64 added = area->end_address - area->start_address;
+                    cpu_read_ranges.ForEachInRange(area->start_address, added, [&](DAddr first, DAddr last) {
+                        added -= last - first;
+                    });
+                    history_pages += added / RecentReadPages::PageSize;
+                }
                 cpu_read_ranges.Add(area->start_address, area->end_address - area->start_address);
+                if (read_batch_baseline_file) {
+                    const u64 generation = device_memory.MappingGeneration();
+                    if (recent_read_generation != generation) {
+                        recent_read_generation = generation;
+                        recent_read_pages = {};
+                    }
+                    recent_read_pages.Read(area->start_address, area->end_address, frame_tick);
+                }
                 download_cpu_read_ranges = true;
             }
             // The core consumed this trap before GetFlushArea. Forget it so the next GPU write
@@ -323,6 +348,32 @@ void BufferCache<P>::DownloadMemory(DAddr device_addr, u64 size) {
         if (download_cpu_read_ranges) {
             download_cpu_read_ranges = false;
             boost::container::small_vector<std::pair<DAddr, u64>, 16> ranges{{device_addr, size}};
+            if (bounded_read_batch) {
+                std::array<DAddr, RecentReadPages::Capacity> extra{};
+                size_t count = 0;
+                recent_read_pages.ForEachExtra(device_addr, size, frame_tick,
+                                               [&](DAddr start, u64) { extra[count++] = start; });
+                if (count != 0) {
+                    const auto pages = std::span{extra}.first(count);
+                    device_memory.WithUniquePhysicalPages(pages, recent_read_generation, [&] {
+                        for (DAddr address : pages) {
+                            ranges.emplace_back(address, RecentReadPages::PageSize);
+                        }
+                    });
+                }
+                if (auto* trace = VideoCore::ReadbackTrace::active) {
+                    u64 demand_history = 0;
+                    const auto first = Common::AlignDown(device_addr, RecentReadPages::PageSize);
+                    const auto end = Common::AlignUp(device_addr + size, RecentReadPages::PageSize);
+                    cpu_read_ranges.ForEachInRange(first, end - first, [&](DAddr lo, DAddr hi) {
+                        demand_history += (hi - lo) / RecentReadPages::PageSize;
+                    });
+                    const u64 considered = demand_history + ranges.size() - 1;
+                    trace->history_pages_skipped += history_pages - std::min(history_pages, considered);
+                }
+                DownloadRangesMemory(ranges);
+                return;
+            }
             cpu_read_ranges.ForEach([&](DAddr lower, DAddr upper) {
                 gpu_modified_ranges.ForEachInRange(lower, upper - lower,
                                                    [&](DAddr start, DAddr end) {
@@ -1056,7 +1107,7 @@ template <class P>
 void BufferCache<P>::WriteDownloadedMemory(const Common::RangeSet<DAddr>& cpu_written,
                                            DAddr device_addr, const u8* data, u64 size) {
     if (!cpu_written.Intersects(device_addr, size)) {
-        if (auto* trace = VideoCore::ReadbackTrace::active) trace->buffer_bytes += size;
+        if (auto* trace = VideoCore::ReadbackTrace::active) trace->Landed(device_addr, size);
         device_memory.WriteBlockUnsafe(device_addr, data, size);
         return;
     }
@@ -1066,7 +1117,7 @@ void BufferCache<P>::WriteDownloadedMemory(const Common::RangeSet<DAddr>& cpu_wr
         parts.Subtract(start, end - start);
     });
     parts.ForEach([&](DAddr start, DAddr end) {
-        if (auto* trace = VideoCore::ReadbackTrace::active) trace->buffer_bytes += end - start;
+        if (auto* trace = VideoCore::ReadbackTrace::active) trace->Landed(start, end - start);
         device_memory.WriteBlockUnsafe(start, data + (start - device_addr), end - start);
     });
 }
@@ -2882,7 +2933,16 @@ void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
     }
     read_trapped_ranges.Subtract(slot_buffers[buffer_id].CpuAddr(),
                                  slot_buffers[buffer_id].SizeBytes());
+    if (read_batch_baseline_file && VideoCore::ReadbackTrace::Enabled()) {
+        cpu_read_ranges.ForEachInRange(slot_buffers[buffer_id].CpuAddr(), slot_buffers[buffer_id].SizeBytes(),
+                                      [&](DAddr lo, DAddr hi) {
+            history_pages -= (hi - lo) / RecentReadPages::PageSize;
+        });
+    }
     cpu_read_ranges.Subtract(slot_buffers[buffer_id].CpuAddr(), slot_buffers[buffer_id].SizeBytes());
+    if (read_batch_baseline_file) {
+        recent_read_pages.Forget(slot_buffers[buffer_id].CpuAddr(), slot_buffers[buffer_id].SizeBytes());
+    }
     bool dirty_index{false};
     boost::container::small_vector<u64, NUM_VERTEX_BUFFERS> dirty_vertex_buffers;
     const auto scalar_replace = [buffer_id](Binding& binding) {
