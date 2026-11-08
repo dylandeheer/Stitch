@@ -4,11 +4,14 @@
 // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
 #include <cstddef>
+#include <cstdlib>
 #include <limits>
 #include <map>
 #include <memory>
 #include <span>
+#include <string_view>
 #include <type_traits>
 #include "common/container/unordered_map.h"
 #include <utility>
@@ -141,6 +144,9 @@ public:
                              DescriptorPool& descriptor_pool)
         : BaseStreamer(id_), texture_cache{texture_cache_}, runtime{runtime_}, rasterizer{rasterizer_}, device{device_},
           scheduler{scheduler_}, memory_allocator{memory_allocator_} {
+        const char* sparse = std::getenv("EDEN_NX2_SPARSE_SAMPLE_COPIES");
+        sparse_direct_copies = device.GetDriverID() == VK_DRIVER_ID_MESA_RADV && sparse &&
+                               std::string_view{sparse} == "1";
         current_bank = nullptr;
         current_query = nullptr;
         amend_value = 0;
@@ -270,42 +276,14 @@ public:
         sync_values_stash.emplace_back();
         std::vector<HostSyncValues>* sync_values = &sync_values_stash.back();
         sync_values->reserve(num_slots_used);
-        ::Common::unordered_map<size_t, std::pair<size_t, size_t>> offsets;
+        BankOffsets offsets;
         resolve_buffers.clear();
         size_t resolve_buffer_index = ObtainBuffer<true>(num_slots_used);
         resolve_buffers.push_back(resolve_buffer_index);
-        size_t base_offset = 0;
-
-        ApplyBanksWideOp<true>(pending_sync, [&](SamplesQueryBank* bank, size_t start,
-                                                 size_t amount) {
-            size_t bank_id = bank->GetIndex();
-            auto& resolve_buffer = buffers[resolve_buffer_index];
-            VkQueryPool query_pool = bank->GetInnerPool();
-            scheduler.RequestOutsideRenderPassOperationContext();
-            scheduler.Record([start, amount, base_offset, query_pool,
-                              buffer = *resolve_buffer](vk::CommandBuffer cmdbuf) {
-                const VkBufferMemoryBarrier copy_query_pool_barrier{
-                    .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
-                    .pNext = nullptr,
-                    .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-                    .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
-                    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                    .buffer = buffer,
-                    .offset = base_offset,
-                    .size = amount * SamplesQueryBank::QUERY_SIZE,
-                };
-
-                cmdbuf.CopyQueryPoolResults(
-                    query_pool, static_cast<u32>(start), static_cast<u32>(amount), buffer,
-                    static_cast<u32>(base_offset), SamplesQueryBank::QUERY_SIZE,
-                    VK_QUERY_RESULT_WAIT_BIT | VK_QUERY_RESULT_64_BIT);
-                cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                       VK_PIPELINE_STAGE_TRANSFER_BIT, 0, copy_query_pool_barrier);
-            });
-            offsets[bank_id] = {start, base_offset};
-            base_offset += amount * SamplesQueryBank::QUERY_SIZE;
-        });
+        if (!sparse_direct_copies ||
+            !TryCopyDirectSamples(*buffers[resolve_buffer_index], offsets)) {
+            CopySampleSpans(*buffers[resolve_buffer_index], offsets);
+        }
 
         // Convert queries
         bool has_multi_queries = false;
@@ -438,6 +416,108 @@ public:
     }
 
 private:
+    using BankOffsets = ::Common::unordered_map<size_t, std::pair<size_t, size_t>>;
+
+    void CopySampleSpans(VkBuffer buffer, BankOffsets& offsets) {
+        size_t base_offset = 0;
+
+        ApplyBanksWideOp<true>(pending_sync, [&](SamplesQueryBank* bank, size_t start,
+                                                 size_t amount) {
+            size_t bank_id = bank->GetIndex();
+            VkQueryPool query_pool = bank->GetInnerPool();
+            scheduler.RequestOutsideRenderPassOperationContext();
+            scheduler.Record([start, amount, base_offset, query_pool,
+                              buffer](vk::CommandBuffer cmdbuf) {
+                const VkBufferMemoryBarrier copy_query_pool_barrier{
+                    .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+                    .pNext = nullptr,
+                    .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                    .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+                    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .buffer = buffer,
+                    .offset = base_offset,
+                    .size = amount * SamplesQueryBank::QUERY_SIZE,
+                };
+
+                cmdbuf.CopyQueryPoolResults(
+                    query_pool, static_cast<u32>(start), static_cast<u32>(amount), buffer,
+                    static_cast<u32>(base_offset), SamplesQueryBank::QUERY_SIZE,
+                    VK_QUERY_RESULT_WAIT_BIT | VK_QUERY_RESULT_64_BIT);
+                cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                       VK_PIPELINE_STAGE_TRANSFER_BIT, 0, copy_query_pool_barrier);
+            });
+            offsets[bank_id] = {start, base_offset};
+            base_offset += amount * SamplesQueryBank::QUERY_SIZE;
+        });
+    }
+
+    // A prefix scan reads the holes as well as the reported slots. Only reports which read a
+    // single raw counter can leave those holes untouched in the resolve buffer.
+    bool TryCopyDirectSamples(VkBuffer buffer, BankOffsets& offsets) {
+        if (pending_sync.size() < 2 || accumulation_since_last_sync ||
+            std::any_of(pending_sync.begin(), pending_sync.end(), [this](size_t id) {
+                const auto* q = GetQuery(id);
+                return q->size_slots != 1 || q->size_banks != 1;
+            })) {
+            return false;
+        }
+
+        std::map<size_t, std::vector<size_t>> slots_by_bank;
+        for (const auto id : pending_sync) {
+            const auto* q = GetQuery(id);
+            slots_by_bank[q->start_bank_id].push_back(q->start_slot);
+        }
+        struct Run {
+            VkQueryPool pool;
+            u32 first;
+            u32 count;
+            VkDeviceSize offset;
+        };
+        constexpr size_t query_size = SamplesQueryBank::QUERY_SIZE;
+        size_t base_offset = 0;
+        std::vector<Run> runs;
+        for (auto& [bank_id, slots] : slots_by_bank) {
+            std::sort(slots.begin(), slots.end());
+            slots.erase(std::unique(slots.begin(), slots.end()), slots.end());
+            const size_t first = slots.front();
+            offsets[bank_id] = {first, base_offset};
+            const VkQueryPool pool = bank_pool.GetBank(bank_id).GetInnerPool();
+            for (size_t i = 0; i < slots.size();) {
+                size_t end = i + 1;
+                while (end < slots.size() && slots[end] == slots[end - 1] + 1) {
+                    ++end;
+                }
+                runs.push_back({pool, static_cast<u32>(slots[i]), static_cast<u32>(end - i),
+                                base_offset + (slots[i] - first) * query_size});
+                i = end;
+            }
+            base_offset += (slots.back() - first + 1) * query_size;
+        }
+
+        scheduler.RequestOutsideRenderPassOperationContext();
+        scheduler.Record([buffer, runs = std::move(runs), base_offset](vk::CommandBuffer cmdbuf) {
+            for (const Run& run : runs) {
+                cmdbuf.CopyQueryPoolResults(run.pool, run.first, run.count, buffer, run.offset,
+                                            query_size,
+                                            VK_QUERY_RESULT_WAIT_BIT | VK_QUERY_RESULT_64_BIT);
+            }
+            const VkBufferMemoryBarrier barrier{
+                .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+                .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .buffer = buffer,
+                .offset = 0,
+                .size = base_offset,
+            };
+            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                   0, barrier);
+        });
+        return true;
+    }
+
     template <typename Func>
     void ApplyBankOp(VideoCommon::HostQueryBase* query, Func&& func) {
         size_t size_slots = query->size_slots;
@@ -633,6 +713,7 @@ private:
     SamplesQueryBank* current_bank;
     VkQueryPool current_query_pool;
     size_t current_query_id;
+    bool sparse_direct_copies{};
     size_t num_slots_used{};
     size_t first_accumulation_checkpoint{};
     size_t last_accumulation_checkpoint{};
