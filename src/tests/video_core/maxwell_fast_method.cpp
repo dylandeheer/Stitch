@@ -28,6 +28,7 @@
 #include "core/memory.h"
 #include "tests/core/system_test_context.h"
 #include "video_core/dirty_flags.h"
+#include "video_core/renderer_vulkan/vk_state_tracker.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
@@ -1677,4 +1678,22 @@ TEST_CASE("Ordered FIFO mode file requires explicit verified promotion and fails
     std::ofstream(path) << "candidate";
     split.RejectOrderedFifo();
     REQUIRE(select() == Mode::Off);
+}
+
+TEST_CASE("A Maxwell iterated-blend write dirties baked and dynamic Vulkan equations",
+          "[iterated_blend_dirty]") {
+    Fixture f;
+    Tegra::Control::ChannelState channel{1};
+    channel.payload.emplace(f.system, f.memory, channel);
+    Vulkan::StateTracker tracker;
+    tracker.SetupTables(channel);
+    auto& engine = channel.payload->maxwell_3d;
+    engine.BindRasterizer(&f.rasterizer);
+    auto& dirty = engine.dirty.flags;
+    dirty.reset();
+    engine.CallMethod(f.system, MAXWELL3D_REG_INDEX(iterated_blend), 1, true);
+    REQUIRE(engine.regs.iterated_blend.enable.Value() == 1);
+    CHECK(dirty[Vulkan::Dirty::Blending]);
+    CHECK(dirty[Vulkan::Dirty::BlendEquations]);
+    CHECK_FALSE(dirty[Vulkan::Dirty::ColorMask]);
 }

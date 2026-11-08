@@ -180,6 +180,9 @@ void SetupDirtyStencilOp(Maxwell3D::DirtyState::Tables& tables) {
 }
 
 void SetupDirtyBlending(Maxwell3D::DirtyState::Tables& tables) {
+    // Both baked and dynamic equations read the squashed iterated-blend enable bit.
+    tables[0][OFF(iterated_blend)] = Blending;
+    tables[1][OFF(iterated_blend)] = BlendEquations;
     tables[0][OFF(color_mask_common)] = Blending;
     tables[1][OFF(color_mask_common)] = ColorMask;
     tables[0][OFF(blend_per_target_enabled)] = Blending;
