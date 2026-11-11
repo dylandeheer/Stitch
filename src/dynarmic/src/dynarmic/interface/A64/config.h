@@ -305,6 +305,9 @@ struct UserConfig {
     /// AddTicks and GetTicksRemaining are never called, and no cycle counting is done.
     bool enable_cycle_counting = true;
 
+    /// Keep one native frame across linked guest blocks on Linux x86-64.
+    bool use_run_frame = false;
+
     /// Internal use only
     bool very_verbose_debugging_output = false;
 

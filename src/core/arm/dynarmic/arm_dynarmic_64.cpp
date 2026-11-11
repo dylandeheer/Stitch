@@ -467,6 +467,12 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
     if (accuracy == Settings::CpuAccuracy::Debugging || accuracy == Settings::CpuAccuracy::Paranoid) {
         config.optimizations &= ~Dynarmic::OptimizationFlag::DisableVerification;
     }
+#if defined(__linux__) && defined(__x86_64__) && !defined(__ANDROID__)
+    const char* run_frame = std::getenv("STITCH_JIT_RUN_FRAME");
+    config.use_run_frame = run_frame && std::string_view{run_frame} == "1" &&
+                           !m_system.DebuggerEnabled() && accuracy != Settings::CpuAccuracy::Debugging &&
+                           accuracy != Settings::CpuAccuracy::Paranoid;
+#endif
     m_jit.emplace(config);
 #if defined(__linux__) && defined(__x86_64__)
     const char* option = std::getenv("STITCH_OOT_COMPARE_LINK");

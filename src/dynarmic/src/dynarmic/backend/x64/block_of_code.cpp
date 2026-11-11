@@ -286,9 +286,23 @@ void BlockOfCode::ForceReturnFromRunCode(bool mxcsr_already_exited) {
 
 void BlockOfCode::GenRunCode(std::function<void(BlockOfCode&)> rcp) {
     Xbyak::Label return_to_caller, return_to_caller_mxcsr_already_exited;
+    const auto enter_run_frame = [this] {
+        if (!UsesRunFrame())
+            return;
+        // Keep the caller's RBP and native return address in a SysV frame for the entire run.
+        // Calling the original body preserves its entry alignment and every StackLayout offset.
+        Xbyak::Label body;
+        push(rbp);
+        mov(rbp, rsp);
+        call(body);
+        pop(rbp);
+        ret();
+        L(body);
+    };
 
     align();
     run_code = getCurr<RunCodeFuncType>();
+    enter_run_frame();
 
     // This serves two purposes:
     // 1. It saves all the registers we as a callee need to save.
@@ -317,6 +331,7 @@ void BlockOfCode::GenRunCode(std::function<void(BlockOfCode&)> rcp) {
 
     align();
     step_code = getCurr<RunCodeFuncType>();
+    enter_run_frame();
 
     ABI_PushCalleeSaveRegistersAndAdjustStack(*this, sizeof(StackLayout));
 

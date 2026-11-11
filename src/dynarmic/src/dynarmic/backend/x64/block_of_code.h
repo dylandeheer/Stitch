@@ -35,6 +35,7 @@ struct RunCodeCallbacks {
     ArgCallback AddTicks;
     ArgCallback GetTicksRemaining;
     bool enable_cycle_counting;
+    bool use_run_frame{};
 };
 
 class BlockOfCode final : public Xbyak::CodeGenerator {
@@ -166,6 +167,7 @@ public:
 
     JitStateInfo GetJitStateInfo() const { return jsi; }
 
+    bool UsesRunFrame() const noexcept { return cb.use_run_frame; }
     bool HasHostFeature(HostFeature feature) const noexcept;
 
 private:

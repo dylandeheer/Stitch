@@ -92,8 +92,10 @@ A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block, bool fold_compare
     // Start emitting.
     code.align();
     const auto* const entrypoint = code.getCurr();
-    code.mov(code.qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, abi_base_pointer)], rbp);
-    code.lea(rbp, code.ptr[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, abi_base_pointer) - 8]);
+    if (!code.UsesRunFrame()) {
+        code.mov(code.qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, abi_base_pointer)], rbp);
+        code.lea(rbp, code.ptr[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, abi_base_pointer) - 8]);
+    }
 
     DEBUG_ASSERT(block.GetCondition() == IR::Cond::AL);
     typedef void (EmitX64::*EmitHandlerFn)(EmitContext& context, IR::Inst* inst);
@@ -147,7 +149,9 @@ finish_this_inst:
     reg_alloc.AssertNoMoreUses();
     if (conf.enable_cycle_counting)
         EmitAddCycles(block.CycleCount());
-    code.mov(rbp, code.qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, abi_base_pointer)]);
+    if (!code.UsesRunFrame()) {
+        code.mov(rbp, code.qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, abi_base_pointer)]);
+    }
     if (fold_compare) {
         const auto& branch = std::get<IR::Term::CheckBit>(block.terminal);
         const auto target = std::get<IR::Term::LinkBlock>(branch.then_).next;

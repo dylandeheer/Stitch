@@ -37,6 +37,9 @@ static RunCodeCallbacks GenRunCodeCallbacks(A64::UserCallbacks* cb, CodePtr (*Lo
         ArgCallback(Devirtualize<&A64::UserCallbacks::AddTicks>(cb)),
         ArgCallback(Devirtualize<&A64::UserCallbacks::GetTicksRemaining>(cb)),
         conf.enable_cycle_counting,
+#if defined(__linux__) && !defined(__ANDROID__)
+        conf.use_run_frame,
+#endif
     };
 }
 
