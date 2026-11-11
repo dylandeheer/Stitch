@@ -80,6 +80,20 @@ struct GpuSplitTestAccess {
         return split.hook_requested.load();
     }
 
+    static size_t WholeRingPayload() {
+        // DeferWords with one captured pointer has a four-u64 header.
+        return (GpuSplit::RingWords - 4) * 2;
+    }
+    static void SetWaitTarget(GpuSplit& split, u64 position) {
+        split.wait_target.store(position);
+    }
+    static u64 Consumed(const GpuSplit& split) {
+        return split.consumed.load();
+    }
+    static void WakeFront(GpuSplit& split) {
+        split.NotifyFront();
+    }
+
     static u64 NearWrap() {
         return GpuSplit::RingWords - 1;
     }
@@ -1147,6 +1161,176 @@ TEST_CASE("Split drain waits for the back's idle hook",
         split.Drain(VideoCommon::DrainSite::Acquire);
         REQUIRE(hooks.load() >= i);
     }
+}
+
+TEST_CASE("Split publishes each partial waiter target once while the front is descheduled",
+          "[video_core][gpu_split_dependencies][split_progress_wait]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    Fixture f;
+    f.system.Initialize();
+    VideoCommon::GpuSplit split;
+    Access::Start(split, f.system);
+    std::atomic<bool> release{};
+    SCOPE_EXIT {
+        release.store(true);
+        release.notify_one();
+        split.Stop();
+    };
+    split.Defer([&release] { release.wait(false); });
+    split.Publish();
+    split.Defer([] {});
+    const auto first = split.Position();
+    Access::SetWaitTarget(split, first);
+    std::array<u64, 4> observed{};
+    split.Defer([&] { observed[0] = Access::Consumed(split); });
+    const auto later_target = split.Position();
+    split.Defer([&] {
+        observed[1] = Access::Consumed(split);
+        // A front can arm a position the back already crossed without publishing it.
+        Access::SetWaitTarget(split, later_target);
+    });
+    const auto next_publication = split.Position();
+    split.Defer([&] { observed[2] = Access::Consumed(split); });
+    split.Defer([&] { observed[3] = Access::Consumed(split); });
+    split.Publish();
+    release.store(true);
+    release.notify_one();
+    split.Drain();
+    REQUIRE(observed == std::array<u64, 4>{first, first, next_publication, next_publication});
+}
+
+TEST_CASE("Split parks until an idle hook finishes or a full ring can be reused",
+          "[video_core][gpu_split_dependencies][split_progress_wait]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    using namespace std::chrono_literals;
+    Fixture f;
+    f.system.Initialize();
+    VideoCommon::GpuSplit split;
+    struct Gate {
+        std::atomic<bool> entered{}, release{}, finished{};
+        static void Block(void* user) {
+            auto& gate = *static_cast<Gate*>(user);
+            gate.entered = true;
+            gate.release.wait(false);
+            gate.finished = true;
+        }
+    } gate;
+    const bool hook = GENERATE(true, false);
+    if (hook) {
+        split.SetIdleHook(Gate::Block, &gate);
+    }
+    Access::Start(split, f.system);
+    SCOPE_EXIT {
+        gate.release.store(true);
+        gate.release.notify_one();
+        split.Stop();
+    };
+    if (hook) {
+        split.Defer([] {});
+    } else {
+        split.Defer([&gate] { Gate::Block(&gate); });
+    }
+    split.Publish();
+    const auto wait_until = [](auto predicate) {
+        const auto deadline = std::chrono::steady_clock::now() + 2s;
+        while (!predicate() && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::yield();
+        }
+        return predicate();
+    };
+    REQUIRE(wait_until([&] { return gate.entered.load(); }));
+    std::vector<u32> payload(hook ? 0 : Access::WholeRingPayload(), 0x5a5a1234);
+    std::atomic<bool> returned{};
+    bool finished_before_return{}, payload_valid{};
+    std::jthread front([&] {
+        if (hook) {
+            split.Drain(VideoCommon::DrainSite::Acquire);
+        } else {
+            // This entry fills a whole ring. Its reservation must wait for the preceding
+            // entry and wrap before it can overwrite either one.
+            split.DeferWords([&payload_valid](std::span<const u32> copy) {
+                payload_valid = copy.size() == Access::WholeRingPayload() &&
+                                copy.front() == 0x5a5a1234 && copy.back() == 0x5a5a1234;
+            }, payload);
+        }
+        finished_before_return = gate.finished.load();
+        returned = true;
+    });
+    const bool parked = wait_until([&] { return returned.load() || Access::FrontWaits(split); }) &&
+                        Access::FrontWaits(split);
+    Access::WakeFront(split);
+    std::this_thread::sleep_for(1ms);
+    const bool returned_early = returned.load();
+    gate.release.store(true);
+    gate.release.notify_one();
+    front.join();
+    split.Drain();
+    REQUIRE(parked);
+    REQUIRE_FALSE(returned_early);
+    REQUIRE(finished_before_return);
+    REQUIRE((hook || payload_valid));
+}
+
+TEST_CASE("Split reuses a completed ring prefix while the rest of the batch is blocked",
+          "[video_core][gpu_split_dependencies][split_progress_wait]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    using namespace std::chrono_literals;
+    Fixture f;
+    f.system.Initialize();
+    VideoCommon::GpuSplit split;
+    Access::Start(split, f.system);
+    struct Gate {
+        std::atomic<bool> entered{}, release{};
+        void Hold() {
+            entered = true;
+            release.wait(false);
+        }
+        void Open() {
+            release = true;
+            release.notify_one();
+        }
+    } first, later;
+    SCOPE_EXIT {
+        first.Open();
+        later.Open();
+        split.Stop();
+    };
+    const auto until = [](auto predicate) {
+        const auto deadline = std::chrono::steady_clock::now() + 2s;
+        while (!predicate() && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::yield();
+        }
+        return predicate();
+    };
+    split.Defer([&first] { first.Hold(); });
+    split.Publish();
+    REQUIRE(until([&] { return first.entered.load(); }));
+    split.Defer([] {});
+    const auto reusable_words = split.Position();
+    split.Defer([&later] { later.Hold(); });
+    // Fill the rest exactly. The consumer will take this batch after the first held entry.
+    const std::vector<u32> fill(Access::WholeRingPayload() - 2 * split.Position(), 0xa1b2c3d4);
+    bool intact{};
+    split.DeferWords([&intact](std::span<const u32> words) {
+        intact = words.front() == 0xa1b2c3d4 && words.back() == 0xa1b2c3d4;
+    }, fill);
+    std::atomic<bool> reserved{};
+    std::jthread front([&] {
+        const std::vector<u32> payload((reusable_words - 4) * 2, 42);
+        split.DeferWords([](std::span<const u32>) {}, payload);
+        reserved = true;
+    });
+    const bool parked = until([&] { return Access::FrontWaits(split); });
+    first.Open();
+    const bool later_busy = until([&] { return later.entered.load(); });
+    const bool reused = until([&] { return reserved.load(); });
+    later.Open();
+    front.join();
+    split.Drain();
+    REQUIRE(parked);
+    REQUIRE(later_busy);
+    REQUIRE(reused);
+    REQUIRE(intact);
 }
 
 TEST_CASE("Split restart resets writer positions without replaying old releases",

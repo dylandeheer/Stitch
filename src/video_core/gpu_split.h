@@ -475,9 +475,9 @@ private:
     void SwitchEngine(Tegra::Engines::EngineInterface* engine);
     bool WaitFor(u64 target, DrainSite site);
 
-    /// One step of a front wait for the back to consume `target`.
-    void Backoff(u32 spins, u64 target);
-    /// After the back stored `consumed`: wakes a front sleeping in Backoff.
+    /// Waits for the executed ring position and, for a drain, the completed idle hook.
+    void WaitForBack(u64 target, bool require_quiet);
+    /// After publishing either kind of progress, wakes the front to recheck its condition.
     void NotifyFront() {
         if (front_waiting.load(std::memory_order_seq_cst)) {
             front_wake.fetch_add(1, std::memory_order_seq_cst);
@@ -539,9 +539,8 @@ private:
 
     /// Whether the back is done with the Vulkan scheduler until it gets more work: set after its
     /// idle hook ran, cleared before it executes entries.
-    [[nodiscard]] bool BackQuiet() const {
-        return back_quiet.load(std::memory_order_acquire) ||
-               !back_running.load(std::memory_order_acquire);
+    [[nodiscard]] bool BackQuiet(std::memory_order order = std::memory_order_acquire) const {
+        return back_quiet.load(order) || !back_running.load(order);
     }
 
     static GpuSplit instance;
@@ -552,6 +551,8 @@ private:
     alignas(64) std::atomic<bool> hook_requested{};
     std::atomic<bool> back_running{};
     std::atomic<bool> back_quiet{true};
+    /// Last position for which the front needs the idle hook. Only the front writes it.
+    std::atomic<u64> drain_target{~u64{0}};
 
     // 128 bytes: x86 spatial prefetchers pull 64-byte lines in pairs. back_waiting and wake are
     // always touched together by both threads, so they share a block.
@@ -561,7 +562,7 @@ private:
     alignas(128) std::atomic<u64> wait_target{~u64{0}};
     alignas(128) std::atomic<bool> back_waiting{};
     std::atomic<u32> wake{};
-    /// The front sleeps in Backoff (#161: instead of yielding).
+    /// Handshake for parking the front until consumed or idle-hook progress.
     alignas(128) std::atomic<bool> front_waiting{};
     std::atomic<u32> front_wake{};
     /// The back's position when it last ran out of work, stored before it waits: while
