@@ -290,7 +290,8 @@ TEST_CASE("A cached task/mesh pipeline reaches fallback warmup once on a compati
     auto provoking = good;
     provoking.state.provoking_vertex_last.Assign(1);
     for (const auto& key : {incompatible, good, good, provoking}) {
-        VideoCommon::SerializePipeline(key, stages, path, VideoCommon::VulkanPipelineCacheVersion);
+        VideoCommon::SerializePipeline(key, stages, path, VideoCommon::VulkanPipelineCacheVersion,
+                                       ReadProperties);
     }
     const Vulkan::DynamicFeatures features{};
     std::unordered_set<u64> known_keys;
