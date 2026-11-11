@@ -78,7 +78,8 @@ public:
         u32 value;
         u32 operation;
         std::chrono::steady_clock::time_point since;
-        bool reported;
+        std::chrono::steady_clock::time_point last_fences; ///< When it last released fences
+        bool reported; ///< The 2 s warning was logged
 
         [[nodiscard]] bool Matches(u32 current) const;
     };

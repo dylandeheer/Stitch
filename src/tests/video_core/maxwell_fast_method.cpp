@@ -35,6 +35,7 @@
 #include "video_core/macro_dma_coverage.h"
 #include "video_core/macro_fifo_shape.h"
 #include "video_core/memory_manager.h"
+#include "video_core/nx2.h"
 #include "video_core/renderer_null/null_rasterizer.h"
 
 namespace VideoCommon {
@@ -57,6 +58,26 @@ struct GpuSplitTestAccess {
         Initialize(split, system);
         split.active = true;
         split.back_thread = std::jthread([&split](std::stop_token stop) { split.BackLoop(stop); });
+    }
+
+    static u64 Published(const GpuSplit& split) {
+        return split.published.load(std::memory_order_acquire);
+    }
+
+    static u64 BackIdleAt(const GpuSplit& split) {
+        return split.back_idle_at.load(std::memory_order_relaxed);
+    }
+
+    /// The back's side as SettleIdleBack sees it, without a back thread.
+    static void SetBack(GpuSplit& split, bool running, bool quiet, u64 consumed) {
+        split.back_running.store(running);
+        split.back_quiet.store(quiet);
+        split.consumed.store(consumed);
+        split.hook_requested.store(false);
+    }
+
+    static bool HookRequested(const GpuSplit& split) {
+        return split.hook_requested.load();
     }
 
     static u64 NearWrap() {
@@ -904,6 +925,228 @@ TEST_CASE("Captured FIFO macro keeps its ring position and Stitch read-publicati
     parameters.clear();
     split.Drain(VideoCommon::DrainSite::MacroDmaRead);
     REQUIRE(back == front);
+}
+
+TEST_CASE("Split remembers the semaphore writes its back has not run yet",
+          "[video_core][gpu_split_dependencies]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    Fixture f;
+    f.system.Initialize();
+    VideoCommon::GpuSplit split;
+    std::atomic<bool> release{};
+    Access::Start(split, f.system);
+    SCOPE_EXIT {
+        split.Stop();
+    };
+    // Runs before Stop: a failed check must not leave the back in the entry below.
+    SCOPE_EXIT {
+        release = true;
+    };
+    // Releases behind an entry the back is still in.
+    split.Defer([&release] {
+        while (!release.load()) {
+            std::this_thread::yield();
+        }
+    });
+    split.Defer([] {});
+    split.NoteSemaphoreWrite(0x1000, 5, true);
+    split.Defer([] {});
+    split.NoteSemaphoreWrite(0x2002, 7, false);
+    split.Publish();
+    auto queued = split.QueuedSemaphoreWriteAt(0x1000);
+    REQUIRE(queued.has_value());
+    REQUIRE(queued->known);
+    REQUIRE(queued->payload == 5);
+    // By 4-byte word: the second write is at 0x2000. No write was sent to 0x1004.
+    queued = split.QueuedSemaphoreWriteAt(0x2000);
+    REQUIRE(queued.has_value());
+    REQUIRE_FALSE(queued->known);
+    REQUIRE_FALSE(split.QueuedSemaphoreWriteAt(0x1004).has_value());
+    // The last write sent to a word decides.
+    split.Defer([] {});
+    split.NoteSemaphoreWrite(0x1000, 9, true);
+    split.Publish();
+    queued = split.QueuedSemaphoreWriteAt(0x1000);
+    REQUIRE(queued.has_value());
+    REQUIRE(queued->payload == 9);
+    // Once the back ran them, the words hold their values in memory.
+    release = true;
+    split.Drain(VideoCommon::DrainSite::Other);
+    REQUIRE_FALSE(split.QueuedSemaphoreWriteAt(0x1000).has_value());
+    REQUIRE_FALSE(split.QueuedSemaphoreWriteAt(0x2000).has_value());
+}
+
+TEST_CASE("A queued release cannot pass GE across a later physical alias write",
+          "[video_core][gpu_split_dependencies][semaphore_acquire_order][semaphore_mirror_remap]") {
+    using namespace Tegra;
+    using Split = VideoCommon::GpuSplit;
+    using Access = VideoCommon::GpuSplitTestAccess;
+    Fixture f;
+    f.system.Initialize();
+    Kernel::KProcess process{f.system.Kernel()};
+    SCOPE_EXIT { f.system.Kernel().UnregisterKernelObject(&process); };
+    auto& table = process.GetPageTable().GetImpl();
+    table.Resize(20, 12);
+    constexpr VAddr cpu = 0x4000;
+    constexpr DAddr device = 0x10000, other_device = 0x20000;
+    constexpr GPUVAddr word = 0x100000, alias = 0x200000;
+    const auto backing = reinterpret_cast<uintptr_t>(f.physical.GetPointerFromRaw<u8>(0x10000));
+    table.entries.GetAndFault(cpu >> 12).Store(false, Common::PageType::Memory, 1, backing - cpu);
+    process.GetMemory().SetCurrentPageTable(process);
+    const auto asid = f.device_memory.RegisterProcess(&process.GetMemory());
+    f.device_memory.BindInterface(&f.rasterizer);
+    f.memory.BindRasterizer(&f.rasterizer);
+    f.device_memory.Map(device, cpu, 0x1000, asid);
+    f.device_memory.Map(other_device, cpu, 0x1000, asid);
+    f.memory.Map(word, device, 0x1000, PTEKind::PITCH, false);
+    f.memory.Map(alias, other_device, 0x1000, PTEKind::PITCH, false);
+    SCOPE_EXIT {
+        f.device_memory.Unmap(other_device, 0x1000);
+        f.device_memory.Unmap(device, 0x1000);
+        f.device_memory.UnregisterProcess(asid);
+    };
+    Control::ChannelState channel{1};
+    const bool oot = GENERATE(false, true);
+    channel.program_id = oot ? 0x0400486024DEC000ULL : 0x040074A01BF12000ULL;
+    REQUIRE(Nx2UsesSemaphoreMirror(channel.program_id) == !oot);
+    channel.memory_manager = &f.memory;
+    DmaPusher parser{f.system, f.memory, channel};
+    parser.BindRasterizer(&f.rasterizer);
+    Engines::Puller puller{};
+    SCOPE_EXIT { Nx2SemaphoreWaiters::Get().Remove(&puller); };
+    const auto call = [&](BufferMethods method, u32 argument) {
+        puller.CallPullerMethod(parser, Engines::Puller::MethodCall{u32(method), argument});
+    };
+    const auto old_ampere = g_nx2_ampere.exchange(true);
+    SCOPE_EXIT { g_nx2_ampere = old_ampere; };
+    auto& split = Split::Get();
+    Access::OrderedMode(split, Split::OrderedFifoMode::Off);
+    Access::Start(split, f.system);
+    SCOPE_EXIT { split.Stop(); };
+    // Also challenge the title guard with an already populated compatibility shadow. Other
+    // titles may observe it, but unmapping and rebinding the same physical page retires it.
+    Nx2AddSemaphoreRegion(word);
+    SCOPE_EXIT { Nx2RemoveSemaphoreRegion(word); };
+    auto& shadow = Nx2MirrorShadow::Get();
+    const auto pointer = f.memory.GetPointer(word);
+    shadow.NoteDirectRelease(device, word, pointer);
+    shadow.Set(device, 9, 2, pointer);
+    REQUIRE(shadow.Read(device, 2, pointer) == 9U);
+    if (!oot) {
+        f.device_memory.Unmap(device, 0x1000);
+        f.device_memory.Map(device, cpu, 0x1000, asid);
+        REQUIRE(f.memory.GetPointer(word) == pointer);
+        REQUIRE_FALSE(shadow.Read(device, 2, pointer).has_value());
+    }
+    f.memory.Write<u32>(word, 5);
+    call(BufferMethods::SemaphoreAddressHigh, 0);
+    call(BufferMethods::SemaphoreAddressLow, word);
+    call(BufferMethods::SemaphoreSequencePayload, 5);
+    std::atomic<bool> acquired{};
+    SCOPE_EXIT { acquired.store(true); };
+    split.Defer([&acquired, &split] {
+        // Keep both writes pending until the acquire waits or returns.
+        while (!Access::FrontWaits(split) && !acquired.load())
+            std::this_thread::yield();
+    });
+    split.Defer([&f] { f.memory.Write<u32>(word, 7); });
+    split.NoteSemaphoreWrite(device, 7, true);
+    split.Defer([&f] { f.memory.Write<u32>(alias, 2); });
+    call(BufferMethods::SemaphoreOperation, 4); // ACQUIRE_GEQUAL
+    acquired.store(true);
+    REQUIRE(puller.HasPendingAcquire());
+    REQUIRE(f.memory.Read<u32>(word) == 2);
+    f.memory.Write<u32>(alias, 8);
+    REQUIRE(puller.ResumeAcquire(parser));
+}
+
+TEST_CASE("Split publishes to a back that waits for work after a few words",
+          "[video_core][gpu_split_dependencies]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    Fixture f;
+    f.system.Initialize();
+    VideoCommon::GpuSplit split;
+    Access::Start(split, f.system);
+    SCOPE_EXIT {
+        split.Stop();
+    };
+    // Publishing raises the interval to 256 words: the words below stay with the front unless it
+    // feeds the waiting back.
+    split.Defer([] {});
+    split.Publish();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{10};
+    while (Access::BackIdleAt(split) != Access::End(split)) {
+        REQUIRE(std::chrono::steady_clock::now() < deadline);
+        std::this_thread::yield();
+    }
+    const u64 published = Access::Published(split);
+    // An empty call takes 3 words.
+    split.Defer([] {});
+    split.Defer([] {});
+    REQUIRE(Access::Published(split) == published);
+    split.Defer([] {});
+    REQUIRE(Access::Published(split) == Access::End(split));
+}
+
+TEST_CASE("Split asks a back that ran everything for its idle hook while the front polls",
+          "[video_core][gpu_split_dependencies]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    Fixture f;
+    VideoCommon::GpuSplit split;
+    Access::Initialize(split, f.system);
+    const bool counting = VideoCommon::g_acquire_counting;
+    VideoCommon::g_acquire_counting = true;
+    SCOPE_EXIT {
+        Access::SetBack(split, false, true, 0);
+        VideoCommon::g_acquire_counting = counting;
+    };
+    const auto settled = [&split] {
+        const u64 before = VideoCommon::g_acquire_stats.settles.load();
+        split.SettleIdleBack();
+        const bool asked = Access::HookRequested(split);
+        REQUIRE(asked == (VideoCommon::g_acquire_stats.settles.load() == before + 1));
+        return asked;
+    };
+    Access::SetBack(split, true, false, Access::End(split));
+    // Ran everything, hook not run yet: asked once.
+    REQUIRE(settled());
+    REQUIRE(Access::HookRequested(split));
+    // Already ran its hook.
+    Access::SetBack(split, true, true, Access::End(split));
+    REQUIRE_FALSE(settled());
+    // Still has work.
+    Access::SetBack(split, true, false, Access::End(split));
+    split.Defer([] {});
+    REQUIRE_FALSE(settled());
+    // Not running.
+    Access::SetBack(split, false, false, Access::End(split));
+    REQUIRE_FALSE(settled());
+}
+
+TEST_CASE("Split drain waits for the back's idle hook",
+          "[video_core][gpu_split_dependencies]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    Fixture f;
+    f.system.Initialize();
+    VideoCommon::GpuSplit split;
+    static std::atomic<u32> hooks;
+    hooks = 0;
+    // Slow, so a drain that returned before the hook finished sees the old count.
+    split.SetIdleHook(
+        [](void*) {
+            std::this_thread::sleep_for(std::chrono::milliseconds{2});
+            hooks.fetch_add(1);
+        },
+        nullptr);
+    Access::Start(split, f.system);
+    SCOPE_EXIT {
+        split.Stop();
+    };
+    for (u32 i = 1; i <= 3; ++i) {
+        split.Defer([] {});
+        split.Drain(VideoCommon::DrainSite::Acquire);
+        REQUIRE(hooks.load() >= i);
+    }
 }
 
 TEST_CASE("Split restart resets writer positions without replaying old releases",

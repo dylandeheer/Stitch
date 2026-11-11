@@ -8,9 +8,9 @@ The current development target is Ocarina of Time on a Navi33 Steam Machine. Ren
 
 The desktop application is **Stitch** and the GUI executable is `stitch`. The inherited CMake GUI target remains `yuzu`; the CLI target remains `yuzu-cmd` and its executable remains `eden-cli` for build compatibility.
 
-Stitch retains Eden-compatible save, settings and cache formats. The SteamOS test launcher uses its own existing isolated profile. No game files, keys or firmware are distributed with this repository.
+Stitch retains compatible save and settings formats. The current upstream profile uses `lichii` folders and provides a recoverable Eden import. The SteamOS test launcher keeps its existing isolated profile with a separately prepared compatible destination and rollback. Shader-cache v2 validates and migrates old cache records; warmup and runtime rebuilding remain separate checks. No game files, keys or firmware are distributed with this repository.
 
-The [releases page](https://github.com/dylandeheer/Stitch/releases) belongs to this fork. Update links point here so upstream releases cannot replace a Stitch build. There are no published Stitch releases yet. Build and source notes for measured candidates are kept with the corresponding package; the active performance work is on `stitch/amd-performance`.
+The [releases page](https://github.com/dylandeheer/Stitch/releases) belongs to this fork. Update links point here so upstream releases cannot replace a Stitch build. There are no published Stitch releases yet. Build and source notes for measured candidates are kept with the corresponding package; the latest upstream integration is on `stitch/upstream-150-20261111`.
 
 See [Build.md](docs/Build.md) for inherited build instructions. Current custom packages are validated on Linux x86-64; other platforms need their own validation.
 

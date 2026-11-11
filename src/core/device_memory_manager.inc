@@ -281,6 +281,9 @@ void DeviceMemoryManager<Traits>::Map(DAddr address, VAddr virtual_address, size
     size_t start_page_d = address >> Memory::YUZU_PAGEBITS;
     size_t num_pages = Common::AlignUp(size, Memory::YUZU_PAGESIZE) >> Memory::YUZU_PAGEBITS;
     std::scoped_lock lk(mapping_guard);
+    if constexpr (requires { Traits::DeviceMethods::ForgetSemaphoreMapping(address, size); }) {
+        Traits::DeviceMethods::ForgetSemaphoreMapping(address, size);
+    }
 
     tracked_entries.CommitRegion(start_page_d, start_page_d + num_pages);
     CutContinuityAt(start_page_d);
@@ -322,6 +325,9 @@ void DeviceMemoryManager<Traits>::Unmap(DAddr address, size_t size) {
     size_t num_pages = Common::AlignUp(size, Memory::YUZU_PAGESIZE) >> Memory::YUZU_PAGEBITS;
     device_inter->InvalidateRegion(address, size);
     std::scoped_lock lk(mapping_guard);
+    if constexpr (requires { Traits::DeviceMethods::ForgetSemaphoreMapping(address, size); }) {
+        Traits::DeviceMethods::ForgetSemaphoreMapping(address, size);
+    }
 
     tracked_entries.CommitRegion(start_page_d, start_page_d + num_pages); // should already be committed, but just in case
     CutContinuityAt(start_page_d);

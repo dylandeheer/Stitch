@@ -37,6 +37,7 @@
 #include "video_core/texture_cache/decode_bc.h"
 #include "video_core/texture_cache/format_lookup_table.h"
 #include "video_core/texture_cache/formatter.h"
+#include "video_core/texture_cache/host_mip_limits.h"
 #include "video_core/texture_cache/samples_helper.h"
 #include "video_core/texture_cache/atlas_upload_evidence.h"
 #include "video_core/texture_cache/util.h"
@@ -1505,6 +1506,63 @@ Extent3D MipBlockSize(const ImageInfo& info, u32 level) {
     return AdjustMipBlockSize(num_tiles, level_info.block, level, level_info.num_levels);
 }
 
+void MarkSubresourcesWrittenWhole(const ImageBase& dst, const ImageBase& src,
+                                  std::span<const ImageCopy> copies, std::span<u8> written) {
+    constexpr auto excluded = ImageFlagBits::Rescaled | ImageFlagBits::TrimmedLevels |
+                              ImageFlagBits::Unbacked | ImageFlagBits::UnwrittenSparse |
+                              ImageFlagBits::Sparse | ImageFlagBits::SparseLayers |
+                              ImageFlagBits::SparseTiles | ImageFlagBits::Remapped |
+                              ImageFlagBits::Converted | ImageFlagBits::IsDecoding;
+    const s32 levels = dst.info.resources.levels;
+    const s32 layers = dst.info.resources.layers;
+    if (dst.info.type != ImageType::e2D || src.info.type != ImageType::e2D ||
+        dst.info.num_samples != 1 || src.info.num_samples != 1 ||
+        src.info.format != dst.info.format || src.info.astc_opaque != dst.info.astc_opaque ||
+        True((src.flags | dst.flags) & excluded) || levels <= 0 || layers <= 0 ||
+        written.size() / static_cast<size_t>(levels) < static_cast<size_t>(layers)) {
+        return;
+    }
+    // A compressed alias's copy counts blocks while the backend copies texels.
+    if (DefaultBlockWidth(dst.info.format) != 1 || DefaultBlockHeight(dst.info.format) != 1) {
+        return;
+    }
+    const auto valid_level = [](const ImageInfo& info, s32 level) {
+        const auto size = info.size;
+        return level >= 0 && level < info.resources.levels &&
+               static_cast<u32>(level) < HostMipLevelCount(size.width, size.height, size.depth,
+                                                           info.resources.levels);
+    };
+    for (const ImageCopy& copy : copies) {
+        const auto& from = copy.src_subresource;
+        const auto& to = copy.dst_subresource;
+        if (!valid_level(src.info, from.base_level) || !valid_level(dst.info, to.base_level) ||
+            from.base_layer < 0 || to.base_layer < 0 || from.num_layers <= 0 ||
+            from.num_layers != to.num_layers || from.num_layers > src.info.resources.layers ||
+            from.base_layer > src.info.resources.layers - from.num_layers ||
+            to.num_layers > layers || to.base_layer > layers - to.num_layers) {
+            continue;
+        }
+        const Extent3D available = MipSize(src.info.size, from.base_level);
+        if (copy.src_offset != Offset3D{} || copy.dst_offset != Offset3D{} ||
+            copy.extent != MipSize(dst.info.size, to.base_level) || copy.extent.depth != 1 ||
+            copy.extent.width > available.width || copy.extent.height > available.height) {
+            continue;
+        }
+        const size_t first = static_cast<size_t>(to.base_level) * layers + to.base_layer;
+        std::ranges::fill(written.subspan(first, to.num_layers), u8{1});
+    }
+}
+
+bool CopiesWriteWholeImage(const ImageBase& dst, const ImageBase& src,
+                           std::span<const ImageCopy> copies) {
+    if (dst.info.resources.levels <= 0 || dst.info.resources.layers <= 0) {
+        return false;
+    }
+    std::vector<u8> written(static_cast<size_t>(dst.info.resources.levels) * dst.info.resources.layers);
+    MarkSubresourcesWrittenWhole(dst, src, copies, written);
+    return std::ranges::all_of(written, [](u8 whole) { return whole != 0; });
+}
+
 boost::container::small_vector<SwizzleParameters, 16> FullUploadSwizzles(const ImageInfo& info) {
     const Extent2D tile_size = DefaultBlockSize(info.format);
     if (info.type == ImageType::Linear) {
@@ -1542,6 +1600,16 @@ void SwizzleImage(Tegra::MemoryManager& gpu_memory, GPUVAddr gpu_addr, const Ima
                   Common::ScratchBuffer<u8>& tmp_buffer) {
     const bool is_pitch_linear = info.type == ImageType::Linear;
     for (const BufferImageCopy& copy : copies) {
+        const u32 levels =
+            info.num_samples > 1
+                ? 1
+                : HostMipLevelCount(info.size.width, info.size.height, info.size.depth,
+                                    static_cast<u32>(info.resources.levels));
+        if (!IsHostMipLevel(copy.image_subresource.base_level, levels)) {
+            // The host did not download this tail level. Preserve the guest bytes.
+            continue;
+        }
+
         if (is_pitch_linear) {
             SwizzlePitchLinearImage(gpu_memory, gpu_addr, info, copy, memory);
         } else {

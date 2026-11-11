@@ -13,6 +13,7 @@
 #include "core/arm/dynarmic/arm_dynarmic.h"
 #include "core/arm/dynarmic/arm_dynarmic_64.h"
 #include "core/arm/dynarmic/dynarmic_exclusive_monitor.h"
+#include "core/arm/dynarmic/jit_warmup.h"
 #include "core/arm/dynarmic/oot_lookup_sites.h"
 #include "core/arm/dynarmic/window_trace.h"
 #include "core/core_timing.h"
@@ -58,12 +59,10 @@ Dynarmic::A64::Vector DynarmicCallbacks64::MemoryRead128(u64 vaddr) {
 std::optional<u32> DynarmicCallbacks64::MemoryReadCode(u64 vaddr) {
     if (!m_memory.IsValidVirtualAddressRange(vaddr, sizeof(u32)))
         return std::nullopt;
-    auto const aligned_vaddr = vaddr & ~Core::Memory::YUZU_PAGEMASK;
-    if (last_code_addr != aligned_vaddr) {
-        m_memory.ReadBlock(aligned_vaddr, &cached_code_page, sizeof(cached_code_page));
-        last_code_addr = aligned_vaddr;
-    }
-    const u32 instruction = cached_code_page.inst[(vaddr & Core::Memory::YUZU_PAGEMASK) / sizeof(u32)];
+    static_assert(Dynarmic::CODE_PAGE_SIZE - 1 == Core::Memory::YUZU_PAGEMASK);
+    const u32 instruction = instruction_page.Read(vaddr, [this](u64 base, Dynarmic::CodePage& page) {
+        m_memory.ReadBlock(base, &page, sizeof(page));
+    });
     if (WindowTrace::Enabled() && m_process->GetProgramId() == WindowTrace::ProgramId) {
         if (!m_window_trace) {
             m_window_trace = WindowTrace::sessions.Find(m_process);
@@ -115,7 +114,7 @@ bool DynarmicCallbacks64::MemoryWriteExclusive128(u64 vaddr, Dynarmic::A64::Vect
 }
 
 void DynarmicCallbacks64::InstructionCacheOperationRaised(Dynarmic::A64::InstructionCacheOperation op, u64 value) {
-    last_code_addr = u64(-1); //invalidate cached page
+    instruction_page.ResetLocal();
     switch (op) {
     case Dynarmic::A64::InstructionCacheOperation::InvalidateByVAToPoU: {
         static constexpr u64 ICACHE_LINE_SIZE = 64;
@@ -265,6 +264,12 @@ u64 DynarmicCallbacks64::GetCNTPCT() {
     }
     m_last_cntpct = ticks;
     return ticks;
+}
+
+void DynarmicCallbacks64::BlockCompiled(u64 location) {
+    if (m_parent.m_warmup) {
+        m_parent.m_warmup->OnCompiled(m_parent.m_core_index, location);
+    }
 }
 
 bool DynarmicCallbacks64::CheckMemoryAccess(u64 addr, u64 size, Kernel::DebugWatchpointType type) {
@@ -457,6 +462,11 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
         config.fastmem_pointer = std::nullopt;
         config.fastmem_exclusive_access = false;
     }
+    // Dynarmic's default safe flags already skip the read-only IR verification pass.
+    const auto accuracy = Settings::values.cpu_accuracy.GetValue();
+    if (accuracy == Settings::CpuAccuracy::Debugging || accuracy == Settings::CpuAccuracy::Paranoid) {
+        config.optimizations &= ~Dynarmic::OptimizationFlag::DisableVerification;
+    }
     m_jit.emplace(config);
 #if defined(__linux__) && defined(__x86_64__)
     const char* option = std::getenv("STITCH_OOT_COMPARE_LINK");
@@ -570,15 +580,36 @@ void ArmDynarmic64::SignalInterrupt(Kernel::KThread* thread) {
 }
 
 void ArmDynarmic64::ClearInstructionCache() {
-    m_cb->last_code_addr = u64(-1);
+    m_cb->instruction_page.Invalidate();
     m_jit->ClearCache();
+}
+
+bool ArmDynarmic64::SupportsJitWarmup() const {
+#ifdef ARCHITECTURE_x86_64
+    return true;
+#else
+    return false;
+#endif
+}
+
+void ArmDynarmic64::SetJitWarmup(std::shared_ptr<JitWarmup> warmup) {
+    m_warmup = std::move(warmup);
+}
+
+bool ArmDynarmic64::WarmUp(const std::atomic<bool>& stop) {
+    if (!m_warmup) {
+        return false;
+    }
+    const bool more = m_warmup->Run(m_core_index, *m_jit, stop);
+    m_cb->instruction_page.ResetLocal();
+    return more;
 }
 
 void ArmDynarmic64::InvalidateCacheRange(u64 addr, std::size_t size) {
     // Drop the cached code page too: blocks recompiled after the invalidation would
     // otherwise still decode the old instructions (e.g. a gdbstub breakpoint written
     // into or removed from that page).
-    m_cb->last_code_addr = u64(-1);
+    m_cb->instruction_page.Invalidate();
     m_jit->InvalidateCacheRange(addr, size);
 }
 

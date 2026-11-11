@@ -4,10 +4,15 @@
 #include "core/device_memory_manager.inc"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/rasterizer_interface.h"
+#include "video_core/nx2.h"
 
 namespace Tegra {
 
 struct MaxwellDeviceMethods {
+    static void ForgetSemaphoreMapping(DAddr address, size_t size) {
+        Nx2MirrorShadow::Get().ForgetDeviceMapping(address, size);
+    }
+
     static inline void MarkRegionCaching(Core::Memory::Memory* interface, VAddr address,
                                          size_t size, bool caching) {
         interface->RasterizerMarkRegionCached(address, size, caching);

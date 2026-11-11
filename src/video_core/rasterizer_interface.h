@@ -34,14 +34,40 @@ struct TICEntry;
 }
 } // namespace Tegra
 
+namespace VideoCommon::OotNetwork {
+struct BypassState;
+}
+
 namespace VideoCore {
 
 enum class LoadCallbackStage {
     Prepare,
     Build,
     Complete,
+    /// The shader precache running before the game starts (programs built / total).
+    /// Last, so the values of the others stay as frontends that know only those expect.
+    Warm,
 };
 using DiskResourceLoadCallback = std::function<void(LoadCallbackStage, std::size_t, std::size_t)>;
+
+/// A query slot released on return needs the fence manager to use the same decision the
+/// query cache made, even if GPU accuracy changes before SignalFence enters the backend.
+enum class QueryReportFence { UseSettings, Inline, Deferred };
+
+class ScopedQueryReportFence {
+public:
+    explicit ScopedQueryReportFence(QueryReportFence mode) : previous{std::exchange(next, mode)} {}
+    ~ScopedQueryReportFence() { next = previous; }
+    ScopedQueryReportFence(const ScopedQueryReportFence&) = delete;
+    ScopedQueryReportFence& operator=(const ScopedQueryReportFence&) = delete;
+
+    /// Consume once so ordinary fences nested inside the operation still follow their settings.
+    static QueryReportFence Take() { return std::exchange(next, QueryReportFence::UseSettings); }
+
+private:
+    inline static thread_local QueryReportFence next{QueryReportFence::UseSettings};
+    QueryReportFence previous;
+};
 
 class RasterizerInterface {
 public:
@@ -107,6 +133,24 @@ public:
     virtual void FlushRegion(DAddr addr, u64 size,
                              VideoCommon::CacheType which = VideoCommon::CacheType::All) = 0;
 
+    /// FlushRegion for a guest CPU read of the region (GPU::OnCPURead), on the GPU thread: a
+    /// cache may submit its downloads without waiting for the host GPU, for FinishRead to write.
+    virtual void FlushRegionForRead(DAddr addr, u64 size) {
+        FlushRegion(addr, size);
+    }
+
+    /// Writes to guest memory what FlushRegionForRead submitted over the region (and anything
+    /// submitted before it), waiting for the host GPU if it must. Any thread: the reading one
+    /// before it reads, and the GPU's side before it writes guest memory there.
+    virtual void FinishRead([[maybe_unused]] DAddr addr, [[maybe_unused]] u64 size) {}
+
+    /// A query result the query cache writes to guest memory later, at a fence or sync point.
+    /// When this returns true, FinishReport once it wrote or dropped it.
+    virtual bool NoteReportPending([[maybe_unused]] DAddr addr, [[maybe_unused]] u64 size) {
+        return false;
+    }
+    virtual void FinishReport([[maybe_unused]] DAddr addr, [[maybe_unused]] u64 size) {}
+
     /// Switch 2, from the GPU thread's front: where a GPU-written command list's words are.
     enum class GpuWrittenList {
         Unknown, ///< Neither: the caller drains, flushes the page and notes it synced
@@ -115,11 +159,22 @@ public:
         /// Draws write the page: ask again with `past_sync` once the split's back ran the work
         /// before the last host-level wait (GpuSplit::WaitForSync)
         NeedsSync,
+        /// Only with `pending_tick`: the copy is not done yet, `*pending_tick` is the host GPU
+        /// tick that completes it. Ask again once IsGpuTickDone(*pending_tick).
+        Pending,
     };
+    /// With `pending_tick`, a copy the GPU is still making returns Pending instead of waiting.
     virtual GpuWrittenList ReadGpuWrittenCommandList([[maybe_unused]] DAddr addr,
                                                      [[maybe_unused]] std::span<u8> out,
-                                                     [[maybe_unused]] bool past_sync) {
+                                                     [[maybe_unused]] bool past_sync,
+                                                     [[maybe_unused]] u64* pending_tick = nullptr) {
         return GpuWrittenList::Unknown;
+    }
+
+    /// Whether the host GPU passed `tick`, without waiting. Asks for deferred work to be
+    /// submitted when the tick is not submitted yet, so it completes.
+    virtual bool IsGpuTickDone([[maybe_unused]] u64 tick) {
+        return true;
     }
 
     /// Switch 2: the front flushed this command list page with the split drained.
@@ -235,7 +290,8 @@ public:
         const Tegra::Engines::Fermi2D::Surface& src, const Tegra::Engines::Fermi2D::Surface& dst,
         const Tegra::Engines::Fermi2D::Surface& motion_vectors,
         const Tegra::Texture::TICEntry* depth, std::array<f32, 2> jitter,
-        std::array<f32, 2> motion_scale, bool use_history = true) {
+        std::array<f32, 2> motion_scale, bool use_history = true,
+        std::optional<std::array<u32, 2>> render_region = std::nullopt) {
         return false;
     }
 
@@ -260,6 +316,12 @@ public:
     [[nodiscard]] virtual std::optional<VideoCore::GameDlssProbe> ProbeGameDlssOutput(
         const Tegra::Engines::Fermi2D::Surface& src, const Tegra::Engines::Fermi2D::Surface& dst) {
         return std::nullopt;
+    }
+
+    /// State of the Ocarina of Time anti-aliasing network bypass (oot_network.h), or null when
+    /// this backend cannot bypass it or NVIDIA DLSS replaces the same output pass.
+    [[nodiscard]] virtual VideoCommon::OotNetwork::BypassState* OotNetworkBypass() {
+        return nullptr;
     }
 
     [[nodiscard]] virtual Tegra::Engines::AccelerateDMAInterface& AccessAccelerateDMA() = 0;

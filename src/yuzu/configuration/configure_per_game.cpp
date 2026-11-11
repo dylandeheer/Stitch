@@ -74,6 +74,7 @@
 #include "yuzu/configuration/configure_per_game.h"
 #include "yuzu/configuration/configure_per_game_addons.h"
 #include "yuzu/configuration/configure_system.h"
+#include "yuzu/configuration/linux_scrollable_page.h"
 #include "yuzu/util/util.h"
 
 namespace {
@@ -400,6 +401,12 @@ ConfigurePerGame::ConfigurePerGame(QWidget* parent, u64 title_id_, const std::st
     ui->tabWidget->addTab(input_tab.get(), tr("Input Profiles"));
     ui->tabWidget->addTab(network_tab.get(), tr("Network"));
     ui->tabWidget->addTab(applets_tab.get(), tr("Applets"));
+
+#if defined(__linux__) && !defined(__ANDROID__)
+    for (int index = 0; index < ui->tabWidget->count(); ++index) {
+        ConfigurationShared::MakePageScrollable(ui->tabWidget->widget(index));
+    }
+#endif
 
     setFocusPolicy(Qt::ClickFocus);
     setWindowTitle(tr("Properties"));

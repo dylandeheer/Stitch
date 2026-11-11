@@ -1,10 +1,13 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
 #include <array>
 #include <limits>
 #include <thread>
+#include <vector>
 #include <catch2/catch_test_macros.hpp>
+#include "audio_core/sink/null_sink.h"
 #include "common/atomic_ops.h"
 #include "common/scope_exit.h"
 #include "core/core_timing.h"
@@ -68,6 +71,63 @@ TEST_CASE("sysmix input publishes fresh mono capture across ring wrap", "[sysmix
     REQUIRE(purged == 3);
     REQUIRE(context.Memory().Read32Acquire(Context::Base + 0x44, read));
     REQUIRE(read == write);
+}
+
+TEST_CASE("sysmix input captures silence when the host microphone cannot open", "[sysmix][input]") {
+    Context context;
+    context.sink.ready = false;
+    std::array<s16, 2400> stale{};
+    stale.fill(0x1234);
+    REQUIRE(context.Memory().WriteBlock(Context::Base + 0x1040, stale.data(), sizeof(stale)));
+    SysmixOutput stream{
+        context.system, *context.process, context.sink, 2, Context::Base, Context::Size, 2, true};
+    REQUIRE(stream.Open(2, 1, 48000, 4096, 0, 0).IsSuccess());
+    REQUIRE(context.sink.last == nullptr);
+    REQUIRE(context.sink.closed == 1);
+    REQUIRE(stream.SetEngaged(true).IsSuccess());
+    REQUIRE(stream.GetState() == 2);
+    const auto advance = [&] {
+        context.system.CoreTiming().cpu_ticks += Common::WallClock::CPUTickFreq / 200;
+        context.system.CoreTiming().Advance();
+        stream.Pump();
+    };
+    for (int block = 0; block < 10; ++block) {
+        advance();
+    }
+    u32 write{};
+    REQUIRE(context.Memory().Read32Acquire(Context::Base + 0x1004, write));
+    REQUIRE(write >= 9 * 240);
+    REQUIRE(write <= 10 * 240);
+    std::vector<s16> captured(write);
+    REQUIRE(context.Memory().ReadBlock(Context::Base + 0x1040, captured.data(),
+                                       captured.size() * sizeof(s16)));
+    REQUIRE(std::ranges::all_of(captured, [](s16 sample) { return sample == 0; }));
+    REQUIRE(stream.GetCounters().nonzero_frames == 0);
+    REQUIRE(stream.SetEngaged(false).IsSuccess());
+    const u32 stopped = write;
+    advance();
+    REQUIRE(context.Memory().Read32Acquire(Context::Base + 0x1004, write));
+    REQUIRE(write == stopped);
+}
+
+TEST_CASE("sysmix input captures silence when the host microphone cannot start",
+          "[sysmix][input]") {
+    Context context;
+    context.sink.fail_start = true;
+    SysmixOutput stream{
+        context.system, *context.process, context.sink, 2, Context::Base, Context::Size, 2, true};
+    REQUIRE(stream.Open(2, 1, 48000, 1024, 0, 0).IsSuccess());
+    REQUIRE(context.sink.last != nullptr);
+    REQUIRE(stream.SetEngaged(true).IsSuccess());
+    REQUIRE(context.sink.last == nullptr);
+    for (int block = 0; block < 2; ++block) {
+        context.system.CoreTiming().cpu_ticks += Common::WallClock::CPUTickFreq / 200;
+        context.system.CoreTiming().Advance();
+        stream.Pump();
+    }
+    u32 write{};
+    REQUIRE(context.Memory().Read32Acquire(Context::Base + 0x1004, write));
+    REQUIRE(write >= 240);
 }
 
 TEST_CASE("sysmix input applies gain to float capture and protects producer ownership",
@@ -253,7 +313,7 @@ TEST_CASE("sysmix mode2 event uses actual free frames even before engagement", "
     REQUIRE_FALSE(stream.GetDataEvent()->IsSignaled(context.system.Kernel()));
     REQUIRE(stream.SetEngaged(true).IsSuccess());
     stream.Pump();
-    REQUIRE(ReadCursor(context) == 240);
+    REQUIRE(ReadCursor(context) == 480);
     REQUIRE(stream.GetDataEvent()->IsSignaled(context.system.Kernel()));
     REQUIRE(stream.SetEngaged(false).IsSuccess());
     REQUIRE(stream.GetDataEvent()->Clear(context.system.Kernel()).IsSuccess());
@@ -263,6 +323,26 @@ TEST_CASE("sysmix mode2 event uses actual free frames even before engagement", "
     REQUIRE(stream.GetDataEvent()->Clear(context.system.Kernel()).IsSuccess());
     stream.Pump();
     REQUIRE_FALSE(stream.GetDataEvent()->IsSignaled(context.system.Kernel()));
+}
+
+TEST_CASE("sysmix signals free guest space while the host queue remains full", "[sysmix]") {
+    Context context;
+    Cursor(context, 0, 730);
+    SysmixOutput stream{context.system, *context.process, context.sink, 1,
+                        Context::Base, Context::Size, 0x24};
+    REQUIRE(stream.Open(5, 2, 48000, 2048, 0, 0).IsSuccess());
+    REQUIRE(stream.SetDataNotification(2, 1536).IsSuccess());
+    REQUIRE(stream.SetEngaged(true).IsSuccess());
+    stream.Pump();
+    REQUIRE(ReadCursor(context) == 720);
+    REQUIRE(context.sink.last->GetQueueSize() == 3);
+    REQUIRE(stream.GetDataEvent()->IsSignaled(context.system.Kernel()));
+    REQUIRE(stream.GetDataEvent()->Clear(context.system.Kernel()).IsSuccess());
+    stream.Pump();
+    REQUIRE(stream.GetDataEvent()->IsSignaled(context.system.Kernel()));
+    REQUIRE(ReadCursor(context) == 720);
+    REQUIRE(stream.GetCounters().accepted_frames == 720);
+    REQUIRE(stream.GetCounters().admitted_blocks == 3);
 }
 
 TEST_CASE("sysmix backpressure leaves guest ownership unchanged and resumes in order", "[sysmix]") {
@@ -275,16 +355,15 @@ TEST_CASE("sysmix backpressure leaves guest ownership unchanged and resumes in o
                         Context::Size, 0x24};
     REQUIRE(stream.Open(5, 2, 48000, 2048, 0, 0).IsSuccess());
     REQUIRE(stream.SetEngaged(true).IsSuccess());
-    for (u32 i = 0; i < 3; ++i) {
-        stream.Pump();
-    }
+    // Before the host reveals its callback size, refill only the existing three-block cap.
+    stream.Pump();
     REQUIRE(ReadCursor(context) == 720);
     stream.Pump();
     REQUIRE(ReadCursor(context) == 720);
     REQUIRE(stream.GetCounters().accepted_frames == 720);
     REQUIRE(stream.GetCounters().backpressure == 1);
-    REQUIRE(stream.GetCounters().copied_frames == 960);
-    REQUIRE(stream.GetCounters().retried_frames == 240);
+    REQUIRE(stream.GetCounters().copied_frames == 720);
+    REQUIRE(stream.GetCounters().retried_frames == 0);
     std::array<s16, 480> output{};
     context.sink.last->ProcessAudioOutAndRender(output, 240);
     stream.Pump();
@@ -522,4 +601,112 @@ TEST_CASE("sysmix does not report successful disengage after backend stop failur
     REQUIRE(stream.GetCounters().faults == 1);
     stream.Pump();
     REQUIRE(stream.GetCounters().admitted_blocks == 0);
+}
+
+TEST_CASE("sysmix refills host headroom across callback phase and timer jitter", "[sysmix]") {
+    for (const u32 delay : {0U, 32U, 272U}) {
+        CAPTURE(delay);
+        Context context;
+        std::vector<float> pcm(2049 * 2);
+        for (u32 slot = 0; slot < 2049; ++slot) {
+            pcm[slot * 2] = static_cast<float>(slot + 1) / 32768.0f;
+            pcm[slot * 2 + 1] = -pcm[slot * 2];
+        }
+        REQUIRE(context.Memory().WriteBlock(Context::Base + 0x1040, pcm.data(),
+                                            pcm.size() * sizeof(float)));
+        u32 cursor = 2048;
+        REQUIRE(context.Memory().WriteBlock(Context::Base + 0x1004, &cursor, 4));
+        SysmixOutput stream{context.system, *context.process, context.sink, 1,
+                            Context::Base,  Context::Size,    0x24};
+        REQUIRE(stream.Open(5, 2, 48000, 2048, 0, 0).IsSuccess());
+        REQUIRE(stream.SetEngaged(true).IsSuccess());
+        auto& host = *context.sink.last;
+        host.SetSystemVolume(1.0f / Settings::Volume());
+        std::array<s16, 2048> output{};
+        // Learn the real host callback size before measuring steady-state PCM delivery.
+        host.ProcessAudioOutAndRender(output, 1024);
+        struct Event {
+            u32 frame;
+            bool pump;
+        };
+        std::vector<Event> events;
+        // In the old one-block pump, delaying deadline 4080 by just 32 frames (0.667 ms)
+        // leaves 1008 frames for the host request at 4096: exactly 16 inserted zeros.
+        // Also exercise a delay exceeding a full 5 ms producer period; the timer skips the
+        // missed deadline instead of running a second pump concurrently with the late callback.
+        for (u32 frame = 0; frame <= 6000; frame += 240) {
+            if (delay >= 240 && frame == 4320) {
+                continue;
+            }
+            events.push_back({frame + (frame == 4080 ? delay : 0U), true});
+        }
+        for (u32 frame = 1024; frame <= 5120; frame += 1024) {
+            events.push_back({frame, false});
+        }
+        std::ranges::stable_sort(events, {}, &Event::frame);
+        u32 missing{}, rendered{};
+        for (const auto event : events) {
+            if (event.pump) {
+                stream.Pump();
+                REQUIRE(context.Memory().Read32Acquire(Context::Base + 0x44, cursor));
+                cursor = (cursor + 2048) % 2049;
+                REQUIRE(context.Memory().WriteBlock(Context::Base + 0x1004, &cursor, 4));
+            } else {
+                host.ProcessAudioOutAndRender(output, 1024);
+                for (u32 i = 0; i < 1024; ++i) {
+                    const s16 expected = static_cast<s16>(rendered++ % 2049 + 1);
+                    REQUIRE(output[i * 2] == expected);
+                    REQUIRE(output[i * 2 + 1] == -expected);
+                    missing += output[i * 2] == 0;
+                }
+            }
+        }
+        INFO("pump delay in frames=" << delay << " missing=" << missing);
+        REQUIRE(missing == 0);
+        REQUIRE(stream.GetCounters().padded_frames == 0);
+    }
+}
+
+TEST_CASE("sysmix refill budget stays bounded while the host consumes concurrently", "[sysmix]") {
+    Context context;
+    Cursor(context, 0, 2048);
+    SysmixOutput stream{context.system, *context.process, context.sink, 1,
+                        Context::Base,  Context::Size,    0x24};
+    REQUIRE(stream.Open(5, 2, 48000, 2048, 0, 0).IsSuccess());
+    REQUIRE(stream.SetEngaged(true).IsSuccess());
+    std::array<s16, 480> output{};
+    context.sink.last->on_admit = [&] { context.sink.last->ProcessAudioOutAndRender(output, 240); };
+    stream.Pump();
+    REQUIRE(stream.GetCounters().admitted_blocks == 3);
+    REQUIRE(ReadCursor(context) == 720);
+    REQUIRE(context.sink.last->GetQueueSize() == 0);
+    REQUIRE(stream.GetCounters().padded_frames == 0);
+}
+
+TEST_CASE("sysmix null output preserves PCM cadence and notification timing", "[sysmix]") {
+    Context context;
+    AudioCore::Sink::NullSink sink{"auto"};
+    Cursor(context, 0, 1440);
+    std::vector<float> pcm(1440 * 2, 0.25f);
+    REQUIRE(context.Memory().WriteBlock(Context::Base + 0x1040, pcm.data(),
+                                        pcm.size() * sizeof(float)));
+    SysmixOutput stream{context.system, *context.process, sink, 1,
+                        Context::Base,  Context::Size,    0x24};
+    REQUIRE(stream.Open(5, 2, 48000, 2048, 0, 0).IsSuccess());
+    REQUIRE(stream.SetDataNotification(2, 1100).IsSuccess());
+    REQUIRE_FALSE(stream.GetDataEvent()->IsSignaled(context.system.Kernel()));
+    REQUIRE(stream.SetEngaged(true).IsSuccess());
+    for (u32 tick = 1; tick <= 6; ++tick) {
+        CAPTURE(tick);
+        stream.Pump();
+        REQUIRE(ReadCursor(context) == tick * 240);
+        REQUIRE(stream.GetCounters().accepted_frames == tick * 240);
+        REQUIRE(stream.GetCounters().nonzero_frames == tick * 240);
+        REQUIRE(stream.GetCounters().admitted_blocks == tick);
+        REQUIRE(stream.GetCounters().padded_frames == 0);
+        // Initial free space is 608 frames. The 1100-frame threshold must first be reached
+        // after three 5 ms ticks, just as when the original pump admitted one block per tick.
+        REQUIRE(stream.GetDataEvent()->IsSignaled(context.system.Kernel()) == (tick >= 3));
+        REQUIRE(stream.GetDataEvent()->Clear(context.system.Kernel()).IsSuccess());
+    }
 }

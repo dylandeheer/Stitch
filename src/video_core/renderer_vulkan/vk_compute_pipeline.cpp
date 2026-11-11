@@ -17,6 +17,8 @@
 #include <boost/container/small_vector.hpp>
 #include <fmt/format.h>
 
+#include "video_core/nx2_profile.h"
+#include "video_core/renderer_vulkan/pipeline_build_failure.h"
 #include "video_core/renderer_vulkan/pipeline_build_trace.h"
 #include "video_core/renderer_vulkan/pipeline_helper.h"
 #include "video_core/renderer_vulkan/pipeline_optimization.h"
@@ -25,6 +27,7 @@
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
 #include "video_core/renderer_vulkan/vk_frame_dump.h"
+#include "video_core/renderer_vulkan/vk_pipeline_binaries.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
@@ -289,19 +292,23 @@ void ComputePipeline::TickUpscalerTrace() {
     }
 }
 
-ComputePipeline::ComputePipeline(
-    const Device& device_, Scheduler& scheduler, vk::PipelineCache& pipeline_cache_,
-    DescriptorPool& descriptor_pool, GuestDescriptorQueue& guest_descriptor_queue_,
-    DescriptorBufferRing& descriptor_buffer_ring_, Common::ThreadWorker* thread_worker,
-    PipelineStatistics* pipeline_statistics, VideoCore::ShaderNotify* shader_notify,
-    const Shader::Info& info_, vk::ShaderModule spv_module_, u64 shader_hash_,
-    vk::ShaderModule paired_spv_module_, TensorPipelineMode* tensor_mode_,
-    vk::ShaderModule reuse_spv_module_)
-    : device{device_}, pipeline_cache(pipeline_cache_),
+ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk::PipelineCache& pipeline_cache_,
+                                 PipelineBinaries* binaries_, u64 binary_key_,
+                                 DescriptorPool& descriptor_pool,
+                                 GuestDescriptorQueue& guest_descriptor_queue_,
+                                 DescriptorBufferRing& descriptor_buffer_ring_,
+                                 const PipelineBuildQueue& build_queue,
+                                 PipelineStatistics* pipeline_statistics,
+                                 VideoCore::ShaderNotify* shader_notify, const Shader::Info& info_,
+                                 vk::ShaderModule spv_module_, u64 shader_hash_,
+                                 std::function<vk::ShaderModule()> emit, vk::ShaderModule paired,
+                                 TensorPipelineMode* mode, vk::ShaderModule reuse)
+    : device{device_},
+      pipeline_cache(pipeline_cache_), binaries{binaries_}, binary_key{binary_key_},
       guest_descriptor_queue{guest_descriptor_queue_},
-      descriptor_buffer_ring{descriptor_buffer_ring_}, info{info_}, shader_hash{shader_hash_},
-      spv_module(std::move(spv_module_)), paired_spv_module{std::move(paired_spv_module_)},
-      reuse_spv_module{std::move(reuse_spv_module_)}, tensor_mode{tensor_mode_} {
+      descriptor_buffer_ring{descriptor_buffer_ring_}, info{info_},
+      shader_hash{shader_hash_}, spv_module(std::move(spv_module_)),
+      paired_spv_module{std::move(paired)}, reuse_spv_module{std::move(reuse)}, tensor_mode{mode} {
     if (shader_notify) {
         shader_notify->MarkShaderBuilding();
     }
@@ -388,14 +395,18 @@ ComputePipeline::ComputePipeline(
             const bool unoptimized = (flags & VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT) != 0;
             const auto trace_begin = std::chrono::steady_clock::now();
             TracePipelineBuild("BEGIN", "compute", shader_hash, traced, unoptimized);
-            pipeline = device.GetLogical().CreateComputePipeline(compute_ci, *pipeline_cache);
+            pipeline = binaries ? binaries->CreateComputePipeline(compute_ci, *pipeline_cache,
+                                                                  binary_key)
+                                : device.GetLogical().CreateComputePipeline(compute_ci,
+                                                                            *pipeline_cache);
             TracePipelineBuild("END", "compute", shader_hash, traced, unoptimized,
                                std::chrono::duration<double, std::milli>(
                                    std::chrono::steady_clock::now() - trace_begin)
                                    .count());
         } catch (const vk::Exception& exception) {
-            LOG_CRITICAL(Render_Vulkan, "Adreno rejected compute shader {:016X}: {}", shader_hash,
+            LOG_CRITICAL(Render_Vulkan, "Driver rejected compute shader {:016X}: {}", shader_hash,
                          exception.what());
+            ReportPipelineBuildFailure(exception.GetResult());
             std::scoped_lock lock{build_mutex};
             is_built = true;
             build_condvar.notify_one();
@@ -461,15 +472,55 @@ ComputePipeline::ComputePipeline(
         }
     }};
     build_task = std::move(func);
-    if (thread_worker) {
-        build_task_done = false;
-        thread_worker->QueueWork([this] {
-            RunBuild();
-            // The last access to this pipeline from the worker.
-            build_task_done.store(true, std::memory_order::release);
-        });
-    } else {
+    if (build_queue.jobs) {
+        jobs = build_queue.jobs;
+        VideoCommon::ShaderJob build_job{
+            .priority = VideoCommon::ShaderJobPriority::Soon,
+            .cpu_bytes = build_queue.cpu_bytes,
+            .driver_bytes = build_queue.driver_bytes,
+        };
+        if (emit) {
+            // The SPIR-V is emitted first, in the job's CPU stage (shader cache v2)
+            build_job.cpu = [this, shader_notify, emit = std::move(emit)](
+                                VideoCommon::ShaderJobContext&) -> VideoCommon::ShaderDriverStage {
+                // A pipeline that fails here is built without a VkPipeline: its dispatches are
+                // skipped, as for one the driver rejects
+                const auto fail = [&](const char* what) {
+                    LOG_ERROR(Render_Vulkan,
+                              "Compute pipeline compilation failed shader={:#016x}: {}",
+                              shader_hash, what);
+                    std::scoped_lock lock{build_mutex};
+                    is_built = true;
+                    build_condvar.notify_one();
+                    if (shader_notify) {
+                        shader_notify->MarkShaderComplete();
+                    }
+                };
+                try {
+                    spv_module = emit();
+                } catch (const std::exception& exception) {
+                    fail(exception.what());
+                    return {};
+                } catch (...) {
+                    fail("unknown exception");
+                    return {};
+                }
+                return [this] { RunBuild(); };
+            };
+        } else {
+            build_job.driver = [this] { RunBuild(); };
+        }
+        job = jobs->Submit(std::move(build_job));
+    } else if (!build_queue.owner_builds) {
         RunBuild();
+    }
+}
+
+ComputePipeline::~ComputePipeline() {
+    if (jobs) {
+        // Nothing needs a pipeline that goes: a build still queued is dropped.
+        jobs->Cancel(job);
+        job.Wait();
     }
 }
 
@@ -483,11 +534,24 @@ void ComputePipeline::RunBuild() {
     build_task = nullptr;
 }
 
+bool ComputePipeline::CanReplaceOcarinaUpscale() const {
+    const bool known_shader =
+        shader_hash == 0xe40f5efb5480e692ULL || shader_hash == 0xef542df87cacfe9eULL ||
+        shader_hash == Ocarina1440pShader ||
+        shader_hash == OcarinaFullSizeShader;
+    return known_shader && !info.stores_global_memory &&
+           info.image_buffer_descriptors.empty() && info.image_descriptors.size() == 1 &&
+           info.image_descriptors.front().count == 1 && info.image_descriptors.front().is_written &&
+           !info.image_descriptors.front().is_read && !info.image_descriptors.front().is_byte_addressed &&
+           std::ranges::none_of(info.storage_buffers_descriptors, &Shader::StorageBufferDescriptor::is_written);
+}
+
 bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
                                 Tegra::MemoryManager& gpu_memory, Scheduler& scheduler,
                                 BufferCache& buffer_cache, TextureCache& texture_cache,
                                 TextureCacheRuntime& texture_runtime,
-                                std::optional<ByteAddressedShadow>& shadow) {
+                                std::optional<ByteAddressedShadow>& shadow,
+                                BindCommand* deferred_bind) {
     shadow.reset();
     guest_descriptor_queue.Acquire(scheduler, num_descriptor_entries, uses_descriptor_buffer);
 
@@ -562,7 +626,9 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     }
     for (const auto& desc : info.texture_descriptors) {
         for (u32 index = 0; index < desc.count; ++index) {
-            const auto handle{read_handle(desc, index)};
+            const auto handle{VideoCommon::HandleIsStoragePointer(info, desc, index)
+                                  ? VideoCommon::NULL_TEXTURE_HANDLE
+                                  : read_handle(desc, index)};
             views.push_back({handle.first});
 
             VideoCommon::SamplerId sampler = texture_cache.GetSamplerId(handle.second, true);
@@ -587,7 +653,7 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
         }
     }
 
-    if (RecordingSampledTextures()) {
+    if (RecordingSampledTextures() || deferred_bind) {
         sampled_images.clear();
         const size_t first = Shader::NumDescriptors(info.texture_buffer_descriptors) +
                              Shader::NumDescriptors(info.image_buffer_descriptors);
@@ -735,7 +801,16 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     if (!is_built.load(std::memory_order::acquire)) {
         // Wait for the pipeline to be built
         scheduler.Record([this](vk::CommandBuffer) {
-            RunBuild();
+            const VideoCommon::Nx2Profile::Scope scope{VideoCommon::Nx2Profile::Zone::PipelineWait};
+            if (jobs) {
+                // Raised to NeedNow, and built here unless a driver worker builds it already
+                jobs->RunOrWait(job);
+                if (job.Status() == VideoCommon::ShaderJobStatus::Cancelled) {
+                    return; // The scheduler shut down
+                }
+            } else {
+                RunBuild();
+            }
             std::unique_lock lock{build_mutex};
             build_condvar.wait(lock, [this] { return is_built.load(std::memory_order::relaxed); });
         });
@@ -763,7 +838,8 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     }
 
     const bool bind_descriptor_buffer{
-        uses_descriptor_buffer && scheduler.UpdateDescriptorBufferChunk(descriptor_buffer_chunk)};
+        uses_descriptor_buffer &&
+        (deferred_bind || scheduler.UpdateDescriptorBufferChunk(descriptor_buffer_chunk))};
 
     if (shadow) {
         image_index = Shader::NumDescriptors(info.texture_buffer_descriptors) +
@@ -780,7 +856,7 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     }
 
     const bool is_rescaling = !info.texture_descriptors.empty() || !info.image_descriptors.empty();
-    scheduler.Record([this, descriptor_data, is_rescaling, descriptor_buffer_offset,
+    auto bind = [this, descriptor_data, is_rescaling, descriptor_buffer_offset,
                       descriptor_buffer_chunk, bind_descriptor_buffer,
                       request = tensor_mode ? tensor_mode->Requested() : TensorVariant::Original,
                       rescaling_data = rescaling.Data()](vk::CommandBuffer cmdbuf) {
@@ -825,7 +901,12 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
             cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *pipeline_layout, 0,
                                       descriptor_set, nullptr);
         }
-    });
+    };
+    if (deferred_bind) {
+        *deferred_bind = std::move(bind);
+    } else {
+        scheduler.Record(std::move(bind));
+    }
     return true;
 }
 

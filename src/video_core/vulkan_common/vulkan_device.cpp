@@ -27,12 +27,14 @@
 #include <ranges>
 #include "common/settings.h"
 #include "common/settings_enums.h"
+#include "video_core/nx2_stutter_trace.h"
 #include "video_core/vulkan_common/nsight_aftermath_tracker.h"
 #include "video_core/vulkan_common/vma.h"
 #include "video_core/vulkan_common/retired_image_pool.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 #include "video_core/gpu_logging/gpu_logging.h"
+#include "video_core/shader_cache_v2/cache.h"
 #ifdef EGLANTINE_STREAMLINE
 #include "video_core/vulkan_common/streamline.h"
 #endif
@@ -429,6 +431,26 @@ u64 AllocatedUsage(VkDeviceSize driver_usage, const VmaBudget& vma_budget) {
     return driver_usage - (std::min)(driver_usage, unused);
 }
 
+// VMA's device memory calls, timed for EDEN_NX2_STUTTER_TRACE.
+PFN_vkAllocateMemory g_vma_allocate_memory{};
+PFN_vkFreeMemory g_vma_free_memory{};
+
+VKAPI_ATTR VkResult VKAPI_CALL TimedAllocateMemory(VkDevice device,
+                                                   const VkMemoryAllocateInfo* allocate_info,
+                                                   const VkAllocationCallbacks* allocator,
+                                                   VkDeviceMemory* memory) {
+    using namespace VideoCommon::StutterTrace;
+    const SiteScope site{Site::MemoryAllocate};
+    return g_vma_allocate_memory(device, allocate_info, allocator, memory);
+}
+
+VKAPI_ATTR void VKAPI_CALL TimedFreeMemory(VkDevice device, VkDeviceMemory memory,
+                                           const VkAllocationCallbacks* allocator) {
+    using namespace VideoCommon::StutterTrace;
+    const SiteScope site{Site::MemoryFree};
+    g_vma_free_memory(device, memory, allocator);
+}
+
 } // Anonymous namespace
 
 void Device::RemoveExtension(bool& extension, const std::string& extension_name) {
@@ -467,6 +489,18 @@ void Device::RemoveExtensionFeatureIfUnsuitable(bool is_suitable, Feature& featu
         this->RemoveExtensionFeature(is_suitable, feature, extension_name);
     }
 }
+
+namespace {
+/// AMD FSR 4 runs AMD's own shaders inside AMD's runtime (Windows, AMD's driver). They need
+/// float16 and, on RDNA 4, float8 on the device; the emulator's shaders use neither for it.
+bool WantsAmdFsr4(VkDriverId driver_id) {
+#ifdef _WIN32
+    return driver_id == VK_DRIVER_ID_AMD_PROPRIETARY && Settings::values.amd_fsr4.GetValue();
+#else
+    return false;
+#endif
+}
+} // Anonymous namespace
 
 Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR surface,
                const vk::InstanceDispatch& dld_)
@@ -516,6 +550,22 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
                      VK_DEVICE_DIAGNOSTICS_CONFIG_ENABLE_AUTOMATIC_CHECKPOINTS_BIT_NV,
         };
         first_next = &diagnostics_nv;
+    }
+
+    // AMD's driver fails device-local allocations once the heap is full unless overallocation is
+    // allowed, which lets them fall back to system memory.
+    VkDeviceMemoryOverallocationCreateInfoAMD overallocation_amd{
+        .sType = VK_STRUCTURE_TYPE_DEVICE_MEMORY_OVERALLOCATION_CREATE_INFO_AMD,
+        .pNext = first_next,
+        .overallocationBehavior = VK_MEMORY_OVERALLOCATION_BEHAVIOR_ALLOWED_AMD,
+    };
+    if (is_amd_driver &&
+        supported_extensions.contains(VK_AMD_MEMORY_OVERALLOCATION_BEHAVIOR_EXTENSION_NAME)) {
+        loaded_extensions.insert(VK_AMD_MEMORY_OVERALLOCATION_BEHAVIOR_EXTENSION_NAME);
+        first_next = &overallocation_amd;
+        LOG_INFO(Render_Vulkan,
+                 "VK_AMD_memory_overallocation_behavior enabled: device memory may overflow into "
+                 "system memory");
     }
 
     is_blit_depth24_stencil8_supported = TestDepthStencilBlits(VK_FORMAT_D24_UNORM_S8_UINT);
@@ -632,6 +682,7 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     // off for newer AMD drivers below: checked after that, every AMD GPU looked like GCN4 and lost
     // VK_EXT_sampler_filter_minmax (an RDNA3 Radeon 780M logged it).
     const bool amd_gcn4_or_older = is_amd && !features.shader_float16_int8.shaderFloat16;
+    const bool device_float16 = features.shader_float16_int8.shaderFloat16;
     if (is_amd_driver) {
         // AMD drivers need a higher amount of Sets per Pool in certain circumstances like in XC2.
         sets_per_pool = 96;
@@ -778,7 +829,7 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     // host-only shaders (frame generation) may use it. The AMD and Intel workarounds turn it off
     // for every shader, host ones included.
     host_float16_supported |= float16_math;
-    if (host_float16_supported) {
+    if (host_float16_supported || (device_float16 && WantsAmdFsr4(driver_id))) {
         features.shader_float16_int8.shaderFloat16 = VK_TRUE;
     }
     logical = vk::Device::Create(physical, queue_cis, ExtensionListForVulkan(loaded_extensions), first_next, dld);
@@ -798,6 +849,10 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     VmaVulkanFunctions functions{};
     functions.vkGetInstanceProcAddr = dld.vkGetInstanceProcAddr;
     functions.vkGetDeviceProcAddr = dld.vkGetDeviceProcAddr;
+    g_vma_allocate_memory = dld.vkAllocateMemory;
+    g_vma_free_memory = dld.vkFreeMemory;
+    functions.vkAllocateMemory = TimedAllocateMemory;
+    functions.vkFreeMemory = TimedFreeMemory;
 
     VmaAllocatorCreateFlags flags =
         ImagePoolBaselineFile() ? 0 : VMA_ALLOCATOR_CREATE_EXTERNALLY_SYNCHRONIZED_BIT;
@@ -1434,6 +1489,11 @@ bool Device::GetSuitability(bool requires_swapchain) {
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_PROPERTIES_KHR;
         SetNext(next, properties.maintenance5);
     }
+    if (extensions.pipeline_binary) {
+        properties.pipeline_binary.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_BINARY_PROPERTIES_KHR;
+        SetNext(next, properties.pipeline_binary);
+    }
     if (extensions.custom_border_color) {
         properties.custom_border_color.sType =
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_PROPERTIES_EXT;
@@ -1443,6 +1503,11 @@ bool Device::GetSuitability(bool requires_swapchain) {
         properties.cooperative_matrix.sType =
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_PROPERTIES_KHR;
         SetNext(next, properties.cooperative_matrix);
+    }
+    if (supported_extensions.contains(VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME)) {
+        properties.integer_dot_product.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_PROPERTIES;
+        SetNext(next, properties.integer_dot_product);
     }
 
     // Perform the property fetch.
@@ -1754,7 +1819,20 @@ void Device::RemoveUnsuitableExtensions() {
                        shape.scope == VK_SCOPE_SUBGROUP_KHR;
             });
         };
-        const bool usable = extensions.cooperative_matrix &&
+        // AMD's driver also advertises the extension on GPUs without matrix cores (GCN, RDNA1,
+        // RDNA2) and crashes in amdvlk64.dll building these pipelines on RDNA2. RDNA3 brought
+        // matrix cores together with accelerated mixed-signedness dot4, which the driver reports.
+        const VkDriverId driver_id = properties.driver.driverID;
+        const bool emulated_amd_matrices =
+            (driver_id == VK_DRIVER_ID_AMD_PROPRIETARY ||
+             driver_id == VK_DRIVER_ID_AMD_OPEN_SOURCE) &&
+            !properties.integer_dot_product.integerDotProduct4x8BitPackedMixedSignednessAccelerated;
+        if (extensions.cooperative_matrix && emulated_amd_matrices) {
+            LOG_INFO(Render_Vulkan,
+                     "VK_KHR_cooperative_matrix is emulated on this AMD GPU: guest tensor "
+                     "operations stay in shader emulation");
+        }
+        const bool usable = extensions.cooperative_matrix && !emulated_amd_matrices &&
                             features.cooperative_matrix.cooperativeMatrix &&
                             (properties.cooperative_matrix.cooperativeMatrixSupportedStages &
                              VK_SHADER_STAGE_COMPUTE_BIT) != 0 &&
@@ -1809,6 +1887,33 @@ void Device::RemoveUnsuitableExtensions() {
     extensions.maintenance5 = features.maintenance5.maintenance5;
     RemoveExtensionFeatureIfUnsuitable(extensions.maintenance5, features.maintenance5,
                                        VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
+
+    // VK_KHR_pipeline_binary (needs maintenance5 for the capture flag), kept to drivers without a
+    // disk cache of their own (DriverCachesPipelines) that don't prefer their internal cache: the
+    // store would only duplicate it there (PipelineBinaries). NVIDIA 610.88 also gave ~7.8 MB of
+    // blobs a pipeline: one Ocarina of Time session stored 2.3 GB.
+    if (extensions.pipeline_binary) {
+        LOG_INFO(Render_Vulkan,
+                 "VK_KHR_pipeline_binary: pipelineBinaries {}, internal cache {}, prefers internal "
+                 "cache {}, compressed data {}",
+                 features.pipeline_binary.pipelineBinaries != VK_FALSE,
+                 properties.pipeline_binary.pipelineBinaryInternalCache != VK_FALSE,
+                 properties.pipeline_binary.pipelineBinaryPrefersInternalCache != VK_FALSE,
+                 properties.pipeline_binary.pipelineBinaryCompressedData != VK_FALSE);
+    }
+    extensions.pipeline_binary =
+        features.pipeline_binary.pipelineBinaries && extensions.maintenance5 &&
+        !properties.pipeline_binary.pipelineBinaryPrefersInternalCache && !DriverCachesPipelines();
+    RemoveExtensionFeatureIfUnsuitable(extensions.pipeline_binary, features.pipeline_binary,
+                                       VK_KHR_PIPELINE_BINARY_EXTENSION_NAME);
+
+    // VK_EXT_shader_float8, only for AMD FSR 4: its RDNA 4 network runs in FP8 and drew a black
+    // picture without the feature on the device (found by CheezerWheezer).
+    if (extensions.shader_float8 &&
+        (!features.shader_float8.shaderFloat8 || !WantsAmdFsr4(properties.driver.driverID))) {
+        RemoveExtensionFeature(extensions.shader_float8, features.shader_float8,
+                               VK_EXT_SHADER_FLOAT8_EXTENSION_NAME);
+    }
 
     // VK_KHR_maintenance6
     extensions.maintenance6 = features.maintenance6.maintenance6;

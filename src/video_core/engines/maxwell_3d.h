@@ -26,6 +26,8 @@
 #include "video_core/engines/engine_upload.h"
 #include "video_core/gpu.h"
 #include "video_core/macro.h"
+#include "video_core/nx2_fast_draw.h"
+#include "video_core/nx2_perf.h"
 #include "video_core/textures/texture.h"
 #include "video_core/engines/maxwell_3d.h"
 
@@ -3270,6 +3272,16 @@ public:
     /// Handles a write to the CB_BIND register.
     void ProcessCBBind(size_t stage_index);
 
+    /// Fast draw (nx2_fast_draw.h): registers that only parameterize the next draw, the next
+    /// constant buffer bind or the buffers a delta draw binds again, or that ProcessMethodCall
+    /// handles, so writing them doesn't end draw reuse.
+    static bool IsFastDrawParameter(u32 method);
+    /// Methods fast draw records as light changes (constant buffer data and binds).
+    static bool IsFastDrawDeltaMethod(u32 method);
+    /// A vertex stream's address, size or limit (not its stride or enable).
+    static bool IsFastDrawVertexBuffer(u32 method);
+    void NoteFastDrawConstantData(GPUVAddr begin, GPUVAddr end);
+
     /// Handles a write to the CB_DATA[i] register.
     void ProcessCBData(u32 value);
     void ProcessCBMultiData(const u32* start_base, u32 amount);
@@ -3281,9 +3293,48 @@ private:
 
     void ProcessMacro(Core::System& system, u32 method, const u32* base_start, u32 amount, bool is_last_call);
 
-    u32 ProcessShadowRam(u32 method, u32 argument);
+    /// The value a write leaves in the register, as the shadow RAM mode has it: the argument
+    /// (tracked in shadow_state when tracking), or the shadow copy when replaying. Defined here,
+    /// as the hot method paths call it for nearly every write.
+    u32 ProcessShadowRam(u32 method, u32 argument) {
+        const auto control = shadow_state.shadow_ram_control;
+        if (control == Regs::ShadowRamControl::Track ||
+            control == Regs::ShadowRamControl::TrackWithFilter) {
+            return shadow_state.reg_array[method] = argument;
+        }
+        if (control == Regs::ShadowRamControl::Replay) {
+            return shadow_state.reg_array[method];
+        }
+        return argument;
+    }
 
-    void ProcessDirtyRegisters(u32 method, u32 argument);
+    /// Stores a register's value and sets its dirty flags. Defined here for the same reason.
+    void ProcessDirtyRegisters(u32 method, u32 argument) {
+        // The instances after the first are drawn together once their loop ends, and they must see
+        // the state they were begun with: NVN's draw macros reset the base instance (and its copy
+        // in c[0][0x644]) right after the loop, before the macro returns.
+        if (draw_manager.HasDeferredDraw() && !DrawManager::IsInstanceLoopMethod(method)) {
+            draw_manager.DrawDeferred(*this, true);
+        }
+        // A changed register that doesn't only parameterize the next draw ends fast draw reuse.
+        if (VideoCommon::Nx2FastDraw::Enabled() && regs.reg_array[method] != argument &&
+            !IsFastDrawParameter(method)) {
+            VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Register, method);
+        }
+        regs.reg_array[method] = argument;
+        for (const auto& table : dirty.tables) {
+            dirty.flags[table[method]] = true;
+        }
+    }
+
+    /// CallMethodFast for a state register (not in execution_mask): a write of the value the
+    /// register holds changes nothing (EDEN_NX2_SKIP_SAME=0 keeps it).
+    void WriteStateRegister(u32 method, u32 method_argument) {
+        const u32 argument = ProcessShadowRam(method, method_argument);
+        if (!SkipSameValueWrites() || regs.reg_array[method] != argument) {
+            ProcessDirtyRegisters(method, argument);
+        }
+    }
 
     void ConsumeSinkImpl(Core::System& system) override;
 
@@ -3310,12 +3361,8 @@ private:
     void CallMacroMethod(Core::System& system, u32 method, std::span<const u32> parameters);
 
     /// Whether state register writes that keep the register's value are dropped (CallMethod).
-    static bool SkipSameValueWrites() {
-        static const bool skip = [] {
-            const char* value = std::getenv("EDEN_NX2_SKIP_SAME");
-            return value == nullptr || value[0] != '0';
-        }();
-        return skip;
+    bool SkipSameValueWrites() const {
+        return skip_same_value_writes;
     }
 
     /// Handles writes to the macro uploading register.
@@ -3348,6 +3395,10 @@ private:
 
     MemoryManager& memory_manager;
 
+    /// Device memory of the texture and sampler header tables (NoteFastDrawConstantData).
+    VideoCommon::Nx2FastDraw::DeviceSpans fast_draw_header_spans;
+    VideoCommon::Nx2FastDraw::DeviceSpans fast_draw_sampler_spans;
+
     VideoCore::RasterizerInterface* rasterizer = nullptr;
 
     /// Start offsets of each macro in macro_memory
@@ -3378,6 +3429,18 @@ private:
         recent_writes[recent_write_index++ % recent_writes.size()] = {method, argument, amount, pending};
     }
     void DumpRecentWrites(u32 method);
+    // EDEN_NX2_3D_METHODS: log the first write to each 3D register (finds methods Eden doesn't
+    // model). Read per engine, not at static initialization, which runs before the frontend
+    // loads nx2_switches.txt.
+    const bool trace_first_method_writes = std::getenv("EDEN_NX2_3D_METHODS") != nullptr;
+    // EDEN_NX2_SKIP_SAME and EDEN_NX2_PERF_VERIFY, read per engine like the switch above. Every
+    // method checks them, so they are members rather than function statics (MSVC reads a
+    // thread-local to check a static's initialization on every call).
+    const bool skip_same_value_writes = [] {
+        const char* value = std::getenv("EDEN_NX2_SKIP_SAME");
+        return value == nullptr || value[0] != '0';
+    }();
+    const bool perf_verify = VideoCommon::Nx2Perf::Verify();
     /// Parameters that have been submitted to the macro call so far.
     std::vector<u32> macro_params;
 

@@ -610,7 +610,7 @@ void SetupCapabilities(const Profile& profile, const Info& info, EmitContext& ct
     }
     if ((info.uses_subgroup_vote || info.uses_subgroup_invocation_id ||
          info.uses_subgroup_shuffles || info.uses_subgroup_mask) &&
-        profile.support_vote && profile.SupportsSubgroupStage(ctx.stage)) {
+        profile.support_vote && ctx.SupportsSubgroups()) {
         ctx.AddCapability(spv::Capability::GroupNonUniformBallot);
         ctx.AddCapability(spv::Capability::GroupNonUniformShuffle);
         if (info.uses_subgroup_shuffles && profile.support_shuffle_relative) {

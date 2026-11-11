@@ -11,7 +11,7 @@
 #include "common/container/unordered_map.h"
 
 #include <dynarmic/interface/A64/a64.h>
-#include <dynarmic/interface/code_page.h>
+#include "core/arm/dynarmic/instruction_page_cache.h"
 #include "common/common_types.h"
 #include "common/hash.h"
 #include "core/arm/arm_interface.h"
@@ -45,7 +45,7 @@ public:
     Dynarmic::A64::Vector MemoryRead128(u64 vaddr) override;
     std::optional<u32> MemoryReadCode(u64 vaddr) override;
     void InstructionSynchronizationBarrierRaised() override {
-        last_code_addr = u64(-1); //reset back, force refetch
+        instruction_page.ResetLocal();
     }
     void MemoryWrite(Dynarmic::A64::VAddr vaddr, u64 value, std::size_t size) override;
     void MemoryWrite128(u64 vaddr, Dynarmic::A64::Vector value) override;
@@ -60,11 +60,11 @@ public:
     void AddTicks(u64 ticks) override;
     u64 GetTicksRemaining() override;
     u64 GetCNTPCT() override;
+    void BlockCompiled(u64 location) override;
     bool CheckMemoryAccess(u64 addr, u64 size, Kernel::DebugWatchpointType type);
     void ReturnException(u64 pc, Dynarmic::HaltReason hr);
 
-    Dynarmic::CodePage cached_code_page;
-    u64 last_code_addr = u64(-1);
+    InstructionPageCache instruction_page;
     ArmDynarmic64& m_parent;
     Core::Memory::Memory& m_memory;
     u64 m_tpidrro_el0{};
@@ -103,6 +103,10 @@ public:
     void ClearInstructionCache() override;
     void InvalidateCacheRange(u64 addr, std::size_t size) override;
 
+    bool SupportsJitWarmup() const override;
+    void SetJitWarmup(std::shared_ptr<JitWarmup> warmup) override;
+    bool WarmUp(const std::atomic<bool>& stop) override;
+
 protected:
     const Kernel::DebugWatchpoint* HaltedWatchpoint() const override;
     void RewindBreakpointInstruction() override;
@@ -119,6 +123,7 @@ private:
     std::size_t m_core_index{};
 
     std::optional<Dynarmic::A64::Jit> m_jit{};
+    std::shared_ptr<JitWarmup> m_warmup;
 
     // SVC callback
     u32 m_svc{};

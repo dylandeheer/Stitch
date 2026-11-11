@@ -11,6 +11,7 @@
 #include <atomic>
 #include <chrono>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <span>
 #include <type_traits>
@@ -18,6 +19,7 @@
 
 #include "common/thread_worker.h"
 #include "shader_recompiler/shader_info.h"
+#include "video_core/evicted_pointer_slots.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
 #include "video_core/renderer_vulkan/pipeline_build.h"
@@ -69,6 +71,7 @@ struct hash<Vulkan::GraphicsPipelineCacheKey> {
 namespace Vulkan {
 
 class Device;
+class PipelineBinaries;
 class PipelineStatistics;
 class RenderPassCache;
 class RescalingPushConstant;
@@ -103,20 +106,34 @@ struct MeshEmulationSetup {
     std::array<u32, 4> position_lines{~0U, ~0U, ~0U, ~0U}; ///< line of PositionX..W
 };
 
+/// What an evicted graphics pipeline needs to be built again without translating its shaders
+struct KeptGraphicsStages {
+    static constexpr size_t NUM_STAGES = Tegra::Engines::Maxwell3D::Regs::MaxShaderStage;
+
+    std::array<std::vector<u8>, NUM_STAGES> spirv; ///< zstd, empty for absent stages
+    std::array<std::unique_ptr<Shader::Info>, NUM_STAGES> infos;
+    std::optional<MeshEmulationSetup> mesh_emulation;
+    VideoCommon::EvictedPointerSlots::Slots mapped_pointers;
+
+    /// Memory it holds, roughly
+    [[nodiscard]] u64 Bytes() const noexcept;
+};
+
 class GraphicsPipeline {
     static constexpr size_t NUM_STAGES = Tegra::Engines::Maxwell3D::Regs::MaxShaderStage;
 
 public:
     explicit GraphicsPipeline(
         Scheduler& scheduler, BufferCache& buffer_cache, TextureCache& texture_cache,
-        vk::PipelineCache& pipeline_cache, VideoCore::ShaderNotify* shader_notify,
+        vk::PipelineCache& pipeline_cache, PipelineBinaries* binaries,
+        VideoCore::ShaderNotify* shader_notify,
         const Device& device, DescriptorPool& descriptor_pool,
         GuestDescriptorQueue& guest_descriptor_queue,
-        DescriptorBufferRing& descriptor_buffer_ring, Common::ThreadWorker* worker_thread,
+        DescriptorBufferRing& descriptor_buffer_ring, const PipelineBuildQueue& build_queue,
         PipelineStatistics* pipeline_statistics, RenderPassCache& render_pass_cache,
-        const GraphicsPipelineCacheKey& key, std::array<vk::ShaderModule, NUM_STAGES> stages,
+        const GraphicsPipelineCacheKey& key, std::array<std::vector<u32>, NUM_STAGES> stages,
         const std::array<const Shader::Info*, NUM_STAGES>& infos,
-        std::function<std::array<vk::ShaderModule, NUM_STAGES>()> emit_stages = {},
+        std::function<std::array<std::vector<u32>, NUM_STAGES>()> emit_stages = {},
         std::optional<MeshEmulationSetup> mesh_emulation = std::nullopt);
 
     static std::chrono::nanoseconds TakeHoldTime() noexcept;
@@ -260,14 +277,41 @@ public:
         return used;
     }
 
+    /// The constant buffer slots each program binds as storage buffer pointers
+    [[nodiscard]] const VideoCommon::EvictedPointerSlots::Slots& MappedPointers() const noexcept {
+        return mapped_pointers;
+    }
+
+    void SetMappedPointers(VideoCommon::EvictedPointerSlots::Slots slots) noexcept {
+        mapped_pointers = std::move(slots);
+    }
+
+    /// Moves out the SPIR-V kept after the build, with the stage infos: for a built pipeline being
+    /// evicted
+    [[nodiscard]] KeptGraphicsStages TakeKeptStages();
+
     /// Forgets the transitions, which may point to pipelines the cache evicted.
     void ClearTransitions() noexcept {
         transition_keys.clear();
         transitions.clear();
     }
 
+    [[nodiscard]] bool WritesStorage() const noexcept {
+        return writes_storage;
+    }
+
+    /// Writes storage images or image buffers (their images are marked modified when resolved).
+    [[nodiscard]] bool WritesImages() const noexcept {
+        return writes_images;
+    }
+
     [[nodiscard]] bool IsBuilt() const noexcept {
         return build->IsBuilt();
+    }
+
+    /// Builds it on this thread, for a pipeline made with PipelineBuildQueue::owner_builds
+    void Build() {
+        build->Build();
     }
 
     /// Waits up to `timeout` for the build; true when built.
@@ -278,6 +322,52 @@ public:
     [[nodiscard]] bool Failed() const noexcept {
         return build->Failed();
     }
+
+    /// Fast draw (nx2_fast_draw.h): whether draws can keep the image views and samplers the last
+    /// captured Configure resolved. Handles computed at draw time are resolved on every draw.
+    [[nodiscard]] bool TakesDeltaDraws() const noexcept {
+        return delta_blocker == DeltaBlocker::None && delta_views_valid;
+    }
+
+    /// Why TakesDeltaDraws is false (diagnostics).
+    enum class DeltaBlocker : u8 {
+        None,
+        WritesImages,
+        Mesh,
+        ComputedHandles,
+        NotConfigured,
+        Count,
+    };
+    [[nodiscard]] DeltaBlocker DeltaDrawBlocker() const noexcept {
+        return delta_blocker != DeltaBlocker::None ? delta_blocker
+               : delta_views_valid                 ? DeltaBlocker::None
+                                                   : DeltaBlocker::NotConfigured;
+    }
+
+    /// Constant buffer slots per stage the pipeline reads texture and image handles from.
+    [[nodiscard]] const std::array<u32, NUM_STAGES>& HandleConstantBuffers() const noexcept {
+        return handle_constant_buffers;
+    }
+
+    /// Resolves and binds every buffer as Configure does (storage buffer addresses are read from
+    /// the constant buffers again) and records the draw's descriptors with the image views,
+    /// samplers and texture buffers the last captured Configure resolved. False when the draw
+    /// can't be recorded, as for Configure.
+    bool ConfigureDelta(bool is_indexed);
+
+    /// The next Configure keeps the views and samplers it resolves for delta draws. With
+    /// `verify`, it first compares them with the ones kept before; DeltaMismatch reports it.
+    void CaptureNextDelta(bool verify) noexcept {
+        capture_delta = true;
+        verify_delta = verify;
+    }
+    [[nodiscard]] bool DeltaMismatch() const noexcept {
+        return delta_mismatch;
+    }
+
+    /// Whether an image the kept views sample has an upload pending or a newer alias to copy in:
+    /// ConfigureDelta prepares none, Configure does.
+    [[nodiscard]] bool DeltaImagesChange() const noexcept;
 
     template <typename Spec>
     static auto MakeConfigureSpecFunc() {
@@ -292,6 +382,8 @@ public:
 private:
     template <typename Spec>
     bool ConfigureImpl(bool is_indexed);
+
+    void KeepImageDescriptors(size_t stage, size_t first_entry);
 
     bool ConfigureDraw(const RescalingPushConstant& rescaling,
                        const RenderAreaPushConstant& render_are);
@@ -309,6 +401,7 @@ private:
     TextureCache& texture_cache;
     BufferCache& buffer_cache;
     vk::PipelineCache& pipeline_cache;
+    PipelineBinaries* const binaries; ///< Shader cache v2's driver layer, else null
     Scheduler& scheduler;
     GuestDescriptorQueue& guest_descriptor_queue;
     DescriptorBufferRing& descriptor_buffer_ring;
@@ -317,10 +410,13 @@ private:
 
     std::vector<GraphicsPipelineCacheKey> transition_keys;
     std::vector<GraphicsPipeline*> transitions;
+    VideoCommon::EvictedPointerSlots::Slots mapped_pointers;
     u64 last_use_frame{};
     bool used{};
 
+    std::array<std::vector<u32>, NUM_STAGES> spirv; ///< Until the build makes its modules
     std::array<vk::ShaderModule, NUM_STAGES> spv_modules;
+    std::array<std::vector<u8>, NUM_STAGES> kept_spirv; ///< zstd, after the build
 
     std::array<Shader::Info, NUM_STAGES> stage_infos;
     std::array<u32, 5> enabled_uniform_buffer_masks{};
@@ -332,6 +428,29 @@ private:
     bool fragment_has_color0_output{};
     u32 color_output_mask{};
     bool writes_storage{};
+    /// Every texture is sampled with a handle read from a constant buffer: ConfigureImpl can
+    /// resolve them from texture_memo.
+    bool texture_memo_eligible{};
+    VideoCommon::SampledTextureMemo texture_memo;
+    bool writes_images{};
+
+    DeltaBlocker delta_blocker{};
+    bool delta_views_valid{};
+    bool capture_delta{};
+    bool verify_delta{};
+    bool delta_mismatch{};
+    std::array<bool, NUM_STAGES> configured_stages{};
+    std::array<u32, NUM_STAGES> handle_constant_buffers{};
+    std::vector<VideoCommon::ImageViewInOut> delta_views;
+    std::vector<VideoCommon::SamplerId> delta_samplers;
+    /// Delta draws: the image descriptor entries (first entry and count per
+    /// stage) and rescaling words pushed for delta_views, which delta draws push again while no
+    /// image changed its scale (TextureCache::ScaleEpoch).
+    std::vector<DescriptorUpdateEntry> kept_image_entries;
+    std::array<std::pair<u32, u32>, NUM_STAGES> kept_image_ranges{};
+    std::array<u32, Shader::Backend::SPIRV::NUM_TEXTURE_AND_IMAGE_SCALING_WORDS> kept_rescaling{};
+    u64 kept_scale_epoch{};
+    bool kept_images_valid{};
 
     vk::DescriptorSetLayout descriptor_set_layout;
     DescriptorAllocator descriptor_allocator;

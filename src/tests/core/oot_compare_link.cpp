@@ -207,3 +207,24 @@ TEST_CASE("A scalar compare stops at the fastmem guard and retains out-of-range 
     REQUIRE(candidate.jit.CompareLinksCompiled() == 1);
 }
 #endif
+
+TEST_CASE("Warmup preserves checked compare links and folded tail invalidation",
+          "[oot_compare_link][jit_warmup]") {
+    for (size_t changed : {size_t{5}, size_t{6}}) {
+        Fixture original{false}, warmed{true};
+        REQUIRE(warmed.jit.Precompile(Base, 0) == Dynarmic::A64::PrecompileResult::Compiled);
+        REQUIRE(warmed.env.reads.empty());
+        REQUIRE(warmed.jit.CompareLinksCompiled() == 1);
+        REQUIRE(original.Run(7, 7) == warmed.Run(7, 7));
+        for (auto* fixture : {&original, &warmed}) {
+            fixture->env.code_mem[changed] = changed == 5 ? 0x6b1f007f : (Program[6] ^ 1);
+            fixture->jit.InvalidateCacheRange(Base + changed * 4, 4);
+        }
+        // A pending invalidation is applied before execution, even if warmup sees an old block.
+        REQUIRE(warmed.jit.Precompile(Base, 0) == Dynarmic::A64::PrecompileResult::Present);
+        const auto expected = original.Run(7, 7);
+        REQUIRE(expected.registers[5] == 2);
+        REQUIRE(expected == warmed.Run(7, 7));
+        REQUIRE(warmed.jit.CompareLinksCompiled() == 1);
+    }
+}

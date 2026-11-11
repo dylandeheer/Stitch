@@ -90,6 +90,12 @@ struct RuntimeInfo {
     std::bitset<32> per_primitive_generics{};
     /// The pulling vertex shader supplies these inputs as ordinary flat varyings.
     bool emulate_per_primitive_inputs{};
+    /// Last pre-rasterization stage: generic outputs the fragment stage reads screen-linear.
+    /// They are written times Position.w and the fragment stage reads them perspective-correct
+    /// times FragCoord.w, so clipping a primitive close to the camera interpolates them right.
+    std::bitset<32> noperspective_outputs{};
+    /// Fragment stage: the previous stage writes noperspective_outputs (not a mesh program).
+    bool scaled_noperspective_inputs{};
     std::map<IR::Attribute, IR::Attribute> previous_stage_legacy_stores_mapping;
 
     bool convert_depth_mode{};

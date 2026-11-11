@@ -7,10 +7,15 @@
 #include <algorithm>
 #include <array>
 #include <vector>
+#include <cstring>
+
 #include <catch2/catch_test_macros.hpp>
 #include "tests/common/host_memory_test_access.h"
 
-#ifndef _WIN32
+#ifdef _WIN32
+#include <windows.h>
+#include <psapi.h>
+#else
 #include <unistd.h>
 #endif
 
@@ -298,3 +303,48 @@ TEST_CASE("An anonymous physical fallback never reads a backing file", "[atlas_p
     std::array<u8, 32> scratch{};
     REQUIRE_FALSE(mem.TryReadBacking(0, scratch));
 }
+#ifdef _WIN32
+TEST_CASE("HostMemory: Trim zero pages keeps contents", "[common]") {
+    constexpr size_t Page = 0x1000;
+    HostMemory mem(BACKING_SIZE, VIRTUAL_SIZE);
+    REQUIRE(mem.BackingBasePointer() != nullptr);
+    mem.Map(0x10000, 0x100000, 2 * Page, PERMS, HEAP);
+    // Two views next to each other: one run that VirtualUnlock can't take as a whole.
+    mem.Map(0x12000, 0x200000, Page, PERMS, HEAP);
+    mem.Map(0x13000, 0x300000, Page, PERMS, HEAP);
+    u8* const view = mem.VirtualBasePointer() + 0x10000;
+    u8* const backing = mem.BackingBasePointer();
+    std::memset(view, 0, Page);
+    std::memset(view + Page, 0x5a, Page);
+    std::memset(view + 2 * Page, 0, 2 * Page);
+    std::memset(backing + 0x400000, 0, Page);
+
+    const auto resident = [](const void* address) {
+        PSAPI_WORKING_SET_EX_INFORMATION info{};
+        info.VirtualAddress = const_cast<void*>(address);
+        REQUIRE(QueryWorkingSetEx(GetCurrentProcess(), &info, sizeof(info)));
+        return info.VirtualAttributes.Valid != 0;
+    };
+    REQUIRE(resident(view));
+    REQUIRE(!resident(backing + 0x100000 + Page));
+
+    const auto [looked_at, trimmed] = mem.TrimZeroPages();
+    REQUIRE(looked_at >= 5 * Page);
+    REQUIRE(trimmed >= 4 * Page);
+    REQUIRE(!resident(view));
+    REQUIRE(!resident(view + 2 * Page));
+    REQUIRE(!resident(view + 3 * Page));
+    REQUIRE(!resident(backing + 0x400000));
+    REQUIRE(resident(view + Page));
+    REQUIRE(!resident(backing + 0x100000 + Page));
+
+    const auto all = [](const u8* page, u8 value) {
+        return std::all_of(page, page + Page, [value](u8 byte) { return byte == value; });
+    };
+    REQUIRE(all(view, 0));
+    REQUIRE(all(view + Page, 0x5a));
+    REQUIRE(all(view + 2 * Page, 0));
+    REQUIRE(all(view + 3 * Page, 0));
+    REQUIRE(all(backing + 0x400000, 0));
+}
+#endif

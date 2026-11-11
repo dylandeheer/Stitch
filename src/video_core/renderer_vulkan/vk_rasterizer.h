@@ -7,6 +7,7 @@
 #pragma once
 
 #include <array>
+#include <chrono>
 #include <optional>
 #include <map>
 #include <string_view>
@@ -19,6 +20,8 @@
 #include "video_core/control/channel_state_cache.h"
 #include "video_core/engines/maxwell_dma.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
+#include "video_core/oot_network.h"
+#include "video_core/ocarina_upscale.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_vulkan/blit_image.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
@@ -108,8 +111,13 @@ public:
     void FlushRegionImpl(DAddr addr, u64 size, VideoCommon::CacheType which, bool early_read);
     void FlushRegion(DAddr addr, u64 size,
                      VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
-    GpuWrittenList ReadGpuWrittenCommandList(DAddr addr, std::span<u8> out,
-                                             bool past_sync) override;
+    void FlushRegionForRead(DAddr addr, u64 size) override;
+    void FinishRead(DAddr addr, u64 size) override;
+    bool NoteReportPending(DAddr addr, u64 size) override;
+    void FinishReport(DAddr addr, u64 size) override;
+    GpuWrittenList ReadGpuWrittenCommandList(DAddr addr, std::span<u8> out, bool past_sync,
+                                             u64* pending_tick = nullptr) override;
+    bool IsGpuTickDone(u64 tick) override;
     void NoteGpuWrittenCommandListSynced(DAddr page) override;
     void FlushGpuWrittenCommandListPages(std::span<const DAddr> pages) override;
     bool MustFlushRegion(DAddr addr, u64 size,
@@ -159,7 +167,9 @@ public:
                                    const Tegra::Engines::Fermi2D::Surface& motion_vectors,
                                    const Tegra::Texture::TICEntry* depth,
                                    std::array<f32, 2> jitter,
-                                   std::array<f32, 2> motion_scale, bool use_history = true) override;
+                                   std::array<f32, 2> motion_scale, bool use_history,
+                                   std::optional<std::array<u32, 2>> render_region) override;
+    VideoCommon::OotNetwork::BypassState* OotNetworkBypass() override;
     Tegra::Engines::AccelerateDMAInterface& AccessAccelerateDMA() override;
     void AccelerateInlineToMemory(GPUVAddr address, size_t copy_size,
                                   std::span<const u8> memory) override;
@@ -187,12 +197,19 @@ private:
 
     static constexpr VkDeviceSize DEFAULT_BUFFER_SIZE = 4 * sizeof(float);
 
+    /// The GPU front thread polls pending list copies from the channel scheduler.
+    u64 poll_submit_requested_tick{};
+    std::chrono::steady_clock::time_point poll_submit_requested_at{};
+    std::chrono::steady_clock::time_point poll_refreshed_at{};
+
     template <typename Func>
     void PrepareDraw(bool is_indexed, Func&&, bool is_indirect = false);
 
     void CaptureIndirectTrace();
     void CollectIndirectTrace();
     void TraceDrawFailure(std::string_view reason);
+    /// Remembers render target 0 of a draw with one of Ocarina of Time's tonemap shaders.
+    void TrackOotTonemappedImage(const GraphicsPipeline& pipeline);
     bool TryNx2IndirectReset(bool is_indexed, u32 instance_count);
 
     void FlushWork();
@@ -242,9 +259,21 @@ private:
 
     void UpdateVertexInput(Tegra::Engines::Maxwell3D::Regs& regs);
 
+    /// Clears a 3D color target whose slices the framebuffer can't reach. Returns true when handled.
+    bool ClearVolumeSlices(const Framebuffer* framebuffer, u32 first_slice, u32 slice_count);
     void FrameDumpPass(const Framebuffer* framebuffer);
     /// EDEN_NX2_PENDING_WRITE_TRACE: logs bound buffer ranges with collected, unapplied CPU writes.
     void TracePendingCpuWrites(bool compute, std::span<const u64> shader_hashes);
+    bool OcarinaTemporalEnabled() const;
+    void TrackOcarinaCamera();
+    /// Offsets the viewport of Ocarina's scene draws (depth-tested, into the scene depth) by a
+    /// sub-pixel amount that changes every frame while FSR replaces the game's upscale, so FSR
+    /// gets new sample positions each frame (the game renders without jitter). The offset goes to
+    /// FSR with the frame.
+    void UpdateOcarinaJitter();
+    void TrackOcarinaActor(u64 shader_hash, bool is_indexed, bool is_indirect);
+    bool TryOcarinaUpscale(const ComputePipeline& pipeline, bool replace);
+    void ReadOcarinaActor(struct OcarinaActorMesh& mesh);
     /// Records the uniform and storage buffers of the current draw or dispatch for the frame dump.
     bool FrameDumpBuffers(bool compute, std::span<const u64> shader_hashes);
 
@@ -291,6 +320,41 @@ private:
     std::map<std::array<u64, 3>, MeshPerfStats> mesh_perf_programs;
     u32 mesh_perf_frames{};
     std::unique_ptr<DrawCpuProbe> draw_cpu_probe;
+    std::optional<u64> oot_camera_sample_frame;
+    mutable std::optional<VideoCommon::OcarinaUpscaleBackend> oot_backend;
+    struct OcarinaMotionTrace {
+        const Tegra::MemoryManager* camera_channel{};
+        const Tegra::MemoryManager* depth_channel{};
+        u64 depth_frame{};
+        GPUVAddr depth_address{};
+        u32 depth_tic{};
+        VkExtent2D extent{};
+        std::array<f32, 16> current{};
+        std::array<f32, 16> previous{};
+    } oot_motion;
+    std::unique_ptr<class OcarinaUpscaler> oot_live_dlss;
+    bool oot_live_failed{};
+    const char* oot_fallback_reason{};
+    u32 oot_fallback_repeats{};
+    std::optional<u64> oot_dlss_frame;
+    std::array<f32, 2> oot_jitter_applied{}; ///< in the viewport state now (render pixels)
+    std::array<f32, 2> oot_jitter_offset{};  ///< what oot_jitter_frame's scene draws used
+    std::optional<u64> oot_jitter_frame;
+    u32 oot_jitter_phases{8}; ///< Halton sequence length for the last FSR frame's scale
+    std::optional<u64> oot_4k_scene_frame;
+    VkImage oot_4k_guest_present{};
+    std::optional<u64> oot_effects_frame;
+    GPUVAddr oot_effects_address{};
+    VkImageView oot_effects_scene{};
+    struct OcarinaActorPose {
+        u64 frame{};
+        const Tegra::MemoryManager* channel{};
+        GPUVAddr vertex{};
+        GPUVAddr indices{};
+        s32 base_vertex{};
+        std::array<f32, 4> origin{};
+        std::array<f32, 280 * 12> bones{};
+    } oot_actor, oot_previous_actor;
     u64 render_trace_frame = 0;
     u32 render_trace_draws = 0;
     u32 render_trace_clears = 0;
@@ -298,6 +362,7 @@ private:
     bool mesh_draw{}; ///< the draw being prepared uses a task/mesh pipeline
     /// Fragment output components the dynamic color write mask was last recorded with
     u32 last_color_output_mask{};
+    VideoCommon::OotNetwork::BypassState oot_network_bypass;
     u32 mesh_emulation_groups{};             ///< mesh workgroups of the emulated draw
     u32 mesh_emulation_vertices_per_group{}; ///< 0 unless the draw is an emulated mesh draw
     /// Mesh emulation diagnostics with a task program: one draw's distribution arguments.
@@ -349,6 +414,86 @@ private:
     bool mesh_warned_arena_limit{};
     /// The current submission's arena, after its counter is reset.
     const MeshArena& AcquireMeshArena();
+
+    /// Fast draw (nx2_fast_draw.h): what the last recorded draw left bound.
+    struct ReusableDraw {
+        GraphicsPipeline* pipeline{};
+        const Tegra::Engines::Maxwell3D* maxwell3d{};
+        u64 serial{};
+        u64 map_serial{};
+        u64 tick{};
+        u64 render_pass{};
+        Maxwell::PrimitiveTopology topology{};
+        bool is_indexed{};
+    };
+    enum class FullDraw : u8 {
+        NoCandidate,
+        Kind,
+        StateChanged,
+        Submitted,
+        RenderPass,
+        DeltaPipeline,
+        HandleBind,
+        HandleData,
+        SampledImages,
+        Count,
+    };
+    /// Why a recorded draw can't be followed by a delta draw.
+    enum class Ineligible : u8 {
+        Indirect,
+        Mesh,
+        NotBuilt,
+        WritesImages,
+        TransformFeedback,
+        InlineIndex,
+        Quads,
+        Repacked,
+        NoRenderPass,
+        PipelineNotBound,
+        OffBackThread,
+        Count,
+    };
+    enum class DrawPath : u8 { Full, Delta, Count };
+    struct FastDrawStats {
+        u64 delta{};
+        std::array<u64, static_cast<size_t>(FullDraw::Count)> full{};
+        std::array<u64, static_cast<size_t>(Ineligible::Count)> ineligible{};
+        /// PrepareDraw time and draws per path.
+        std::array<u64, static_cast<size_t>(DrawPath::Count)> prepare_ns{};
+        std::array<u64, static_cast<size_t>(DrawPath::Count)> prepare_draws{};
+        /// EDEN_NX2_FAST_DRAW_VERIFY
+        u64 verified{};
+        u64 pipeline_mismatches{};
+        u64 view_mismatches{};
+        u64 binding_mismatches{};
+        /// DeltaPipeline draws by GraphicsPipeline::DeltaDrawBlocker.
+        std::array<u64, static_cast<size_t>(GraphicsPipeline::DeltaBlocker::Count)> delta_blockers{};
+        /// StateChanged draws by the reason of the last break, and by its 3D method.
+        std::array<u64, static_cast<size_t>(VideoCommon::Nx2FastDraw::Reason::Count)> breaks{};
+        std::array<u32, Maxwell::NUM_REGS> break_methods{};
+        u64 window_start{};
+    };
+    /// The pipeline the draw can take the delta path with, or null for a full resolve. Clears
+    /// the remembered draw either way: only a recorded draw remembers one again.
+    GraphicsPipeline* TakeReusableDraw(bool is_indexed, bool is_indirect);
+    /// Whether the draw TakeReusableDraw took still holds once the caches are locked (serial and
+    /// map_serial as read then), and the images it samples need no preparing.
+    bool DeltaStillHolds(u64 serial, u64 map_serial);
+    void NoteResolvedDraw(GraphicsPipeline* pipeline, bool is_indexed, bool is_indirect, u64 serial,
+                          u64 map_serial);
+    void ReportFastDraws();
+    ReusableDraw reusable_draw;
+    ReusableDraw taken_draw; ///< The draw TakeReusableDraw last returned the pipeline of
+    /// Device memory of the constant buffers TakeReusableDraw checks for texture handle writes.
+    std::array<std::array<VideoCommon::Nx2FastDraw::DeviceSpans, Maxwell::MaxConstBuffers>,
+               Maxwell::MaxShaderStage>
+        handle_spans;
+    /// The constant buffer binds and data since the previous draw.
+    VideoCommon::Nx2FastDraw::Delta taken_delta;
+    FastDrawStats fast_draw_stats;
+    /// Nx2FastDraw::Enabled and VerifyEnabled as the drawing thread last read them.
+    bool fast_draw_on{};
+    bool fast_draw_verify{};
 
     struct IndirectTrace {
         vk::Buffer readback;

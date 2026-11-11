@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <span>
 #include <string>
 #include <string_view>
@@ -18,6 +19,7 @@
 #include "common/scope_exit.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/frontend/ir/ir_emitter.h"
+#include "video_core/renderer_vulkan/mesh_fallback_limits.h"
 #include "video_core/renderer_vulkan/mesh_lookup_mode.h"
 
 namespace {
@@ -179,7 +181,8 @@ Profile MakeProfile() {
 // A one-triangle mesh program (or the task program launching it), as the frontend lowers them.
 std::vector<u32> EmitProgram(Stage stage, bool fallback, bool with_task,
                              const MeshInfo& mesh = TriangleMesh(), bool bounded = false,
-                             bool lookup_fixture = false) {
+                             bool lookup_fixture = false, Profile profile = MakeProfile(),
+                             bool lane_id = false) {
     ObjectPool<IR::Inst> pool;
     IR::Block block{pool}, branch{pool}, merge{pool}, writer{pool}, exit{pool};
     IR::Program program;
@@ -249,7 +252,8 @@ std::vector<u32> EmitProgram(Stage stage, bool fallback, bool with_task,
     } else if (stage == Stage::Mesh && !mesh.primitive_lines.empty()) {
         WritePrimitiveColors(ir);
     } else if (stage == Stage::Mesh) {
-        const IR::U32 index{ir.IsbeRead(ir.Imm32(0))};
+        const IR::U32 index{lane_id ? ir.LaneId() : ir.IsbeRead(ir.Imm32(0))};
+        program.info.uses_subgroup_invocation_id = lane_id;
         ir.IsbeWriteAttribute(ir.Imm32(0), index);
         ir.IsbeWriteMapU8(ir.Imm32(4), ir.Imm32(0));
         ir.IsbeWriteMapU32(ir.Imm32(3), ir.Imm32(1));
@@ -275,7 +279,6 @@ std::vector<u32> EmitProgram(Stage stage, bool fallback, bool with_task,
         runtime_info.mesh_task_payload_stride = program.mesh.payload_words;
     }
     Backend::Bindings bindings;
-    auto profile = MakeProfile();
     profile.bounded_mesh_task_lookup = bounded;
     return SPIRV::EmitSPIRV(profile, runtime_info, program, bindings);
 }
@@ -331,6 +334,17 @@ TEST_CASE("Mesh fallback emits mesh programs as compute shaders writing storage 
     RequireNoMeshShading(after_task);
     REQUIRE(Bindings(after_task) ==
             std::vector<u32>{OUTPUT_BINDING, PAYLOAD_BINDING, OFFSETS_BINDING, ARGS_BINDING});
+}
+
+TEST_CASE("Mesh fallback programs use compute subgroup support",
+          "[video_core][spirv][mesh_fallback]") {
+    // A device without VK_EXT_mesh_shader reports subgroup support for compute, not mesh.
+    Profile profile{MakeProfile()};
+    profile.supported_subgroup_stages = 1U << static_cast<u32>(Stage::Compute);
+    const std::vector<u32> code{EmitProgram(Stage::Mesh, true, false, TriangleMesh(), false, false, profile, true)};
+    Dump(code, "fallback-mesh-lane-id");
+    RequireNoMeshShading(code);
+    REQUIRE(HasCapability(code, spv::Capability::GroupNonUniform));
 }
 
 TEST_CASE("Mesh fallback emits task programs as compute shaders writing their payload",
@@ -491,4 +505,23 @@ TEST_CASE("Bounded mesh marker snapshots arms and rolls over at sixteen presenta
     REQUIRE_FALSE(mode.Bounded());
     REQUIRE_FALSE(original_request);
     REQUIRE(bounded_request);
+}
+
+TEST_CASE("Mesh fallback reserves auxiliary storage buffers in the descriptor set limit",
+          "[video_core][mesh_fallback]") {
+    using Vulkan::FitsStorageBufferSetLimit;
+
+    // Ordinary graphics pipelines do not add emulation descriptors.
+    REQUIRE(FitsStorageBufferSetLimit(8, 0, 8));
+    REQUIRE_FALSE(FitsStorageBufferSetLimit(9, 0, 8));
+
+    // Mesh only: one output buffer. Task+mesh: four auxiliary bindings.
+    REQUIRE(FitsStorageBufferSetLimit(7, 1, 8));
+    REQUIRE_FALSE(FitsStorageBufferSetLimit(8, 1, 8));
+    REQUIRE(FitsStorageBufferSetLimit(4, 4, 8));
+    REQUIRE_FALSE(FitsStorageBufferSetLimit(5, 4, 8));
+
+    // No limit is represented by zero. Reject huge inputs without addition overflow.
+    REQUIRE(FitsStorageBufferSetLimit(200, 4, 0));
+    REQUIRE_FALSE(FitsStorageBufferSetLimit((std::numeric_limits<size_t>::max)(), 4, 8));
 }

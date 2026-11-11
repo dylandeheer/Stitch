@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <optional>
 #include <array>
 #include <cstdlib>
 #include <atomic>
@@ -18,6 +19,7 @@
 #include "common/settings.h"
 #include "common/settings_enums.h"
 #include "common/string_util.h"
+#include "core/arm/dynarmic/jit_warmup.h"
 #include "core/arm/exclusive_monitor.h"
 #include "core/core.h"
 
@@ -44,6 +46,7 @@
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/k_resource_limit.h"
 #include "core/hle/kernel/k_scheduler.h"
+#include "core/hle/kernel/k_system_control.h"
 #include "core/hle/kernel/kernel.h"
 #include "core/hle/kernel/physical_core.h"
 #include "core/hle/service/acc/profile_manager.h"
@@ -64,6 +67,7 @@
 #include "core/hle/service/sm/sm.h"
 #include "core/internal_network/network.h"
 #include "core/loader/loader.h"
+#include "core/loader/nx.h"
 #include "core/memory.h"
 #include "core/memory/cheat_engine.h"
 #include "core/perf_stats.h"
@@ -73,6 +77,7 @@
 #include "hid_core/hid_core.h"
 #include "network/network.h"
 #include "video_core/host1x/host1x.h"
+#include "video_core/nx2_stutter_trace.h"
 #include "video_core/renderer_base.h"
 #include "video_core/video_core.h"
 
@@ -124,13 +129,25 @@ FileSys::VirtualFile GetGameFileFromPath(const FileSys::VirtualFilesystem& vfs,
 
 namespace {
 
-// Detect the platform before initializing the kernel memory layout and guest clock.
-bool IsSwitch2Program(const FileSys::VirtualFile& file, u64 program_id, std::size_t program_index) {
+// The program id from a Switch 2 program's main.npdm, if it is one.
+std::optional<u64> Switch2ProgramId(FileSys::ProgramMetadata& metadata,
+                                    const FileSys::VirtualFile& npdm) {
+    if (npdm == nullptr || metadata.Load(npdm) != Loader::ResultStatus::Success ||
+        !metadata.IsSwitch2()) {
+        return std::nullopt;
+    }
+    return metadata.GetTitleID();
+}
+
+// Detect the platform and program before initializing the kernel memory layout and guest clock:
+// the id of a Switch 2 program, or nothing for any other program.
+std::optional<u64> FindSwitch2Program(const FileSys::VirtualFile& file, u64 program_id,
+                                      std::size_t program_index) {
     FileSys::ProgramMetadata metadata;
     if (FileSys::NupContainer::IsNupFile(file)) {
         FileSys::NupContainer nup{file};
         if (nup.GetStatus() != Loader::ResultStatus::Success) {
-            return false;
+            return std::nullopt;
         }
         const auto base = nup.FindBasePackage();
         const auto update = nup.FindBestUpdatePackage();
@@ -142,14 +159,16 @@ bool IsSwitch2Program(const FileSys::VirtualFile& file, u64 program_id, std::siz
         }
         const auto exefs = program ? nup.GetExeFSDir(*program) : nullptr;
         const auto npdm = exefs != nullptr ? exefs->GetFile("main.npdm") : nullptr;
-        return npdm != nullptr && metadata.Load(npdm) == Loader::ResultStatus::Success &&
-               metadata.IsSwitch2();
+        return Switch2ProgramId(metadata, npdm);
     }
     const auto type = file != nullptr ? Loader::IdentifyFile(file) : Loader::FileType::Unknown;
+    if (type == Loader::FileType::NX) {
+        return Loader::AppLoader_NX::ReadPlatform(file, program_id) == 2;
+    }
     if (type == Loader::FileType::XCI || type == Loader::FileType::XCZ) {
         const FileSys::XCI xci{file, program_id, program_index};
         if (xci.GetStatus() != Loader::ResultStatus::Success) {
-            return false;
+            return std::nullopt;
         }
         const auto partition = xci.GetSecurePartitionNSP();
         const auto program = partition != nullptr
@@ -158,13 +177,12 @@ bool IsSwitch2Program(const FileSys::VirtualFile& file, u64 program_id, std::siz
                                  : nullptr;
         const auto exefs = program != nullptr ? program->GetExeFS() : nullptr;
         const auto npdm = exefs != nullptr ? exefs->GetFile("main.npdm") : nullptr;
-        return npdm != nullptr && metadata.Load(npdm) == Loader::ResultStatus::Success &&
-               metadata.IsSwitch2();
+        return Switch2ProgramId(metadata, npdm);
     }
     if (type == Loader::FileType::NSP || type == Loader::FileType::NSZ) {
         const FileSys::NSP nsp{file, program_id, program_index};
         if (nsp.GetStatus() != Loader::ResultStatus::Success) {
-            return false;
+            return std::nullopt;
         }
         auto exefs = nsp.GetExeFS();
         if (!nsp.IsExtractedType()) {
@@ -173,13 +191,11 @@ bool IsSwitch2Program(const FileSys::VirtualFile& file, u64 program_id, std::siz
             exefs = program != nullptr ? program->GetExeFS() : nullptr;
         }
         const auto npdm = exefs != nullptr ? exefs->GetFile("main.npdm") : nullptr;
-        return npdm != nullptr && metadata.Load(npdm) == Loader::ResultStatus::Success &&
-               metadata.IsSwitch2();
+        return Switch2ProgramId(metadata, npdm);
     }
     const auto dir = file != nullptr ? file->GetContainingDirectory() : nullptr;
     const auto npdm = dir != nullptr ? dir->GetFile("main.npdm") : nullptr;
-    return npdm != nullptr && metadata.Load(npdm) == Loader::ResultStatus::Success &&
-           metadata.IsSwitch2();
+    return Switch2ProgramId(metadata, npdm);
 }
 
 } // namespace
@@ -249,14 +265,22 @@ struct System::Impl {
             return;
         }
 
+        // The settings and time services start on the emulated cores, which only run once the
+        // game has finished loading (shaders included). Waiting for them here froze the UI
+        // thread for the whole loading screen when settings were applied during it. If they
+        // are not up yet there is nothing to refresh: they read the current settings when
+        // they start.
+        auto& manager = system.ServiceManager();
         auto settings_service =
-            system.ServiceManager().GetService<Service::Set::ISystemSettingsServer>("set:sys",
-                                                                                    true);
+            manager.GetService<Service::Set::ISystemSettingsServer>("set:sys");
         auto static_service_a =
-            system.ServiceManager().GetService<Service::Glue::Time::StaticService>("time:a", true);
-
+            manager.GetService<Service::Glue::Time::StaticService>("time:a");
         auto static_service_s =
-            system.ServiceManager().GetService<Service::PSC::Time::StaticService>("time:s", true);
+            manager.GetService<Service::PSC::Time::StaticService>("time:s");
+        if (!settings_service || !static_service_a || !static_service_s) {
+            LOG_INFO(Core, "Time services not started yet, they will use the current settings");
+            return;
+        }
 
         std::shared_ptr<Service::PSC::Time::SystemClock> user_clock;
         static_service_a->GetStandardUserSystemClock(&user_clock);
@@ -381,14 +405,18 @@ struct System::Impl {
     }
 
     SystemResultStatus Load(System& system, Frontend::EmuWindow& emu_window, const std::string& filepath, Service::AM::FrontendAppletParameters& params) {
+        VideoCommon::StutterTrace::BootMarker("boot_start");
         if (params.launch_type == Service::AM::LaunchType::FrontendInitiated) {
             fs_controller.InitTempStorage();
         }
 
-        const bool switch2_program =
-            virtual_filesystem != nullptr &&
-            IsSwitch2Program(GetGameFileFromPath(virtual_filesystem, filepath), params.program_id,
-                             params.program_index);
+        const std::optional<u64> switch2_program_id =
+            virtual_filesystem != nullptr
+                ? FindSwitch2Program(GetGameFileFromPath(virtual_filesystem, filepath),
+                                     params.program_id, params.program_index)
+                : std::nullopt;
+        const bool switch2_program = switch2_program_id.has_value();
+        Kernel::KSystemControl::SetApplicationProgramId(switch2_program_id.value_or(0));
         Settings::SetCurrentProgramIsSwitch2(switch2_program);
         Settings::SetAstcRecompressionOverride(std::nullopt);
 
@@ -446,6 +474,9 @@ struct System::Impl {
 
         if (!app_loader) {
             LOG_CRITICAL(Core, "Failed to obtain loader for {}!", filepath);
+            // The kernel is already initialized. Left running, it is destroyed with the global
+            // System after main() returns, when device memory is already gone, and exit crashes.
+            ShutdownMainProcess();
             return SystemResultStatus::ErrorGetLoader;
         }
 
@@ -468,6 +499,31 @@ struct System::Impl {
 
         // Make the process created be the application
         kernel.SetApplicationProcess(process->GetHandle());
+
+        // Before the cores start: they read it from their JIT without a lock. Not with a single
+        // core (no idle core to compile on) or the debugger, nor where any core's backend lacks
+        // it (NCE, 32-bit processes, dynarmic's non-x64 backends).
+        if (kernel.IsMulticore() && !system.DebuggerEnabled()) {
+            Kernel::KProcess* const kprocess = process->GetHandle();
+            bool supported = true;
+            for (size_t core = 0; core < Core::Hardware::NUM_CPU_CORES; ++core) {
+                const Core::ArmInterface* const arm = kprocess->GetArmInterface(core);
+                supported = supported && arm != nullptr && arm->SupportsJitWarmup();
+            }
+            if (supported) {
+                jit_warmup = Core::JitWarmup::Create({
+                    .program_id = params.program_id,
+                    .build_id = build_id,
+                    .base = GetInteger(kprocess->GetEntryPoint()),
+                    .size = kprocess->GetCodeSize(),
+                });
+            }
+            if (jit_warmup) {
+                for (size_t core = 0; core < Core::Hardware::NUM_CPU_CORES; ++core) {
+                    kprocess->GetArmInterface(core)->SetJitWarmup(jit_warmup);
+                }
+            }
+        }
 
         // Set up the rest of the system.
         SystemResultStatus init_result{SetupForApplicationProcess(system, emu_window)};
@@ -525,6 +581,7 @@ struct System::Impl {
 
     void ShutdownMainProcess() {
         debug_service.reset();
+        jit_warmup.reset();
         SetShuttingDown(true);
         Common::ADPF::Shutdown();
 
@@ -654,6 +711,8 @@ struct System::Impl {
     bool nvdec_active : 1 = false;
     /// EDEN_NX2_DEBUG_SERVER; the last member, so it stops before anything it reads goes away.
     std::unique_ptr<Nx2Debug::Service> debug_service;
+    /// The application's JIT warm-up; its JITs hold it as well.
+    std::shared_ptr<Core::JitWarmup> jit_warmup;
 
     void EnsureGeneralChannelInitialized(System& system) {
         if (!general_channel_event) {

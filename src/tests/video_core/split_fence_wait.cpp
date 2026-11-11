@@ -161,3 +161,39 @@ TEST_CASE("Immediate fence waits still submit outstanding work", "[video_core][s
     }
     REQUIRE(callback.load());
 }
+
+TEST_CASE("A query fence uses the captured slot lifetime across settings changes",
+          "[video_core][split_fence_wait][query_fence_lifetime]") {
+    ScopedSystemTestContext context;
+    Core::System system;
+    Tegra::GPU gpu{system, false, false};
+    Null::RasterizerNull rasterizer{gpu};
+    Cache texture, buffer, query;
+    Submission submission;
+    const auto previous = Settings::values.gpu_fence_behavior.GetValue();
+    SCOPE_EXIT { Settings::values.gpu_fence_behavior.SetValue(previous); };
+    const auto owner = std::this_thread::get_id();
+    std::atomic<bool> inline_on_owner{}, deferred{};
+    FenceManager manager{rasterizer, gpu, texture, buffer, query, submission};
+    {
+        VideoCore::ScopedQueryReportFence outer{VideoCore::QueryReportFence::Deferred};
+        {
+            VideoCore::ScopedQueryReportFence inner{VideoCore::QueryReportFence::Inline};
+            Settings::values.gpu_fence_behavior.SetValue(Settings::GpuFenceBehavior::Accurate);
+            manager.SignalFence([&] {
+                const auto nested = VideoCore::ScopedQueryReportFence::Take();
+                inline_on_owner.store(std::this_thread::get_id() == owner &&
+                                      nested == VideoCore::QueryReportFence::UseSettings);
+            });
+            REQUIRE(inline_on_owner.load());
+            REQUIRE(manager.submissions == 0);
+        }
+        Settings::values.gpu_fence_behavior.SetValue(Settings::GpuFenceBehavior::Immediate);
+        manager.SignalFence([&] { deferred.store(std::this_thread::get_id() != owner); });
+        REQUIRE(manager.submissions == 1);
+    }
+    Settings::values.gpu_fence_behavior.SetValue(Settings::GpuFenceBehavior::Accurate);
+    manager.WaitPendingFences(true);
+    REQUIRE(deferred.load());
+    REQUIRE_FALSE(submission.timed_out.load());
+}

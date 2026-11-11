@@ -44,6 +44,8 @@ add_library(
     demangle.h
     device_power_state.cpp
     device_power_state.h
+    display_hdr.cpp
+    display_hdr.h
     div_ceil.h
     dkb_cpu_trace.cpp
     dkb_cpu_trace.h
@@ -61,6 +63,8 @@ add_library(
     free_region_manager.h
     fs/file.cpp
     fs/file.h
+    fs/file_lock.cpp
+    fs/file_lock.h
     fs/fs.cpp
     fs/fs.h
     fs/fs_paths.h
@@ -69,6 +73,8 @@ add_library(
     fs/fs_util.h
     fs/path_util.cpp
     fs/path_util.h
+    fs/profile_migration.cpp
+    fs/profile_migration.h
     hash.h
     heap_tracker.cpp
     heap_tracker.h
@@ -99,6 +105,8 @@ add_library(
     range_mutex.h
     range_sets.h
     range_sets.inc
+    recommended_settings.cpp
+    recommended_settings.h
     ring_buffer.h
     ${CMAKE_CURRENT_BINARY_DIR}/scm_rev.cpp
     scm_rev.h
@@ -169,7 +177,7 @@ set_source_files_properties(zbic_compression.cpp PROPERTIES
 if(WIN32)
     target_sources(common PRIVATE windows/timer_resolution.cpp
         windows/timer_resolution.h)
-    target_link_libraries(common PRIVATE ntdll)
+    target_link_libraries(common PRIVATE dxgi ntdll)
 endif()
 
 if(NOT WIN32)

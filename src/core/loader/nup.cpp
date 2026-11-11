@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <cstdlib>
 
 #include "common/logging.h"
 #include "common/string_util.h"
@@ -70,8 +71,10 @@ std::unique_ptr<FileSys::NACP> BuildNacp(const NupContainer::PackageInfo& base,
             }
         }
     }
-    if (!effective_title.empty()) {
-        CopyNameToEntry(nacp->raw.language_entries.language_entries[0], effective_title);
+    // Slot 0 is en-us; an exact en-us localized title wins over the default title (SPEC 5.1).
+    auto& english = nacp->raw.language_entries.language_entries[0];
+    if (!effective_title.empty() && english.application_name[0] == '\0') {
+        CopyNameToEntry(english, effective_title);
     }
     if (!base.publisher.empty()) {
         for (auto& entry : nacp->raw.language_entries.language_entries) {
@@ -101,7 +104,11 @@ std::string DecodeVersion(u32 version) {
 } // namespace
 
 AppLoader_NUP::AppLoader_NUP(FileSys::VirtualFile file_)
-    : AppLoader(std::move(file_)), nup(std::make_unique<NupContainer>(file)) {
+    : AppLoader(std::move(file_)), nup(std::make_unique<NupContainer>(
+          file, NupContainer::DefaultCacheCap, std::filesystem::path{}, [] {
+              const char* setting = std::getenv("EDEN_NX2_NUP_STAND_INS");
+              return setting && std::string_view{setting} == "1";
+          }())) {
     if (nup->GetStatus() != ResultStatus::Success) {
         return;
     }
@@ -160,6 +167,11 @@ AppLoader_NUP::AppLoader_NUP(FileSys::VirtualFile file_)
         }
     }
     display_title = meta.title_name;
+    for (const auto& [lang, name] : meta.localized_titles) {
+        if (lang == "en-us" && !name.empty()) {
+            display_title = name;
+        }
+    }
     has_program = true;
 
     const auto exefs = nup->GetExeFSDir(*exefs_index);
