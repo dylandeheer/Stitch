@@ -97,6 +97,9 @@ else()
         -fno-rtti
         #-fno-exceptions
     )
+    if (APPLE)
+        list(REMOVE_ITEM DYNARMIC_CXX_FLAGS -fno-rtti)
+    endif()
     if (CXX_GCC)
         # GCC produces bogus -Warray-bounds warnings from xbyak headers for code paths that are not
         # actually reachable.  Specifically, it happens in cases where some code casts an Operand&

@@ -169,11 +169,16 @@ if (MSVC AND NOT CXX_CLANG)
     set(CMAKE_EXE_LINKER_FLAGS_RELEASE "/DEBUG /MANIFEST:NO /INCREMENTAL:NO /OPT:REF,ICF" CACHE STRING "" FORCE)
 else()
     if (NOT MSVC)
+        if (APPLE)
+            # Apple's libc++ exception matching needs canonical standard-library type information.
+            set(YUZU_RTTI_FLAG -frtti)
+        else()
+            set(YUZU_RTTI_FLAG -fno-rtti)
+        endif()
         add_compile_options(
             $<$<COMPILE_LANGUAGE:C,CXX>:-fwrapv>
             $<$<COMPILE_LANGUAGE:C,CXX>:-pipe>
-            # Disable RTTI (C++ only)
-            $<$<COMPILE_LANGUAGE:CXX>:-fno-rtti>)
+            $<$<COMPILE_LANGUAGE:CXX>:${YUZU_RTTI_FLAG}>)
     endif()
 
     if (ENABLE_WERROR)
