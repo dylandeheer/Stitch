@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <array>
 #include <filesystem>
 #include <fstream>
 #include <random>
@@ -50,14 +51,34 @@ private:
     }
 };
 
-class ConfigDirectory {
+// The path registry owns mutable paths but exposes legacy entries only by const
+// reference. Swap the registered slots for this single-threaded fixture so even
+// originally absent paths can be restored without creating directories on the host.
+class ScopedProfilePath {
 public:
-    ConfigDirectory()
-        : original{Common::FS::GetEdenPath(Common::FS::EdenPath::ConfigDir)},
-          path{std::filesystem::temp_directory_path() /
-               fmt::format("lichii-config-{}", std::random_device{}())} {
-        REQUIRE(std::filesystem::create_directory(path));
-        Common::FS::SetEdenPath(Common::FS::EdenPath::ConfigDir, path);
+    ScopedProfilePath(const std::filesystem::path& registered, std::filesystem::path replacement)
+        : slot{const_cast<std::filesystem::path&>(registered)}, saved{std::move(replacement)} {
+        slot.swap(saved);
+    }
+    ~ScopedProfilePath() {
+        slot.swap(saved);
+    }
+    ScopedProfilePath(const ScopedProfilePath&) = delete;
+    ScopedProfilePath& operator=(const ScopedProfilePath&) = delete;
+
+private:
+    std::filesystem::path& slot;
+    std::filesystem::path saved;
+};
+
+class ConfigDirectory {
+    using EdenPath = Common::FS::EdenPath;
+
+public:
+    ConfigDirectory() {
+        REQUIRE(std::filesystem::create_directory(root));
+        std::filesystem::create_directory(path);
+        std::filesystem::create_directory(Common::FS::GetEdenPath(EdenPath::EdenDir));
         for (const auto& [key, setting] : Settings::values.linkage.by_key) {
             setting->SetGlobal(false);
             setting->LoadString("");
@@ -67,9 +88,8 @@ public:
     }
 
     ~ConfigDirectory() {
-        Common::FS::SetEdenPath(Common::FS::EdenPath::ConfigDir, original);
         std::error_code error;
-        std::filesystem::remove_all(path, error);
+        std::filesystem::remove_all(root, error);
     }
 
     void Write(const std::string& name, const std::string& contents) const {
@@ -79,8 +99,21 @@ public:
         REQUIRE(file.good());
     }
 
-    const std::filesystem::path original;
-    const std::filesystem::path path;
+    const std::filesystem::path root = std::filesystem::temp_directory_path() /
+                                       fmt::format("lichii-config-{}", std::random_device{}());
+    const std::filesystem::path path = root / "config";
+
+private:
+    // The import journal lives alongside EdenDir. Legacy directories start absent.
+    const std::array<ScopedProfilePath, 7> paths{{
+        {Common::FS::GetEdenPath(EdenPath::EdenDir), root / "lichii"},
+        {Common::FS::GetEdenPath(EdenPath::ConfigDir), path},
+        {Common::FS::GetLegacyPath(Common::FS::LegacyEdenDir), root / "eden"},
+        {Common::FS::GetLegacyPath(Common::FS::CitronDir), root / "citron"},
+        {Common::FS::GetLegacyPath(Common::FS::SudachiDir), root / "sudachi"},
+        {Common::FS::GetLegacyPath(Common::FS::SuyuDir), root / "suyu"},
+        {Common::FS::GetLegacyPath(Common::FS::YuzuDir), root / "yuzu"},
+    }};
 };
 
 void CheckFreshProfile() {
@@ -143,6 +176,21 @@ void CheckUnchangedProfile() {
 }
 
 } // namespace
+
+TEST_CASE("Opening a global config with a legacy profile requires import before writing", "[config]") {
+    ConfigDirectory directory;
+    if (Common::FS::IsPortableMode()) {
+        SKIP("Portable layouts deliberately bypass profile import");
+    }
+    REQUIRE(std::filesystem::create_directory(Common::FS::GetLegacyPath(Common::FS::LegacyEdenDir)));
+    SECTION("Named Qt config") {
+        REQUIRE_THROWS_AS(FileConfig{std::string{"qt-config"}}, std::runtime_error);
+    }
+    SECTION("Default SDL config") {
+        REQUIRE_THROWS_AS(FileConfig{std::optional<std::string>{}}, std::runtime_error);
+    }
+    CHECK(std::filesystem::is_empty(directory.path));
+}
 
 TEST_CASE("Absent global config receives the first-run profile and persists it", "[config]") {
     ConfigDirectory directory;

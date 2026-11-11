@@ -216,6 +216,8 @@ TEST_CASE("Warmup preserves checked compare links and folded tail invalidation",
         REQUIRE(warmed.env.reads.empty());
         REQUIRE(warmed.jit.CompareLinksCompiled() == 1);
         REQUIRE(original.Run(7, 7) == warmed.Run(7, 7));
+        // Installing the filter queued a cache clear that the first Run can consume.
+        const auto links_before_tail_write = warmed.jit.CompareLinksCompiled();
         for (auto* fixture : {&original, &warmed}) {
             fixture->env.code_mem[changed] = changed == 5 ? 0x6b1f007f : (Program[6] ^ 1);
             fixture->jit.InvalidateCacheRange(Base + changed * 4, 4);
@@ -225,6 +227,6 @@ TEST_CASE("Warmup preserves checked compare links and folded tail invalidation",
         const auto expected = original.Run(7, 7);
         REQUIRE(expected.registers[5] == 2);
         REQUIRE(expected == warmed.Run(7, 7));
-        REQUIRE(warmed.jit.CompareLinksCompiled() == 1);
+        REQUIRE(warmed.jit.CompareLinksCompiled() == links_before_tail_write);
     }
 }
