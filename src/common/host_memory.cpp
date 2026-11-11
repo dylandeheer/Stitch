@@ -81,6 +81,7 @@ static int memfd_create(const char* name, unsigned int flags) {
 namespace Common {
 
 thread_local HostMemory::AllocationTestControl* HostMemory::allocation_test_control{};
+thread_local HostMemory::ProtectionTestControl* HostMemory::protection_test_control{};
 
 [[maybe_unused]] constexpr size_t PageAlignment = 0x1000;
 [[maybe_unused]] constexpr int BackingAttempts = 5; // fastmem backing allocation tries (Windows)
@@ -1107,6 +1108,10 @@ void HostMemory::Protect(size_t virtual_offset, size_t length, MemoryPermission 
     const bool write = True(perm & MemoryPermission::Write);
     const bool execute = True(perm & MemoryPermission::Execute);
     impl->Protect(virtual_offset + virtual_base_offset, length, read, write, execute);
+    if (protection_test_control) {
+        protection_test_control->after_protect(protection_test_control->context, virtual_offset,
+                                               length, perm);
+    }
 #endif
 }
 

@@ -495,10 +495,12 @@ struct Memory::Impl {
     }
 
     void RasterizerMarkRegionCached(u64 vaddr, u64 size, bool cached) {
-        if (vaddr == 0 || !AddressSpaceContains(*current_page_table, vaddr, size)) {
+        if (vaddr == 0 || size == 0 || !AddressSpaceContains(*current_page_table, vaddr, size)) {
             return;
         }
 
+        // Arming and disarming must see the permissions and page type change together.
+        std::scoped_lock lk{read_trap_mutex};
         if (current_page_table->fastmem_arena) {
             Common::MemoryPermission perm{};
             // EDEN_NX2_NO_REACTIVE=1 drops the read traps on Switch 2 programs. Opt-in: without
@@ -516,9 +518,10 @@ struct Memory::Impl {
             if (!cached) {
                 perm |= Common::MemoryPermission::Write;
             }
-            host_buffer->Protect(vaddr, size, perm);
             if (cached && perm != Common::MemoryPermission{}) {
-                ProtectArmedPages(vaddr, size);
+                ProtectCachedPages(vaddr, size, perm);
+            } else {
+                host_buffer->Protect(vaddr, size, perm);
             }
         }
 
@@ -640,16 +643,23 @@ struct Memory::Impl {
         return it != armed_read_traps.end() && *it <= ((vaddr + size - 1) >> YUZU_PAGEBITS);
     }
 
-    /// Takes read permission away again from armed pages that were just cached again.
-    void ProtectArmedPages(u64 vaddr, u64 size) {
-        if (armed_read_trap_count.load(std::memory_order_relaxed) == 0) {
-            return;
-        }
-        std::scoped_lock lk{read_trap_mutex};
+    /// Under read_trap_mutex, grant base permissions only to unarmed parts of a cached range.
+    void ProtectCachedPages(u64 vaddr, u64 size, Common::MemoryPermission perm) {
+        const u64 end = vaddr + size;
+        u64 cursor = vaddr;
         const u64 page_end = ((vaddr + size - 1) >> YUZU_PAGEBITS) + 1;
         for (auto it = armed_read_traps.lower_bound(vaddr >> YUZU_PAGEBITS);
              it != armed_read_traps.end() && *it < page_end; ++it) {
-            host_buffer->Protect(*it << YUZU_PAGEBITS, YUZU_PAGESIZE, Common::MemoryPermission{});
+            const u64 begin = std::max(vaddr, *it << YUZU_PAGEBITS);
+            const u64 finish = std::min(end, (*it + 1) << YUZU_PAGEBITS);
+            if (cursor < begin) {
+                host_buffer->Protect(cursor, begin - cursor, perm);
+            }
+            host_buffer->Protect(begin, finish - begin, Common::MemoryPermission{});
+            cursor = finish;
+        }
+        if (cursor < end) {
+            host_buffer->Protect(cursor, end - cursor, perm);
         }
     }
 

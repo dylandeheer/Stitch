@@ -118,6 +118,11 @@ private:
         size_t fallback_attempts{};
     };
     static thread_local AllocationTestControl* allocation_test_control;
+    struct ProtectionTestControl {
+        void* context;
+        void (*after_protect)(void*, size_t, size_t, MemoryPermission);
+    };
+    static thread_local ProtectionTestControl* protection_test_control;
 
     size_t backing_size{};
     size_t virtual_size{};

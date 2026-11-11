@@ -8,6 +8,26 @@ namespace Common {
 
 class HostMemoryTestAccess {
 public:
+    class ProtectionObserver {
+    public:
+        ProtectionObserver(void* context,
+                           void (*callback)(void*, size_t, size_t, MemoryPermission))
+            : previous{HostMemory::protection_test_control}, control{context, callback} {
+            HostMemory::protection_test_control = &control;
+        }
+
+        ~ProtectionObserver() {
+            HostMemory::protection_test_control = previous;
+        }
+
+        ProtectionObserver(const ProtectionObserver&) = delete;
+        ProtectionObserver& operator=(const ProtectionObserver&) = delete;
+
+    private:
+        HostMemory::ProtectionTestControl* previous;
+        HostMemory::ProtectionTestControl control;
+    };
+
     explicit HostMemoryTestAccess(bool fail_fallback = true)
         : previous{HostMemory::allocation_test_control},
           control{0x10000, 0x400000, true, fail_fallback} {
