@@ -1,0 +1,15 @@
+{
+  "revision": "da4c8bd084e656ca67b91355ef1d6f53b1afd677",
+  "branch": "stitch/cpu-bottlenecks-20261111",
+  "frozen_at": "2026-11-11T20:19:46.084791+00:00",
+  "control_revision": "562dfa90e1e678966f168b5813850e43e27f9d0b",
+  "upstream_revision": "d5bb40ad4ca16b66e9c0961f823aff5f2a8c5c08",
+  "upstream_commits_since_control": 6,
+  "candidate_commits": {
+    "split_wait": "e04031b77",
+    "jit_run_frame": "bd21693a8",
+    "read_protection": "208a6bc2b"
+  },
+  "jit_run_frame_default": false,
+  "owner_performance_validation": "pending; owner will test later"
+}

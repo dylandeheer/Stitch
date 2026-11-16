@@ -1,0 +1,6 @@
+{
+  "revision": "c234ec16efa8dd63332b76df410c3e19d9b1264b",
+  "branch": "stitch/macos-20261111",
+  "parent": "562dfa90e1e678966f168b5813850e43e27f9d0b",
+  "tests": "all nine CTest suites passed; metadata-only relink follows"
+}

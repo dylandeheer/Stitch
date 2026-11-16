@@ -1,0 +1,615 @@
+diff --git a/src/core/arm/dynarmic/arm_dynarmic_64.cpp b/src/core/arm/dynarmic/arm_dynarmic_64.cpp
+index b489e795..0784a408 100644
+--- a/src/core/arm/dynarmic/arm_dynarmic_64.cpp
++++ b/src/core/arm/dynarmic/arm_dynarmic_64.cpp
+@@ -13,6 +13,7 @@
+ #include "core/arm/dynarmic/arm_dynarmic.h"
+ #include "core/arm/dynarmic/arm_dynarmic_64.h"
+ #include "core/arm/dynarmic/dynarmic_exclusive_monitor.h"
++#include "core/arm/dynarmic/oot_lookup_sites.h"
+ #include "core/arm/dynarmic/window_trace.h"
+ #include "core/core_timing.h"
+ #include "core/hle/kernel/k_process.h"
+@@ -457,6 +458,25 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
+         config.fastmem_exclusive_access = false;
+     }
+     m_jit.emplace(config);
++#if defined(__linux__) && defined(__x86_64__)
++    const char* option = std::getenv("STITCH_OOT_COMPARE_LINK");
++    if (option && std::string_view{option} == "1" && !m_system.DebuggerEnabled() &&
++        !config.enable_cycle_counting) {
++        m_jit->SetCompareLinkFilter(
++            [this](u64 pc) -> std::optional<Core::OotLookupSites::Window> {
++                if (!OotLookupSites::MayContain(pc))
++                    return std::nullopt;
++                auto sites = m_cb->m_process->GetLookupSites();
++                return sites ? sites->Find(pc) : std::nullopt;
++            },
++            [this](size_t count) {
++                if (count <= 14 || std::has_single_bit(count)) {
++                    LOG_INFO(Core_ARM, "OoT compare links: core={} compiled={}", m_core_index,
++                             count);
++                }
++            });
++    }
++#endif
+ }
+ 
+ HaltReason ArmDynarmic64::RunThread(Kernel::KThread* thread) {
+diff --git a/src/core/arm/dynarmic/oot_lookup_sites.h b/src/core/arm/dynarmic/oot_lookup_sites.h
+new file mode 100644
+index 00000000..217eaf1f
+--- /dev/null
++++ b/src/core/arm/dynarmic/oot_lookup_sites.h
+@@ -0,0 +1,76 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++#pragma once
++
++#include <array>
++#include <cstring>
++#include <memory>
++#include <optional>
++#include <span>
++#include <openssl/evp.h>
++#include "common/common_types.h"
++#include "common/hex_util.h"
++
++namespace Core {
++// Only the loader captures these words, after user mods, for the two digest-matched code pages.
++struct OotLookupSites {
++    using Window = std::array<u32, 7>;
++    static constexpr std::array<u64, 2> page_offsets{0x58f000, 0x591000};
++    static constexpr std::array<u64, 2> first_load{0x58fc9c, 0x591e5c};
++    u64 base;
++    std::array<std::array<Window, 7>, 2> windows{};
++
++    static std::shared_ptr<const OotLookupSites> FromModule(std::span<const u8> module, u64 base,
++                                                            u64 text_begin, u64 text_size) {
++        constexpr std::array<std::string_view, 2> sha256{
++            "02D9C2DC30A85D5C0942117F1898BE88DC94ED8E74BA5468D9B48E1B24A15414",
++            "66D9CEE3F0D52D76B6B2484DE7A1EEAFDBD831984015C91D6E51EEC676FA38B2"};
++        if (base & 4095)
++            return {};
++        auto sites = std::make_shared<OotLookupSites>();
++        sites->base = base;
++        for (size_t i = 0; i < page_offsets.size(); ++i) {
++            const auto offset = page_offsets[i];
++            if (offset < text_begin || offset - text_begin > text_size ||
++                text_size - (offset - text_begin) < 4096 || offset > module.size() ||
++                module.size() - offset < 4096)
++                return {};
++            std::array<u8, 32> digest{};
++            unsigned int n{};
++            if (EVP_Digest(module.data() + offset, 4096, digest.data(), &n, EVP_sha256(),
++                           nullptr) != 1 ||
++                n != digest.size() || Common::HexToString(digest) != sha256[i])
++                return {};
++            for (size_t lane = 0; lane < 7; ++lane) {
++                std::memcpy(sites->windows[i][lane].data(),
++                            module.data() + first_load[i] + lane * 36, sizeof(Window));
++            }
++        }
++        return sites;
++    }
++
++    static bool MayContain(u64 pc) {
++        // Module mappings are 4 KiB aligned. Avoid acquiring a shared_ptr on ordinary JIT misses.
++        const u64 offset = pc & 4095;
++        for (const u64 first : first_load) {
++            const u64 delta = offset - (first & 4095);
++            if (delta < 7 * 36 && delta % 36 == 0)
++                return true;
++        }
++        return false;
++    }
++
++    std::optional<Window> Find(u64 pc) const {
++        if (pc < base)
++            return std::nullopt;
++        const u64 offset = pc - base;
++        for (size_t i = 0; i < first_load.size(); ++i) {
++            if (offset < first_load[i])
++                continue;
++            const u64 delta = offset - first_load[i];
++            if (delta < 7 * 36 && delta % 36 == 0)
++                return windows[i][delta / 36];
++        }
++        return std::nullopt;
++    }
++};
++} // namespace Core
+diff --git a/src/core/hle/kernel/k_process.h b/src/core/hle/kernel/k_process.h
+index 410b5412..eaf53e77 100644
+--- a/src/core/hle/kernel/k_process.h
++++ b/src/core/hle/kernel/k_process.h
+@@ -23,6 +23,10 @@
+ #include "core/hle/kernel/k_thread_local_page.h"
+ #include "core/memory.h"
+ 
++namespace Core {
++struct OotLookupSites;
++}
++
+ namespace Kernel {
+ 
+ enum class DebugWatchpointType : u8 {
+@@ -121,6 +125,7 @@ private:
+ 
+     std::atomic<s64> m_cpu_time{};
+     std::atomic_bool m_mkw_dynamic_fps_patch_applied{};
++    std::shared_ptr<const Core::OotLookupSites> m_lookup_sites;
+     std::atomic<s64> m_num_process_switches{};
+     std::atomic<s64> m_num_thread_switches{};
+     std::atomic<s64> m_num_fpu_switches{};
+@@ -184,6 +189,13 @@ public:
+         return m_program_id;
+     }
+ 
++    void SetLookupSites(std::shared_ptr<const Core::OotLookupSites> sites) {
++        std::atomic_store(&m_lookup_sites, std::move(sites));
++    }
++    auto GetLookupSites() const {
++        return std::atomic_load(&m_lookup_sites);
++    }
++
+     bool IsMkwDynamicFpsPatchApplied() const {
+         return m_mkw_dynamic_fps_patch_applied.load(std::memory_order_relaxed);
+     }
+diff --git a/src/core/loader/nso.cpp b/src/core/loader/nso.cpp
+index 93d3ca16..ce604bb8 100644
+--- a/src/core/loader/nso.cpp
++++ b/src/core/loader/nso.cpp
+@@ -6,9 +6,11 @@
+ 
+ #include <algorithm>
+ #include <cinttypes>
++#include <cstdlib>
+ #include <cstring>
+ #include <span>
+ #include <vector>
++#include "core/arm/dynarmic/oot_lookup_sites.h"
+ 
+ #include "common/common_funcs.h"
+ #include "common/game_presets.h"
+@@ -340,6 +342,23 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
+         }
+     }
+     LOG_INFO(Loader, "Module {} loaded at {:#x} (size {:#x})", nso_file.GetName(), load_base, image_size);
++#if defined(__linux__) && defined(__x86_64__)
++    if (name == "main" && process.GetProgramId() == 0x0400486024DEC000ULL) {
++        const char* option = std::getenv("STITCH_OOT_COMPARE_LINK");
++        if (option && std::string_view{option} == "1" && !system.DebuggerEnabled() &&
++            Common::HexToString(nso_header.build_id) ==
++                "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348000000000000000000000000") {
++            const auto module = std::span<const u8>{codeset.memory}.subspan(module_start);
++            const auto& text = nso_header.segments[0];
++            auto sites =
++                Core::OotLookupSites::FromModule(module, load_base, text.location, text.size);
++            LOG_INFO(Loader, "OoT compare links: verified={}", static_cast<bool>(sites));
++            process.SetLookupSites(std::move(sites));
++        } else {
++            process.SetLookupSites({});
++        }
++    }
++#endif
+     process.LoadModule(system.Kernel(), std::move(codeset), load_base);
+     if (name == "main" && process.GetProgramId() == Settings::MarioKartWorldProgramId) {
+         process.SetMkwDynamicFpsPatchApplied(mkw_dynamic_fps_patch_applied);
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
+index 23072267..5af125ad 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
+@@ -72,7 +72,7 @@ A64EmitX64::A64EmitX64(BlockOfCode& code, A64::UserConfig conf, A64::Jit* jit_in
+ 
+ A64EmitX64::~A64EmitX64() = default;
+ 
+-A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) noexcept {
++A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block, bool fold_compare) noexcept {
+     if (conf.very_verbose_debugging_output) [[unlikely]] {
+         std::puts(IR::DumpBlock(block).c_str());
+     }
+@@ -148,7 +148,28 @@ finish_this_inst:
+     if (conf.enable_cycle_counting)
+         EmitAddCycles(block.CycleCount());
+     code.mov(rbp, code.qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, abi_base_pointer)]);
+-    EmitTerminal(block.terminal, ctx.Location().SetSingleStepping(false), ctx.IsSingleStep());
++    if (fold_compare) {
++        const auto& branch = std::get<IR::Term::CheckBit>(block.terminal);
++        const auto target = std::get<IR::Term::LinkBlock>(branch.then_).next;
++        const auto continuation = std::get<IR::Term::LinkBlock>(branch.else_).next;
++        Xbyak::Label zero, halted;
++        code.cmp(code.byte[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, check_bit)], 0);
++        code.jne(zero, code.T_NEAR);
++        // The original nonzero edge links first to CMP. Preserve its halt checkpoint and PC.
++        code.cmp(code.dword[code.ABI_JIT_PTR + offsetof(A64JitState, halt_reason)], 0);
++        code.jne(halted, code.T_NEAR);
++        EmitTerminal(IR::Term::If{IR::Cond::NE, IR::Term::LinkBlock{target},
++                                  IR::Term::LinkBlock{A64::LocationDescriptor{continuation}.AdvancePC(8)}},
++                     ctx.Location(), false);
++        code.L(halted);
++        code.mov(rax, A64::LocationDescriptor{continuation}.PC());
++        code.mov(code.qword[code.ABI_JIT_PTR + offsetof(A64JitState, pc)], rax);
++        code.ForceReturnFromRunCode();
++        code.L(zero);
++        EmitLeafTerminal(branch.then_, ctx.Location(), false);
++    } else {
++        EmitTerminal(block.terminal, ctx.Location().SetSingleStepping(false), ctx.IsSingleStep());
++    }
+     code.int3();
+     for (auto& deferred_emit : ctx.deferred_emits)
+         deferred_emit();
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.h b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.h
+index a9f2d9b6..c3817b40 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.h
++++ b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.h
+@@ -48,7 +48,7 @@ public:
+ 
+     /// Emit host machine code for a basic block with intermediate representation `block`.
+     /// @note block is modified.
+-    BlockDescriptor Emit(IR::Block& block) noexcept;
++    BlockDescriptor Emit(IR::Block& block, bool fold_compare = false) noexcept;
+ 
+     void ClearCache() override;
+ 
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp b/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp
+index bb072129..b6616a00 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp
+@@ -58,6 +58,27 @@ static Optimization::PolyfillOptions GenPolyfillOptions(const BlockOfCode& code)
+     };
+ }
+ 
++// The sign-extended imm19 counts instructions relative to the branch's own PC.
++static s64 CompareLinkDisplacement(u32 word) {
++    return static_cast<s32>(word << 8) >> 13;
++}
++
++// The first instruction has already been translated normally. The following CMP Wn,Wm
++// remains live across two conditional selects and CBZ Wn. The second CMP is identical,
++// and both branches target the same PC. No guest data-memory instruction is fused.
++static bool IsCompareLinkWindow(const Jit::CompareWindow& w) {
++    const u32 cmp = w[1];
++    if ((cmp & 0xffe0fc1f) != 0x6b00001f || w[5] != cmp || (w[4] & 0xff000000) != 0x34000000 || (w[6] & 0xff00001f) != 0x54000001)
++        return false;
++    const u32 lhs = (cmp >> 5) & 31, rhs = (cmp >> 16) & 31;
++    for (const u32 select : {w[2], w[3]}) {
++        // 32-bit CSEL/CSINC/CSINV/CSNEG, which preserve NZCV.
++        if ((select & 0xbfe00800) != 0x1a800000 || (select & 31) == lhs || (select & 31) == rhs)
++            return false;
++    }
++    return lhs != 31 && rhs != 31 && (w[4] & 31) == lhs && CompareLinkDisplacement(w[4]) == CompareLinkDisplacement(w[6]) + 2;
++}
++
+ struct Jit::Impl final {
+ public:
+     Impl(Jit* jit, UserConfig conf)
+@@ -223,6 +244,10 @@ public:
+         return Common::DisassembleX64(p, p + size);
+     }
+ 
++    CompareFilter compare_filter;
++    std::function<void(size_t)> compare_observer;
++    size_t compare_links{};
++
+ private:
+     static CodePtr GetCurrentBlockThunk(void* thisptr) {
+         Jit::Impl* this_ = static_cast<Jit::Impl*>(thisptr);
+@@ -258,8 +283,42 @@ private:
+         // LocationDescriptor ctor() does important ops (like tflags) do not skip
+         auto const arch_descriptor = A64::LocationDescriptor{descriptor};
+         ir_block.Reset(arch_descriptor);
+-        A64::Translate(ir_block, arch_descriptor, get_code, {conf.define_unpredictable_behaviour, conf.wall_clock_cntpct});
++        const TranslationOptions options{conf.define_unpredictable_behaviour, conf.wall_clock_cntpct};
++        const auto start = arch_descriptor.PC();
++        const auto expected = compare_filter && !arch_descriptor.SingleStepping() && !conf.enable_cycle_counting && conf.HasOptimization(OptimizationFlag::BlockLinking)
++                                ? compare_filter(start)
++                                : std::nullopt;
++        bool fold = false;
++        if (expected) {
++            size_t seen = 0;
++            bool matches = true;
++            const auto observed = [&](u64 pc) {
++                const auto word = get_code(pc);
++                matches &= seen < 5 && pc == start + seen * 4 && word == (*expected)[seen];
++                ++seen;
++                return word;
++            };
++            A64::Translate(ir_block, arch_descriptor, observed, options);
++            fold = matches && seen == 5 && get_code(start + 20) == (*expected)[5] && get_code(start + 24) == (*expected)[6] && IsCompareLinkWindow(*expected);
++        } else {
++            A64::Translate(ir_block, arch_descriptor, get_code, options);
++        }
+         Optimization::Optimize(ir_block, conf, polyfill_options);
++        if (fold) {
++            const auto* branch = std::get_if<IR::Term::CheckBit>(&ir_block.terminal);
++            const auto* zero = branch ? std::get_if<IR::Term::LinkBlock>(&branch->then_) : nullptr;
++            const auto* nonzero = branch ? std::get_if<IR::Term::LinkBlock>(&branch->else_) : nullptr;
++            const u64 target = start + 16 + CompareLinkDisplacement((*expected)[4]) * 4;
++            fold = zero && nonzero && zero->next == arch_descriptor.SetPC(target) && nonzero->next == arch_descriptor.SetPC(start + 20);
++        }
++        if (fold) {
++            // A write to either inlined instruction invalidates this block as well.
++            ir_block.SetEndLocation(arch_descriptor.AdvancePC(28));
++            ++compare_links;
++            if (compare_observer)
++                compare_observer(compare_links);
++            return emitter.Emit(ir_block, true).entrypoint;
++        }
+         return emitter.Emit(ir_block).entrypoint;
+     }
+ 
+@@ -402,6 +461,16 @@ void Jit::SetPstate(u32 value) {
+     impl->SetPstate(value);
+ }
+ 
++void Jit::SetCompareLinkFilter(CompareFilter filter, std::function<void(size_t)> observer) {
++    ClearCache();
++    impl->compare_filter = std::move(filter);
++    impl->compare_observer = std::move(observer);
++}
++
++size_t Jit::CompareLinksCompiled() const {
++    return impl->compare_links;
++}
++
+ void Jit::ClearExclusiveState() {
+     impl->ClearExclusiveState();
+ }
+diff --git a/src/dynarmic/src/dynarmic/interface/A64/a64.h b/src/dynarmic/src/dynarmic/interface/A64/a64.h
+index e8d23527..eb5e641c 100644
+--- a/src/dynarmic/src/dynarmic/interface/A64/a64.h
++++ b/src/dynarmic/src/dynarmic/interface/A64/a64.h
+@@ -11,7 +11,9 @@
+ #include <array>
+ #include <cstddef>
+ #include <cstdint>
++#include <functional>
+ #include <memory>
++#include <optional>
+ #include <string>
+ #include <vector>
+ 
+@@ -44,6 +46,14 @@ public:
+      */
+     void ClearCache();
+ 
++#if defined(__x86_64__) || defined(_M_X64)
++    // Optional embedding-provided authenticated code windows, checked again at translation.
++    using CompareWindow = std::array<std::uint32_t, 7>;
++    using CompareFilter = std::function<std::optional<CompareWindow>(std::uint64_t)>;
++    void SetCompareLinkFilter(CompareFilter filter, std::function<void(std::size_t)> observer = {});
++    std::size_t CompareLinksCompiled() const;
++#endif
++
+     /**
+      * Invalidate the code cache at a range of addresses.
+      * @param start_address The starting address of the range to invalidate.
+diff --git a/src/tests/CMakeLists.txt b/src/tests/CMakeLists.txt
+index 91bd8e2e..867d6512 100644
+--- a/src/tests/CMakeLists.txt
++++ b/src/tests/CMakeLists.txt
+@@ -189,6 +189,9 @@ target_link_libraries(tests PRIVATE ${PLATFORM_LIBRARIES} Catch2::Catch2WithMain
+ 
+ if (TARGET dynarmic::dynarmic)
+     target_sources(tests PRIVATE core/window_trace.cpp)
++    if(ARCHITECTURE_x86_64)
++        target_sources(tests PRIVATE core/oot_compare_link.cpp)
++    endif()
+     target_link_libraries(tests PRIVATE dynarmic::dynarmic)
+ endif()
+ 
+diff --git a/src/tests/core/oot_compare_link.cpp b/src/tests/core/oot_compare_link.cpp
+new file mode 100644
+index 00000000..f8793eb1
+--- /dev/null
++++ b/src/tests/core/oot_compare_link.cpp
+@@ -0,0 +1,209 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++#include <array>
++#if defined(__linux__)
++#include <sys/mman.h>
++#include <unistd.h>
++#endif
++#include <vector>
++#include <catch2/catch_test_macros.hpp>
++#include "../../dynarmic/tests/A64/testenv.h"
++
++namespace {
++using Jit = Dynarmic::A64::Jit;
++constexpr u64 Base = 0x810000;
++constexpr u64 StringByte = 0x1234fff;
++constexpr std::array<u32, 11> Program{
++    0x39400144,             // LDRB W4,[X10]
++    0x6b04007f,             // CMP W3,W4
++    0x5a933671,             // CNEG W17,W19,HS
++    0x1a910294,             // CSEL W20,W20,W17,EQ
++    0x340000a3,             // CBZ W3,finish
++    0x6b04007f,             // CMP W3,W4
++    0x54000061,             // B.NE finish
++    0x52800125, 0xd4000001, // MOV W5,#9; SVC 0
++    0x52800045, 0xd4000001, // finish: MOV W5,#2; SVC 0
++};
++
++class Environment final : public A64TestEnv {
++public:
++    Jit* jit{};
++    bool halt_on_read{};
++    u8 value{};
++    std::vector<std::pair<u64, size_t>> reads;
++    std::optional<u32> MemoryReadCode(u64 pc) override {
++        if (pc < Base || (pc - Base) % 4 || (pc - Base) / 4 >= code_mem.size())
++            return {};
++        return code_mem[(pc - Base) / 4];
++    }
++    u64 MemoryRead(u64 addr, size_t size) override {
++        reads.emplace_back(addr, size);
++        if (halt_on_read)
++            jit->HaltExecution();
++        return value;
++    }
++    void CallSVC(u32) override {
++        jit->HaltExecution();
++    }
++};
++
++struct Outcome {
++    std::array<u64, 31> registers;
++    std::array<Vector, 32> vectors;
++    u64 pc{}, sp{};
++    u32 flags{};
++    std::vector<std::pair<u64, size_t>> reads;
++    bool operator==(const Outcome&) const = default;
++};
++
++struct Fixture {
++    Environment env;
++    Jit jit;
++    explicit Fixture(bool candidate, bool cycles = false, u8* fastmem = nullptr)
++        : jit{[&] {
++              Dynarmic::A64::UserConfig c;
++              c.callbacks = &env;
++              c.enable_cycle_counting = cycles;
++              if (fastmem) {
++                  c.fastmem_pointer = reinterpret_cast<std::uintptr_t>(fastmem);
++                  c.fastmem_address_space_bits = 16;
++                  c.silently_mirror_fastmem = false;
++                  c.recompile_on_fastmem_failure = false;
++              }
++              return c;
++          }()} {
++        env.jit = &jit;
++        env.code_mem.assign(Program.begin(), Program.end());
++        if (candidate)
++            jit.SetCompareLinkFilter([](u64 pc) -> std::optional<Jit::CompareWindow> {
++                if (pc != Base)
++                    return {};
++                Jit::CompareWindow w{};
++                std::copy_n(Program.begin(), w.size(), w.begin());
++                return w;
++            });
++    }
++    Outcome Run(u32 lhs, u8 rhs, u64 pc = Base, bool halt = false, bool step = false,
++                u64 data_address = StringByte) {
++        std::array<u64, 31> regs{};
++        for (size_t i = 0; i < regs.size(); ++i)
++            regs[i] = 0xabcde00000000000ULL + i * 17;
++        regs[3] = lhs;
++        regs[10] = data_address;
++        std::array<Vector, 32> vectors{};
++        for (size_t i = 0; i < vectors.size(); ++i)
++            vectors[i] = {i * 11, i * 19 + 1};
++        env.ticks_left = 1000;
++        env.value = rhs;
++        env.halt_on_read = halt;
++        env.reads.clear();
++        jit.ClearHalt(Dynarmic::HaltReason::UserDefined1);
++        jit.ClearHalt(Dynarmic::HaltReason::Step);
++        jit.SetRegisters(regs);
++        jit.SetVectors(vectors);
++        jit.SetPC(pc);
++        jit.SetSP(0x8000);
++        jit.SetPstate(0x90000000);
++        if (step)
++            (void)jit.Step();
++        else
++            (void)jit.Run();
++        return {jit.GetRegisters(), jit.GetVectors(), jit.GetPC(),
++                jit.GetSP(),        jit.GetPstate(),  env.reads};
++    }
++};
++} // namespace
++
++TEST_CASE("A fused compare preserves byte reads, registers, flags and both branch checkpoints",
++          "[oot_compare_link]") {
++    Fixture original{false}, candidate{true};
++    for (u32 lhs : {0u, 1u, 127u, 128u, 255u})
++        for (u8 rhs : std::array<u8, 5>{0, 1, 127, 128, 255}) {
++            const auto ref = original.Run(lhs, rhs);
++            REQUIRE(ref == candidate.Run(lhs, rhs));
++            REQUIRE(ref.reads.size() == 1);
++            REQUIRE(ref.reads[0].first == StringByte);
++            REQUIRE(ref.reads[0].second == 1);
++            REQUIRE(ref.registers[5] == (lhs && lhs == rhs ? 9 : 2));
++        }
++    REQUIRE(candidate.jit.CompareLinksCompiled() == 1);
++    for (u32 lhs : {0u, 7u}) {
++        const auto ref = original.Run(lhs, 7, Base, true);
++        REQUIRE(ref == candidate.Run(lhs, 7, Base, true));
++        REQUIRE(ref.pc == Base + (lhs == 0 ? 36 : 20));
++    }
++    for (unsigned offset : {4u, 8u, 12u, 16u, 20u, 24u})
++        REQUIRE(original.Run(9, 9, Base + offset) == candidate.Run(9, 9, Base + offset));
++}
++
++TEST_CASE("Guest code invalidation includes both folded words and restores the baseline",
++          "[oot_compare_link]") {
++    Fixture original{false}, candidate{true};
++    REQUIRE(original.Run(7, 7) == candidate.Run(7, 7));
++    REQUIRE(candidate.jit.CompareLinksCompiled() == 1);
++    size_t changed = 0;
++    SECTION("Change the second comparison") {
++        changed = 5;
++    } // CMP W3,WZR makes 7 unequal.
++    SECTION("Change the second branch") {
++        changed = 6;
++    } // B.EQ reverses the answer.
++    for (auto* f : {&original, &candidate}) {
++        f->env.code_mem[changed] = changed == 5 ? 0x6b1f007f : (Program[6] ^ 1);
++        f->jit.InvalidateCacheRange(Base + 4 * changed, 4);
++    }
++    const auto ref = original.Run(7, 7);
++    REQUIRE(ref.registers[5] == 2);
++    REQUIRE(ref == candidate.Run(7, 7));
++    REQUIRE(candidate.jit.CompareLinksCompiled() == 1);
++}
++
++TEST_CASE("Unverified words, cycle accounting and single stepping retain the normal code",
++          "[oot_compare_link]") {
++    Fixture stepping{true};
++    REQUIRE(stepping.Run(1, 1, Base, false, true).pc == Base + 4);
++    REQUIRE(stepping.jit.CompareLinksCompiled() == 0);
++    Fixture cycles{true, true};
++    REQUIRE(cycles.Run(1, 1).registers[5] == 9);
++    REQUIRE(cycles.jit.CompareLinksCompiled() == 0);
++    Fixture disabled{true};
++    REQUIRE(disabled.Run(1, 1).registers[5] == 9);
++    disabled.jit.SetCompareLinkFilter({});
++    REQUIRE(disabled.Run(1, 1).registers[5] == 9);
++    REQUIRE(disabled.jit.CompareLinksCompiled() == 1);
++    Fixture mismatch{true};
++    mismatch.env.code_mem[3] = 0xd503201f; // NOP replaces the selected move.
++    REQUIRE(mismatch.Run(1, 1).registers[5] == 9);
++    REQUIRE(mismatch.jit.CompareLinksCompiled() == 0);
++}
++
++#if defined(__linux__)
++TEST_CASE("A scalar compare stops at the fastmem guard and retains out-of-range fallback",
++          "[oot_compare_link]") {
++    const size_t page = sysconf(_SC_PAGESIZE);
++    REQUIRE(page < 0x10000);
++    struct Mapping {
++        u8* p;
++        size_t size;
++        ~Mapping() {
++            if (p != MAP_FAILED)
++                munmap(p, size);
++        }
++    } mapping{static_cast<u8*>(mmap(nullptr, 2 * page, PROT_READ | PROT_WRITE,
++                                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0)),
++              2 * page};
++    REQUIRE(mapping.p != MAP_FAILED);
++    REQUIRE(mprotect(mapping.p + page, page, PROT_NONE) == 0);
++    mapping.p[page - 1] = 0xa5;
++    Fixture original{false, false, mapping.p}, candidate{true, false, mapping.p};
++    const auto edge = original.Run(0xa5, 0, Base, false, false, page - 1);
++    REQUIRE(edge == candidate.Run(0xa5, 0, Base, false, false, page - 1));
++    REQUIRE(edge.reads.empty()); // the last accessible byte went directly through fastmem
++    const auto missing = original.Run(7, 7, Base, false, false, 0x10000);
++    REQUIRE(missing == candidate.Run(7, 7, Base, false, false, 0x10000));
++    REQUIRE(missing.reads.size() ==
++            1); // Non-mirrored address outside the configured window uses the original callback.
++    REQUIRE(missing.reads[0].first == 0x10000);
++    REQUIRE(missing.reads[0].second == 1);
++    REQUIRE(candidate.jit.CompareLinksCompiled() == 1);
++}
++#endif

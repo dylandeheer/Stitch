@@ -1,0 +1,76 @@
+diff --git a/src/tests/video_core/maxwell_fast_method.cpp b/src/tests/video_core/maxwell_fast_method.cpp
+index 763abc05..5c71db04 100644
+--- a/src/tests/video_core/maxwell_fast_method.cpp
++++ b/src/tests/video_core/maxwell_fast_method.cpp
+@@ -22,6 +22,8 @@
+ #include "core/memory.h"
+ #include "tests/core/system_test_context.h"
+ #include "video_core/dirty_flags.h"
++#include "video_core/renderer_vulkan/fixed_pipeline_state.h"
++#include "video_core/renderer_vulkan/vk_state_tracker.h"
+ #include "video_core/engines/maxwell_3d.h"
+ #include "video_core/gpu.h"
+ #include "video_core/gpu_split.h"
+@@ -1295,3 +1297,25 @@ TEST_CASE("MME fast reads require stable unique physical backing on every source
+     split.NoteWrite(f.memory, gpu + 0x240, 4);
+     CHECK(Access::WritesTarget(split, f.memory, gpu + 0x140, 4) == pending);
+ }
++
++TEST_CASE("Static Vulkan blend keys observe registers even when the dirty bit is clean",
++          "[static_blend_key]") {
++    Fixture f;
++    auto& maxwell = f.fast;
++    Vulkan::DynamicFeatures features{};
++    Vulkan::FixedPipelineState state{};
++    maxwell.regs.color_mask_common = 0;
++    maxwell.regs.blend.enable[3] = 1;
++    maxwell.regs.iterated_blend.enable.Assign(0);
++    maxwell.regs.color_mask[3].R.Assign(1);
++    maxwell.dirty.flags[Vulkan::Dirty::Blending] = true;
++    state.Refresh(maxwell, features);
++    const auto previous = state.attachments[3].raw;
++    const auto sibling = state.attachments[2].raw;
++    maxwell.regs.color_mask[3].R.Assign(0);
++    REQUIRE_FALSE(maxwell.dirty.flags[Vulkan::Dirty::Blending]);
++    state.Refresh(maxwell, features);
++    CHECK(state.attachments[3].mask_r.Value() == 0);
++    CHECK(state.attachments[3].raw != previous);
++    CHECK(state.attachments[2].raw == sibling);
++}
+diff --git a/src/video_core/renderer_vulkan/fixed_pipeline_state.cpp b/src/video_core/renderer_vulkan/fixed_pipeline_state.cpp
+index babea58b..6509d2c0 100644
+--- a/src/video_core/renderer_vulkan/fixed_pipeline_state.cpp
++++ b/src/video_core/renderer_vulkan/fixed_pipeline_state.cpp
+@@ -254,19 +254,19 @@ void FixedPipelineState::Refresh(Tegra::Engines::Maxwell3D& maxwell3d, DynamicFe
+         dynamic_state.Refresh2(regs, topology_, extended_dynamic_state_2);
+     }
+     if (!extended_dynamic_state_3_blend) {
+-        if (maxwell3d.dirty.flags[Dirty::Blending]) {
+-            maxwell3d.dirty.flags[Dirty::Blending] = false;
+-            for (size_t index = 0; index < attachments.size(); ++index) {
+-                attachments[index].Refresh(regs, index);
+-                auto& attachment = attachments[index];
+-                if (color_write_enable_dynamic && attachment.mask_r == 0 &&
+-                    attachment.mask_g == 0 && attachment.mask_b == 0 &&
+-                    attachment.mask_a == 0) {
+-                    attachment.mask_r.Assign(1);
+-                    attachment.mask_g.Assign(1);
+-                    attachment.mask_b.Assign(1);
+-                    attachment.mask_a.Assign(1);
+-                }
++        // Native register writes and channel restores do not always raise this dirty bit.
++        // Baked blend state must describe the actual attachments before hashing the pipeline key.
++        maxwell3d.dirty.flags[Dirty::Blending] = false;
++        for (size_t index = 0; index < attachments.size(); ++index) {
++            attachments[index].Refresh(regs, index);
++            auto& attachment = attachments[index];
++            if (color_write_enable_dynamic && attachment.mask_r == 0 &&
++                attachment.mask_g == 0 && attachment.mask_b == 0 &&
++                attachment.mask_a == 0) {
++                attachment.mask_r.Assign(1);
++                attachment.mask_g.Assign(1);
++                attachment.mask_b.Assign(1);
++                attachment.mask_a.Assign(1);
+             }
+         }
+     }

@@ -1,0 +1,10 @@
+{
+  "ref": "refs/tags/V1.0.3",
+  "node_id": "REF_kwDOVnQeL7ByZWZzL3RhZ3MvVjEuMC4z",
+  "url": "https://api.github.com/repos/fab918/nxformat/git/refs/tags/V1.0.3",
+  "object": {
+    "sha": "208b815dc21fd92e8bd1c596c708c908b467a457",
+    "type": "commit",
+    "url": "https://api.github.com/repos/fab918/nxformat/git/commits/208b815dc21fd92e8bd1c596c708c908b467a457"
+  }
+}

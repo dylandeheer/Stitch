@@ -1,0 +1,302 @@
+[
+  {
+    "path": "src/core/arm/dynarmic/arm_dynarmic_64 2.cpp",
+    "sha256": "cc64cbb9979530d37783015eccdf3a321d3bc7dc090fdef499f58e5490e41f07",
+    "bytes": 24422
+  },
+  {
+    "path": "src/core/hle/kernel/k_process 2.h",
+    "sha256": "da6d441151435da503e0779bfc46c721046c90f14142b20aa25bd40a11db3d2a",
+    "bytes": 19730
+  },
+  {
+    "path": "src/core/loader/nso 2.cpp",
+    "sha256": "11cf7f7bd94ee70aef1c86e8f30c5de6b9a2c5ec113a3d7d8167d6d74cc8caed",
+    "bytes": 17268
+  },
+  {
+    "path": "src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64 2.h",
+    "sha256": "9152498d4a4f37a906d6771380f520c34dbf2ea610b4e5e434ca2f90a744c220",
+    "bytes": 6092
+  },
+  {
+    "path": "src/dynarmic/src/dynarmic/backend/x64/a64_interface 2.cpp",
+    "sha256": "92fd32345fd013c7e416baf5b3336b24d8a465b615d92e74e5a61316952fd40c",
+    "bytes": 11837
+  },
+  {
+    "path": "src/shader_recompiler/backend/spirv/emit_spirv 2.cpp",
+    "sha256": "e7f566fa775f49241d4c9a0016f1ebd5402f8a489aa72535e7ea7d9708fc303e",
+    "bytes": 35729
+  },
+  {
+    "path": "src/shader_recompiler/backend/spirv/emit_spirv_instructions 2.h",
+    "sha256": "a1c8947cebc9b7793281b66bfacccde0ca1ce34043a2df8dba2b1c999824ade4",
+    "bytes": 37424
+  },
+  {
+    "path": "src/shader_recompiler/backend/spirv/emit_spirv_mesh 2.cpp",
+    "sha256": "1bbe7baee1c055cd1cd36fb5e21a4b5723278b86fa06d79edaa694c55436cd0c",
+    "bytes": 41618
+  },
+  {
+    "path": "src/shader_recompiler/backend/spirv/spirv_emit_context 2.h",
+    "sha256": "283057198337c53ba3d873422a16925bf91963da27e238b44d0448db1eabdb83",
+    "bytes": 13391
+  },
+  {
+    "path": "src/shader_recompiler/object_pool 2.h",
+    "sha256": "2c67517f4a341e380cd30208a653b0bb3285056c6d3cd800e3ce005d00736d61",
+    "bytes": 3198
+  },
+  {
+    "path": "src/shader_recompiler/profile 2.h",
+    "sha256": "1a76a86486e8c50274354e18f7a3d2324565dfb2e5e36ab185cdd61dc07b069b",
+    "bytes": 5531
+  },
+  {
+    "path": "src/tests/CMakeLists 2.txt",
+    "sha256": "9d20e832f2b47171414a8122c0fa30a40228a0ef5f7f13734aa6b047fc8f9698",
+    "bytes": 8286
+  },
+  {
+    "path": "src/tests/CMakeLists 3.txt",
+    "sha256": "8247f652426f2eac66a2585e43e4b913a68bae03ce4a820ac40727de62e7bca3",
+    "bytes": 8486
+  },
+  {
+    "path": "src/tests/video_core/atlas_upload_evidence 2.cpp",
+    "sha256": "c6441655839175722da7580e2499d8c08430d20f9ddf74bc2aee55afe88cba69",
+    "bytes": 4733
+  },
+  {
+    "path": "src/tests/video_core/command_writer 2.cpp",
+    "sha256": "ea348dd55c230260254a5fb0fd8ac25060f8cbdcb766e3f81e2226ebfed8c12c",
+    "bytes": 2978
+  },
+  {
+    "path": "src/tests/video_core/maxwell_fast_method 2.cpp",
+    "sha256": "e4f657a2bf2e843a4fd71078acaba018bef12727d0c817febf4de5434a828e3e",
+    "bytes": 56044
+  },
+  {
+    "path": "src/tests/video_core/memory_tracker 2.cpp",
+    "sha256": "b0ba1899872b98d7e0485d3aa4fc1d8d3c3ca7eccc179ca8e04e8b417c1a3993",
+    "bytes": 31497
+  },
+  {
+    "path": "src/tests/video_core/mesh_fallback 2.cpp",
+    "sha256": "b3ef94a8512a29b69fc4db30de4a3081bc0f54166914b4b11bf1f2539672c7f1",
+    "bytes": 16550
+  },
+  {
+    "path": "src/tests/video_core/mesh_fallback 3.cpp",
+    "sha256": "5c01a79eed4da1060232c5ce3efffd8cbe7bda2438dd38edca65cb16821a0e44",
+    "bytes": 20398
+  },
+  {
+    "path": "src/video_core/CMakeLists 2.txt",
+    "sha256": "612974c4406341ed5f6271fa414c2fe789f5e62b66063eb54c2573108475c4c1",
+    "bytes": 19857
+  },
+  {
+    "path": "src/video_core/CMakeLists 3.txt",
+    "sha256": "26fb458b4051c0b86d486e92423d0142d45f0d653960aea214aeda1b50be2458",
+    "bytes": 19895
+  },
+  {
+    "path": "src/video_core/CMakeLists 4.txt",
+    "sha256": "31e762390bf26988cd2b7f6f1ebea76bdd7822ebcfe5a5cd9c0cbcedddd9aa60",
+    "bytes": 19949
+  },
+  {
+    "path": "src/video_core/buffer_cache/buffer_cache_base 2.h",
+    "sha256": "25b26a095f7fa2fdfdb02d0dd88a978fd99870e83dba65ef4f1933e9d343015d",
+    "bytes": 34182
+  },
+  {
+    "path": "src/video_core/buffer_cache/read_trap_tracker 2.h",
+    "sha256": "23ac2b7bb4afc7f27981e72006d0c2addb8d6ca8836006b2de3d038753dd0e6c",
+    "bytes": 878
+  },
+  {
+    "path": "src/video_core/control/scheduler 2.cpp",
+    "sha256": "7c07ac8b5b503e10c35d44483980f0b5c8f759f3efd212b73ac1d647ae8879f3",
+    "bytes": 3394
+  },
+  {
+    "path": "src/video_core/control/scheduler 2.h",
+    "sha256": "da9738ee4aefc16146f3114a5a11d3b979a30c2a88f7c6f6900b128eec85350f",
+    "bytes": 1343
+  },
+  {
+    "path": "src/video_core/dma_pusher 2.cpp",
+    "sha256": "d17dab5cd6fffbd4b0d2da52d5f3ecbf5c8725d551f34a7ac751c88dbf781050",
+    "bytes": 43564
+  },
+  {
+    "path": "src/video_core/dma_pusher 2.h",
+    "sha256": "6705eb908581c117369797f6a4f95171132c64df7795e3c104bade334c78b1a2",
+    "bytes": 11877
+  },
+  {
+    "path": "src/video_core/engines/maxwell_3d 2.cpp",
+    "sha256": "a6356acd36358853fd57d046b40c4688ddeb4790b987f7bea747fcbf701a7fc3",
+    "bytes": 72723
+  },
+  {
+    "path": "src/video_core/engines/maxwell_3d 2.h",
+    "sha256": "bc4152b7656bf9cf7036d31e570a3a4ea4ee9a41c08e1adde8881f700adf8595",
+    "bytes": 150608
+  },
+  {
+    "path": "src/video_core/engines/maxwell_3d 3.cpp",
+    "sha256": "af924177e6b5aefff3c04e3778064baef58e285d30b32f3ad5d55d8e6515766b",
+    "bytes": 75317
+  },
+  {
+    "path": "src/video_core/engines/maxwell_3d 4.cpp",
+    "sha256": "bd0fa525110aea3d3c8ba50bbce3073ebc9bf3fda2e3ff322a935ea7445bed5c",
+    "bytes": 76324
+  },
+  {
+    "path": "src/video_core/gpu_split 2.cpp",
+    "sha256": "d56bd6ff59edbff35df9bcfc9a4cf3a2b9e980ef58ec3a90bf53886a5fdc68f4",
+    "bytes": 29934
+  },
+  {
+    "path": "src/video_core/gpu_split 2.h",
+    "sha256": "a7b0cd44c9cbbc6d9d9bf93bd39da11c347e6c6483b5cc9af59fdba94044eca5",
+    "bytes": 15561
+  },
+  {
+    "path": "src/video_core/gpu_split 3.cpp",
+    "sha256": "fb3af3e5577b41a75f6d0065f32ff22a3639a591fd618cadc1d56221d53af32a",
+    "bytes": 38478
+  },
+  {
+    "path": "src/video_core/gpu_split 3.h",
+    "sha256": "89a241caad14291f0010a2048b4ea251703e8ca6f7135f61c5f4c0bf41d5d7c3",
+    "bytes": 16449
+  },
+  {
+    "path": "src/video_core/gpu_thread 2.cpp",
+    "sha256": "1e3a5bbfa61dbb534dc046c939183d1160e3e90714e272149a64ab3b8d750aec",
+    "bytes": 9869
+  },
+  {
+    "path": "src/video_core/renderer_opengl/gl_rasterizer 2.cpp",
+    "sha256": "c0ffa4566a0312728469aff95ff505ac1889a60f3a69b08d428287011e7c93c1",
+    "bytes": 56333
+  },
+  {
+    "path": "src/video_core/renderer_vulkan/vk_graphics_pipeline 2.cpp",
+    "sha256": "2799af624d3852928d97a8a0ca8be3cecb52d43ad3178539827f4bfe993d7a58",
+    "bytes": 81038
+  },
+  {
+    "path": "src/video_core/renderer_vulkan/vk_graphics_pipeline 2.h",
+    "sha256": "167964c20251c3a9c1e5c82404dc29143c04302888e811dacc758068e1c8ac3e",
+    "bytes": 13113
+  },
+  {
+    "path": "src/video_core/renderer_vulkan/vk_pipeline_cache 2.cpp",
+    "sha256": "ae064b569f69d54a505feb580e1457b5956234b7f5e1b22c7f31e723f4ed950a",
+    "bytes": 111301
+  },
+  {
+    "path": "src/video_core/renderer_vulkan/vk_pipeline_cache 3.cpp",
+    "sha256": "8c91eb2d9eeb1bc5689dc6ad0470701f252ae0c7323d37feb41bdc4b599a205d",
+    "bytes": 112297
+  },
+  {
+    "path": "src/video_core/renderer_vulkan/vk_pipeline_cache 4.cpp",
+    "sha256": "c37cf04e3cdcd1c473ced417fbffe2fa2d85a4d9f717cb4bfdb6dee5496ecabe",
+    "bytes": 112467
+  },
+  {
+    "path": "src/video_core/renderer_vulkan/vk_rasterizer 2.cpp",
+    "sha256": "8d4b52120102a809578740a197a6a51e95eb0c14712a5c15831393f2b6d33518",
+    "bytes": 176111
+  },
+  {
+    "path": "src/video_core/renderer_vulkan/vk_texture_cache 2.cpp",
+    "sha256": "a79b002859a0549a8eb455a33b7a0900cce8e3c3bcecfaacf653cd59300b525f",
+    "bytes": 232334
+  },
+  {
+    "path": "src/video_core/renderer_vulkan/vk_texture_cache 2.h",
+    "sha256": "85a43e301f95603310f8ed8bfb228527b692d7af8d965c7b0c1702a6ce32ab91",
+    "bytes": 33096
+  },
+  {
+    "path": "src/video_core/renderer_vulkan/vk_texture_cache 3.cpp",
+    "sha256": "c2eafec9e46695fc8a1bfc67f382f108b505469b649d7882e7e2fbb6bba82111",
+    "bytes": 232396
+  },
+  {
+    "path": "src/video_core/renderer_vulkan/vk_texture_cache 3.h",
+    "sha256": "6f42e25405dbb5be1e894134e30bcd5df8a3ca75c80846f884d834432efdedc2",
+    "bytes": 33170
+  },
+  {
+    "path": "src/video_core/texture_cache/texture_cache 2.h",
+    "sha256": "7f8b2143d5941de67b62fdbbc904bceb25a4a295ed8fdc0633696d6e4fcb1f5b",
+    "bytes": 192107
+  },
+  {
+    "path": "src/video_core/texture_cache/texture_cache 3.h",
+    "sha256": "27b7eafd6175c0151e9af08e602c32f777ce16aeac4d9c4ea1c3a4c3e7328732",
+    "bytes": 193463
+  },
+  {
+    "path": "src/video_core/texture_cache/texture_cache 4.h",
+    "sha256": "a583e08afd4e0e75529dbc75dd1f1a432421a46349e11c98639e4c86175b1ff5",
+    "bytes": 196549
+  },
+  {
+    "path": "src/video_core/texture_cache/util 2.cpp",
+    "sha256": "f8677e516fac4c5e0ed97db46cff4221222cba53f3aa3fafe4c10df8c59d79d7",
+    "bytes": 79229
+  },
+  {
+    "path": "src/video_core/texture_cache/util 2.h",
+    "sha256": "5366eddef11b32105fc6e8752313374b9c155a9f6e3ada717670071cc4c4e6a0",
+    "bytes": 8695
+  },
+  {
+    "path": "src/video_core/texture_cache/util 3.cpp",
+    "sha256": "73af36aa41d83a9b2b6768fd4385b8c664520f5165bf1678ebe6095cf0230207",
+    "bytes": 79848
+  },
+  {
+    "path": "src/video_core/texture_cache/util 3.h",
+    "sha256": "cd00fb1ae7873da252e25f86575befd1eb71252d9c5597f3dfc6b1f6b95dcc24",
+    "bytes": 9207
+  },
+  {
+    "path": "src/video_core/vulkan_common/vulkan_memory_allocator 2.cpp",
+    "sha256": "790d64754454ca00e6924203ea0affa3ec6f3d9c1bdf5bb71a4c6b030d75a152",
+    "bytes": 30810
+  },
+  {
+    "path": "src/video_core/vulkan_common/vulkan_memory_allocator 2.h",
+    "sha256": "18221762bbc820a04947727ee3ae50ef5aa074dd86f27d692fed4e0d8ba95931",
+    "bytes": 8987
+  },
+  {
+    "path": "src/video_core/vulkan_common/vulkan_memory_allocator 3.cpp",
+    "sha256": "f7346a7c17585e0d5678212be863728bebfdbb57535bf66aa2f273d427355e18",
+    "bytes": 31063
+  },
+  {
+    "path": "src/video_core/vulkan_common/vulkan_wrapper 2.cpp",
+    "sha256": "25a982cf22d689d482b25436471726a9ade4f4034e2ba8704e68750f4a704e13",
+    "bytes": 43190
+  },
+  {
+    "path": "src/video_core/vulkan_common/vulkan_wrapper 2.h",
+    "sha256": "95ebdf9e307df97b294b8229207557d1db55bb40b8db5bdb202a35e7ee9f6947",
+    "bytes": 72481
+  }
+]

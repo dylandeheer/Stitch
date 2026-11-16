@@ -1,0 +1,32 @@
+[
+  {
+    "path": "836-r32-init-impl.patch",
+    "original_base": "5a3b7f5e30c1cc47c87e59ab751d5d53e0e82194",
+    "sha256": "412079fe695e98d678e7ab50e3ead06b786da149b76291ec73e5e50c33448926",
+    "status": "unfinished historical experiment; not promoted to engine"
+  },
+  {
+    "path": "836-depth-init-impl.patch",
+    "original_base": "f3fe39e503e52bb9ecc4c3a7c83634f9324a0941",
+    "sha256": "b5cecc5ae82ec4196b4fa59058072bdd51c9b39e9c9cef44c2b061f38816cf13",
+    "status": "unfinished historical experiment; not promoted to engine"
+  },
+  {
+    "path": "917-impl.patch",
+    "original_base": "89ca3cd8cf2c077f063da6e165600fc4b109e630",
+    "sha256": "4be5d4b3dc5089424973f75e291ae8a76d77ca6d06fc31eedd08a9c912df1401",
+    "status": "unfinished historical experiment; not promoted to engine"
+  },
+  {
+    "path": "917-blend-impl.patch",
+    "original_base": "89ca3cd8cf2c077f063da6e165600fc4b109e630",
+    "sha256": "bad1f05a69e374fcbb511d9ddf5c221c76f6c7987f04847d5f890ee9d9009950",
+    "status": "unfinished historical experiment; not promoted to engine"
+  },
+  {
+    "path": "917-producer-impl.patch",
+    "original_base": "5a3b7f5e30c1cc47c87e59ab751d5d53e0e82194",
+    "sha256": "3c3eaf37c8d5decbad7bf994a4ee0b1ed935c62e02d2c302e5edd17b257a6684",
+    "status": "unfinished historical experiment; not promoted to engine"
+  }
+]

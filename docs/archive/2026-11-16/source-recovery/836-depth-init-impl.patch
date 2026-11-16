@@ -1,0 +1,763 @@
+diff --git a/src/tests/video_core/atlas_upload_evidence.cpp b/src/tests/video_core/atlas_upload_evidence.cpp
+index 109ae57b..258a20f9 100644
+--- a/src/tests/video_core/atlas_upload_evidence.cpp
++++ b/src/tests/video_core/atlas_upload_evidence.cpp
+@@ -5,6 +5,7 @@
+ 
+ #include "video_core/texture_cache/atlas_upload_evidence.h"
+ #include "video_core/texture_cache/util.h"
++#include "video_core/texture_cache/zero_depth_upload.h"
+ 
+ namespace {
+ using namespace VideoCommon;
+@@ -114,3 +115,130 @@ TEST_CASE("All nine D16 chunks cover the full guest footprint exactly once", "[a
+     REQUIRE(observed.other_bytes == observed.non_file_bytes);
+     REQUIRE(observed.ff_bytes == 0);
+ }
++
++TEST_CASE("Only fresh backed D16 first-use storage can use a depth clear", "[zero_depth_upload]") {
++    REQUIRE(IsFirstDepthUpload(false, ImageFlagBits::Tracked));
++    REQUIRE_FALSE(IsFirstDepthUpload(true, ImageFlagBits::Tracked));
++    for (auto bit :
++         {ImageFlagBits::Registered, ImageFlagBits::Remapped, ImageFlagBits::GpuModified,
++          ImageFlagBits::Alias, ImageFlagBits::BadOverlap, ImageFlagBits::Sparse,
++          ImageFlagBits::Rescaled, ImageFlagBits::Unbacked, ImageFlagBits::TrimmedLevels}) {
++        CHECK_FALSE(IsFirstDepthUpload(false, ImageFlagBits::Tracked | bit));
++    }
++}
++
++TEST_CASE("A depth clear requires exact tiled source and full host subresource coverage",
++          "[zero_depth_upload]") {
++    constexpr GPUVAddr base = 0x12345000;
++    constexpr size_t size = 288ULL << 20;
++    constexpr size_t chunk = 32ULL << 20;
++    auto info = Target(PixelFormat::D16_UNORM, 12288);
++    info.layer_stride = CalculateLayerStride(info);
++    std::vector<UnswizzlePlan> plans;
++    for (size_t offset = 0; offset < size; offset += chunk) {
++        const std::array range{std::pair<u64, u64>{offset, offset + chunk}};
++        plans.emplace_back(PlanUnswizzleImageRows(base, info, range));
++    }
++    const auto covers = [&] { return CoversWholeD16(plans, base, size, 12288, 12288); };
++    REQUIRE(covers());
++    SECTION("Guest gap at the end") {
++        ++plans.back().runs.back().src_addr;
++    }
++    SECTION("Destination overlap and hole of equal area") {
++        --plans[1].copies.front().image_offset.x;
++    }
++    SECTION("Accidental second mip") {
++        ++plans.back().copies.back().image_subresource.base_level;
++    }
++    SECTION("Second layer") {
++        ++plans.front().copies.front().image_subresource.num_layers;
++    }
++    SECTION("Padded source") {
++        ++plans[2].runs.back().guest_bytes;
++    }
++    SECTION("Short staging allocation") {
++        --plans[1].total_host_bytes;
++    }
++    SECTION("Staging offset overlap") {
++        --plans.back().copies.back().buffer_offset;
++    }
++    REQUIRE_FALSE(covers());
++}
++
++TEST_CASE("D16 owned runs survive source mutation and late mixed walker fallback",
++          "[zero_depth_upload]") {
++    constexpr GPUVAddr base = 512;
++    constexpr size_t width = 256, height = 512;
++    auto info = Target(PixelFormat::D16_UNORM, width);
++    info.size.height = height;
++    info.layer_stride = CalculateLayerStride(info);
++    const auto size = CalculateGuestSizeInBytes(info);
++    std::vector<UnswizzlePlan> plans;
++    constexpr u64 chunk_size = 96 * 1024;
++    for (u64 offset = 0; offset < size; offset += chunk_size) {
++        const std::array range{std::pair{offset, std::min<u64>(size, offset + chunk_size)}};
++        plans.emplace_back(PlanUnswizzleImageRows(base, info, range));
++    }
++    REQUIRE(CoversWholeD16(plans, base, size, width, height));
++    std::vector<u8> source(size);
++    bool expect_clear = false;
++    SECTION("All zero") {
++        expect_clear = true;
++    }
++    SECTION("Short-distance from start") {
++        source.front() = 0x31;
++    }
++    SECTION("Last fallback snapshot is the only mixed one") {
++        source.back() = 0x71;
++    }
++    SECTION("Chunk boundary") {
++        source[chunk_size] = 0x51;
++    }
++    SECTION("Every byte FF requires original upload") {
++        std::fill(source.begin(), source.end(), 0xff);
++    }
++    const auto original = source;
++    std::vector<u8> received;
++    std::vector<u8> expected;
++    size_t next_read = 0, allocations = 0;
++    D16UploadEvidence evidence{base, size};
++    const auto capture = [&](const UnswizzleRowRun& r, std::vector<u8>& owned) {
++        const size_t offset = r.src_addr - base;
++        REQUIRE(offset == next_read);
++        next_read += r.guest_bytes;
++        owned.assign(source.begin() + offset, source.begin() + next_read);
++        std::fill(source.begin() + offset, source.begin() + next_read, 0xed);
++        const auto before = evidence.zero_bytes;
++        evidence.Observe(r.src_addr, owned, next_read != size);
++        return evidence.zero_bytes - before == r.guest_bytes;
++    };
++    struct Map {
++        std::vector<u8> mapped_span;
++    };
++    const auto allocate = [&](size_t n) {
++        ++allocations;
++        return Map{std::vector<u8>(n, 0x99)};
++    };
++    const auto upload = [&](Map& map, const UnswizzlePlan& p) {
++        received.insert(received.end(), map.mapped_span.begin(), map.mapped_span.end());
++        std::vector<u8> baseline(p.total_host_bytes);
++        for (const auto& r : p.runs) {
++            const auto pristine = std::span{original}.subspan(r.src_addr - base, r.guest_bytes);
++            DetileOwnedRun(p, r, pristine, baseline, true);
++        }
++        expected.insert(expected.end(), baseline.begin(), baseline.end());
++    };
++    const auto result = UploadD16Snapshots(
++        plans, capture, allocate,
++        [](const auto& p, const auto& r, auto& src, auto& dst) {
++            DetileOwnedRun(p, r, src, dst, true);
++        },
++        upload);
++    REQUIRE(result == expect_clear);
++    REQUIRE(next_read == size);
++    REQUIRE(evidence.Complete());
++    REQUIRE(evidence.non_file_bytes == plans.back().runs.back().guest_bytes);
++    REQUIRE(allocations == (expect_clear ? 0 : plans.size()));
++    REQUIRE(received == expected);
++    REQUIRE(received.size() == (expect_clear ? 0 : size));
++}
+diff --git a/src/video_core/renderer_vulkan/vk_initial_depth_clear.h b/src/video_core/renderer_vulkan/vk_initial_depth_clear.h
+new file mode 100644
+index 00000000..51ab5ead
+--- /dev/null
++++ b/src/video_core/renderer_vulkan/vk_initial_depth_clear.h
+@@ -0,0 +1,42 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#pragma once
++
++#include <vulkan/vulkan.h>
++
++namespace Vulkan {
++
++constexpr bool SupportsInitialZeroDepth(VkFormat format, VkImageUsageFlags usage,
++                                        VkImageAspectFlags aspect) {
++    return format == VK_FORMAT_D16_UNORM && (usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT) &&
++           aspect == VK_IMAGE_ASPECT_DEPTH_BIT;
++}
++
++// The caller owns a fresh, bound, single-sample D16 allocation with exactly one level/layer.
++template <typename Commands>
++void RecordInitialZeroDepth(Commands& commands, VkImage image) {
++    const VkImageSubresourceRange range{VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
++    VkImageMemoryBarrier barrier{
++        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
++        .srcAccessMask = 0,
++        .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
++        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
++        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++        .image = image,
++        .subresourceRange = range,
++    };
++    commands.PipelineBarrier(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
++                             barrier);
++    commands.ClearDepthStencilImage(image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, {0.0f, 0}, range);
++    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
++    barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
++    barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
++    barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
++    commands.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0,
++                             barrier);
++}
++
++} // namespace Vulkan
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.cpp b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+index 9b8569ca..b08dd6e6 100644
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+@@ -48,10 +48,12 @@
+ #ifdef EGLANTINE_STREAMLINE
+ #include "video_core/vulkan_common/streamline.h"
+ #endif
++#include "video_core/renderer_vulkan/vk_initial_depth_clear.h"
++#include "video_core/texture_cache/zero_depth_upload.h"
++#include "video_core/textures/decoders.h"
+ #include "video_core/vulkan_common/unbacked_fallback.h"
+ #include "video_core/vulkan_common/vulkan_memory_allocator.h"
+ #include "video_core/vulkan_common/vulkan_wrapper.h"
+-#include "video_core/textures/decoders.h"
+ 
+ namespace Vulkan {
+ 
+@@ -3635,6 +3637,25 @@ bool Image::BindZeroBlock() {
+     return true;
+ }
+ 
++bool Image::CanInitializeZeroDepth() const {
++    return original_image && !original_image.IsUnbacked() && !recycle_ticket &&
++           current_image == &Image::original_image && !host_level_offset && !info.is_sparse &&
++           VideoCommon::IsFirstDepthUpload(initialized, flags) &&
++           SupportsInitialZeroDepth(original_image.Format(), original_image.UsageFlags(),
++                                    aspect_mask) &&
++           runtime->device.IsFormatSupported(
++               VK_FORMAT_D16_UNORM, VK_FORMAT_FEATURE_TRANSFER_DST_BIT, FormatType::Optimal);
++}
++
++void Image::InitializeZeroDepth() {
++    ASSERT(CanInitializeZeroDepth());
++    scheduler->RequestOutsideRenderPassOperationContext();
++    initialized = true;
++    scheduler->Record([image = *original_image](vk::CommandBuffer cmdbuf) {
++        RecordInitialZeroDepth(cmdbuf, image);
++    });
++}
++
+ void Image::ClearTiles() {
+     scheduler->RequestOutsideRenderPassOperationContext();
+     const VkImage vk_image = *original_image;
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.h b/src/video_core/renderer_vulkan/vk_texture_cache.h
+index 0e6ce08c..1cedfd14 100644
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.h
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.h
+@@ -569,6 +569,9 @@ public:
+         return sparse_layers.bound_bytes;
+     }
+ 
++    bool CanInitializeZeroDepth() const;
++    void InitializeZeroDepth();
++
+     bool IsRescaled() const noexcept;
+ 
+     bool ScaleUp(bool ignore = false);
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index b677e066..a6a3a719 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -34,18 +34,19 @@
+ #include "video_core/engines/kepler_compute.h"
+ #include "video_core/guest_memory.h"
+ #include "video_core/host1x/gpu_device_memory_manager.h"
++#include "video_core/nx2.h"
++#include "video_core/nx2_profile.h"
++#include "video_core/render_trace.h"
+ #include "video_core/texture_cache/alias_copy.h"
+ #include "video_core/texture_cache/atlas_upload_evidence.h"
+ #include "video_core/texture_cache/clear_discard.h"
+-#include "video_core/texture_cache/image_view_base.h"
+ #include "video_core/texture_cache/conversion.h"
++#include "video_core/texture_cache/image_view_base.h"
+ #include "video_core/texture_cache/retire_completed_images.h"
+ #include "video_core/texture_cache/samples_helper.h"
+ #include "video_core/texture_cache/texture_cache_base.h"
+ #include "video_core/texture_cache/util.h"
+-#include "video_core/nx2.h"
+-#include "video_core/nx2_profile.h"
+-#include "video_core/render_trace.h"
++#include "video_core/texture_cache/zero_depth_upload.h"
+ #include "video_core/textures/decoders.h"
+ 
+ namespace VideoCommon {
+@@ -2038,31 +2039,88 @@ bool TextureCache<P>::UploadInChunks(Image& image) {
+                       (d16 && snapshot_marker && *snapshot_marker && absent(snapshot_marker));
+     u64 plan_ns{}, staging_ns{}, record_ns{}, chunks{};
+     UnswizzleTimings unswizzle;
+-    for (u64 offset = 0; offset < image.guest_size_bytes; offset += chunk_size) {
++    const auto plan_chunk = [&](u64 offset) {
+         const std::array range{
+             std::pair<u64, u64>{offset, std::min<u64>(offset + chunk_size, image.guest_size_bytes)}};
+         const auto began = now();
+         const auto plan = PlanUnswizzleImageRows(image.gpu_addr, image.info, range);
+-        const auto planned = now();
+-        plan_ns += elapsed(began, planned);
+-        if (!plan.layout_valid) {
+-            if (offset == 0) {
+-                return false; // layout not handled: one staging buffer after all
++        plan_ns += elapsed(began, now());
++        return plan;
++    };
++    const auto allocate = [&](size_t size) {
++        const auto begin = now();
++        auto staging = runtime.UploadStagingBuffer(size);
++        staging_ns += elapsed(begin, now());
++        return staging;
++    };
++    const auto upload = [&](auto& staging, const UnswizzlePlan& plan) {
++        const auto begin = now();
++        image.UploadMemory(staging, plan.copies);
++        record_ns += elapsed(begin, now());
++        ++chunks;
++    };
++    bool snapshot_upload = false;
++    bool depth_cleared = false;
++    if constexpr (requires {
++                      image.CanInitializeZeroDepth();
++                      image.InitializeZeroDepth();
++                  }) {
++        static const char* const zero_marker = std::getenv("STITCH_D16_ZERO_BASELINE_FILE");
++        if (zero_marker && *zero_marker && IsD16EvidenceAtlas(image.info, image.guest_size_bytes) &&
++            absent(zero_marker) && image.CanInitializeZeroDepth()) {
++            std::vector<UnswizzlePlan> plans;
++            for (u64 offset = 0; offset < image.guest_size_bytes; offset += chunk_size) {
++                plans.emplace_back(plan_chunk(offset));
++            }
++            if (CoversWholeD16(plans, image.gpu_addr, image.guest_size_bytes, image.info.size.width,
++                               image.info.size.height)) {
++                evidence.emplace(image.gpu_addr, image.guest_size_bytes);
++                const auto capture = [&](const UnswizzleRowRun& r, std::vector<u8>& bytes) {
++                    const bool file =
++                        ReadOwnedUnswizzleRun(*gpu_memory, r, bytes, timed ? &unswizzle : nullptr,
++                                              bulk, read_backing_file);
++                    const auto begin = Clock::now();
++                    const auto before = evidence->zero_bytes;
++                    evidence->Observe(r.src_addr, bytes, file);
++                    evidence->scan_ns += elapsed(begin, Clock::now());
++                    return evidence->zero_bytes - before == r.guest_bytes;
++                };
++                const auto decode = [&](const UnswizzlePlan& plan, const UnswizzleRowRun& r,
++                                        std::span<const u8> bytes, std::span<u8> dst) {
++                    const auto begin = now();
++                    DetileOwnedRun(plan, r, bytes, dst, gpu_memory->UsesNativeTiling());
++                    unswizzle.detile_ns += elapsed(begin, now());
++                };
++                depth_cleared = UploadD16Snapshots(plans, capture, allocate, decode, upload);
++                if (depth_cleared) {
++                    // Coverage was proven from metadata; every contributing snapshot was zero.
++                    ASSERT(evidence->Complete() && evidence->zero_bytes == evidence->size);
++                    const auto begin = now();
++                    image.InitializeZeroDepth();
++                    record_ns += elapsed(begin, now());
++                }
++                snapshot_upload = true;
+             }
+-            continue;
+         }
+-        if (plan.copies.empty()) {
+-            continue; // padding between levels or layers
++    }
++    if (!snapshot_upload) {
++        for (u64 offset = 0; offset < image.guest_size_bytes; offset += chunk_size) {
++            const auto plan = plan_chunk(offset);
++            if (!plan.layout_valid) {
++                if (offset == 0) {
++                    return false; // layout not handled: one staging buffer after all
++                }
++                continue;
++            }
++            if (plan.copies.empty()) {
++                continue; // padding between levels or layers
++            }
++            auto staging = allocate(plan.total_host_bytes);
++            ExecuteUnswizzlePlan(*gpu_memory, plan, staging.mapped_span,
++                                 timed ? &unswizzle : nullptr, bulk, read_backing_file,
++                                 evidence ? &*evidence : nullptr);
++            upload(staging, plan);
+         }
+-        auto staging = runtime.UploadStagingBuffer(plan.total_host_bytes);
+-        const auto staged = now();
+-        ExecuteUnswizzlePlan(*gpu_memory, plan, staging.mapped_span, timed ? &unswizzle : nullptr,
+-                             bulk, read_backing_file, evidence ? &*evidence : nullptr);
+-        const auto decoded = now();
+-        image.UploadMemory(staging, plan.copies);
+-        staging_ns += elapsed(planned, staged);
+-        record_ns += elapsed(decoded, now());
+-        ++chunks;
+     }
+     const auto barrier_begin = now();
+     runtime.InsertUploadMemoryBarrier();
+@@ -2086,12 +2144,14 @@ bool TextureCache<P>::UploadInChunks(Image& image) {
+                  unswizzle.read_major_faults, read_backing_file, unswizzle.file_read_bytes);
+     }
+     if (evidence) {
+-        LOG_INFO(HW_GPU,
+-                 "D16 upload evidence: frame={} footprint_bytes={} complete={} scanned_bytes={} runs={} "
+-                 "zero_run_bytes={} ff_run_bytes={} other_run_bytes={} non_file_bytes={} scan_ms={:.3f}",
+-                 frame_tick, evidence->size, evidence->Complete(), evidence->scanned, evidence->runs,
+-                 evidence->zero_bytes, evidence->ff_bytes, evidence->other_bytes,
+-                 evidence->non_file_bytes, evidence->scan_ns / 1.e6);
++        LOG_INFO(
++            HW_GPU,
++            "D16 upload evidence: frame={} footprint_bytes={} complete={} scanned_bytes={} runs={} "
++            "zero_run_bytes={} ff_run_bytes={} other_run_bytes={} non_file_bytes={} scan_ms={:.3f} "
++            "zero_candidate={} depth_cleared={}",
++            frame_tick, evidence->size, evidence->Complete(), evidence->scanned, evidence->runs,
++            evidence->zero_bytes, evidence->ff_bytes, evidence->other_bytes,
++            evidence->non_file_bytes, evidence->scan_ns / 1.e6, snapshot_upload, depth_cleared);
+     }
+     return true;
+ }
+diff --git a/src/video_core/texture_cache/util.cpp b/src/video_core/texture_cache/util.cpp
+index 8fc9f7c4..f2873019 100644
+--- a/src/video_core/texture_cache/util.cpp
++++ b/src/video_core/texture_cache/util.cpp
+@@ -1269,58 +1269,72 @@ UnswizzlePlan PlanUnswizzleImageRows(
+     return plan;
+ }
+ 
+-void ExecuteUnswizzlePlan(Tegra::MemoryManager& gpu_memory, const UnswizzlePlan& plan,
+-                         std::span<u8> output, UnswizzleTimings* timings, bool bulk_snapshot, bool read_backing_file,
+-                         D16UploadEvidence* evidence) {
++bool ReadOwnedUnswizzleRun(Tegra::MemoryManager& memory, const UnswizzleRowRun& run,
++                           std::vector<u8>& storage, UnswizzleTimings* timings, bool bulk_snapshot,
++                           bool read_backing_file) {
+     using Clock = std::chrono::steady_clock;
+     const auto now = [&] { return timings ? Clock::now() : Clock::time_point{}; };
+-    const auto elapsed = [](auto start, auto end) {
+-        return std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
+-    };
+-    std::vector<u8> run;
+-    for (const auto& r : plan.runs) {
+-        const auto began = now();
+-        run.resize(r.guest_bytes);
+-        const auto allocated = now();
++    const auto began = now();
++    storage.resize(run.guest_bytes);
++    const auto allocated = now();
+ #ifdef __linux__
+-        rusage before{}, after{};
+-        const bool sampled = timings && getrusage(RUSAGE_THREAD, &before) == 0;
++    rusage before{}, after{};
++    const bool sampled = timings && getrusage(RUSAGE_THREAD, &before) == 0;
+ #endif
+-        bool file_read = false;
+-        const bool bulk = bulk_snapshot && gpu_memory.TrySnapshotTextureRun(
+-                                               r.src_addr, run, read_backing_file ? &file_read : nullptr);
+-        if (!bulk) {
+-            gpu_memory.ReadBlockUnsafe(r.src_addr, run.data(), r.guest_bytes);
+-        }
++    bool file_read = false;
++    const bool bulk =
++        bulk_snapshot && memory.TrySnapshotTextureRun(run.src_addr, storage,
++                                                      read_backing_file ? &file_read : nullptr);
++    if (!bulk) {
++        memory.ReadBlockUnsafe(run.src_addr, storage.data(), storage.size());
++    }
+ #ifdef __linux__
+-        if (sampled && getrusage(RUSAGE_THREAD, &after) == 0) {
+-            ++timings->sampled_reads;
+-            timings->read_minor_faults += after.ru_minflt - before.ru_minflt;
+-            timings->read_major_faults += after.ru_majflt - before.ru_majflt;
+-        }
++    if (sampled && getrusage(RUSAGE_THREAD, &after) == 0) {
++        ++timings->sampled_reads;
++        timings->read_minor_faults += after.ru_minflt - before.ru_minflt;
++        timings->read_major_faults += after.ru_majflt - before.ru_majflt;
++    }
+ #endif
++    if (timings) {
+         const auto read = now();
+-        auto decode_begin = read;
++        timings->read_ns +=
++            std::chrono::duration_cast<std::chrono::nanoseconds>(read - allocated).count();
++        timings->allocation_ns +=
++            std::chrono::duration_cast<std::chrono::nanoseconds>(allocated - began).count();
++        timings->bulk_bytes += bulk ? run.guest_bytes : 0;
++        timings->file_read_bytes += file_read ? run.guest_bytes : 0;
++        ++timings->runs;
++        timings->guest_bytes += run.guest_bytes;
++    }
++    return file_read;
++}
++
++void DetileOwnedRun(const UnswizzlePlan& plan, const UnswizzleRowRun& run,
++                    std::span<const u8> source, std::span<u8> output, bool native_tiling) {
++    Tegra::Texture::UnswizzleTexture(
++        output.subspan(run.host_offset, run.host_bytes), source, 1U << plan.bpp_log2, run.run_tiles,
++        run.tile_rows, 1, run.block.height, run.block.depth, run.run_alignment, native_tiling);
++}
++
++void ExecuteUnswizzlePlan(Tegra::MemoryManager& gpu_memory, const UnswizzlePlan& plan,
++                          std::span<u8> output, UnswizzleTimings* timings, bool bulk_snapshot,
++                          bool read_backing_file, D16UploadEvidence* evidence) {
++    using Clock = std::chrono::steady_clock;
++    std::vector<u8> run;
++    for (const auto& r : plan.runs) {
++        const bool file =
++            ReadOwnedUnswizzleRun(gpu_memory, r, run, timings, bulk_snapshot, read_backing_file);
+         if (evidence) {
+             const auto begin = Clock::now();
+-            evidence->Observe(r.src_addr, run, file_read);
+-            decode_begin = Clock::now();
+-            evidence->scan_ns += elapsed(begin, decode_begin);
++            evidence->Observe(r.src_addr, run, file);
++            evidence->scan_ns +=
++                std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - begin).count();
+         }
+-        Tegra::Texture::UnswizzleTexture(output.subspan(r.host_offset, r.host_bytes),
+-                                         run, 1U << plan.bpp_log2, r.run_tiles, r.tile_rows, 1,
+-                                         r.block.height, r.block.depth, r.run_alignment,
+-                                         gpu_memory.UsesNativeTiling());
++        const auto began = timings ? Clock::now() : Clock::time_point{};
++        DetileOwnedRun(plan, r, run, output, gpu_memory.UsesNativeTiling());
+         if (timings) {
+-            if (bulk) {
+-                timings->bulk_bytes += r.guest_bytes;
+-                if (file_read) timings->file_read_bytes += r.guest_bytes;
+-            }
+-            timings->allocation_ns += elapsed(began, allocated);
+-            timings->read_ns += elapsed(allocated, read);
+-            timings->detile_ns += elapsed(decode_begin, Clock::now());
+-            ++timings->runs;
+-            timings->guest_bytes += r.guest_bytes;
++            timings->detile_ns +=
++                std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - began).count();
+         }
+     }
+ }
+diff --git a/src/video_core/texture_cache/util.h b/src/video_core/texture_cache/util.h
+index 165d0e03..a1d254d0 100644
+--- a/src/video_core/texture_cache/util.h
++++ b/src/video_core/texture_cache/util.h
+@@ -106,6 +106,15 @@ struct UnswizzleTimings {
+     u64 bulk_bytes{}, file_read_bytes{}, read_minor_faults{}, read_major_faults{}, sampled_reads{};
+ };
+ 
++/// Reads one complete tiled run into caller-owned storage. Returns true for a full backing file
++/// read.
++bool ReadOwnedUnswizzleRun(Tegra::MemoryManager& memory, const UnswizzleRowRun& run,
++                           std::vector<u8>& storage, UnswizzleTimings* timings, bool bulk_snapshot,
++                           bool read_backing_file);
++
++void DetileOwnedRun(const UnswizzlePlan& plan, const UnswizzleRowRun& run,
++                    std::span<const u8> source, std::span<u8> output, bool native_tiling);
++
+ /// Executes a precalculated unswizzle plan directly into destination memory (e.g. mapped staging span).
+ void ExecuteUnswizzlePlan(Tegra::MemoryManager& gpu_memory, const UnswizzlePlan& plan,
+                          std::span<u8> output, UnswizzleTimings* timings = nullptr,
+diff --git a/src/video_core/texture_cache/zero_depth_upload.h b/src/video_core/texture_cache/zero_depth_upload.h
+new file mode 100644
+index 00000000..a3acf13f
+--- /dev/null
++++ b/src/video_core/texture_cache/zero_depth_upload.h
+@@ -0,0 +1,107 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#pragma once
++
++#include <algorithm>
++#include <limits>
++#include <optional>
++
++#include "video_core/texture_cache/image_base.h"
++#include "video_core/texture_cache/util.h"
++
++namespace VideoCommon {
++
++inline bool IsFirstDepthUpload(bool initialized, ImageFlagBits flags) {
++    // Tracking was enabled just before RefreshContents. A registered image can already have views.
++    return !initialized && False(flags & ~ImageFlagBits::Tracked);
++}
++
++// Require a tight D16 footprint on both sides: successive guest byte intervals and
++// consecutive horizontal fragments of complete, equally tall bands at level/layer zero.
++inline bool CoversWholeD16(std::span<const UnswizzlePlan> plans, GPUVAddr base, u64 size, u32 width,
++                           u32 height) {
++    if (!width || !height || !size || size % 2 || size / 2 != u64{width} * height ||
++        size > std::numeric_limits<u64>::max() - base) {
++        return false;
++    }
++    u64 consumed{};
++    u32 x{}, y{}, band_height{};
++    for (const auto& plan : plans) {
++        if (!plan.layout_valid || plan.bpp_log2 != 1 || plan.runs.empty() ||
++            plan.runs.size() != plan.copies.size()) {
++            return false;
++        }
++        u64 host{};
++        for (size_t i = 0; i < plan.runs.size(); ++i) {
++            const auto& run = plan.runs[i];
++            const auto& copy = plan.copies[i];
++            const auto extent = copy.image_extent;
++            const auto sub = copy.image_subresource;
++            if (x == 0)
++                band_height = extent.height;
++            if (sub.base_level || sub.base_layer || sub.num_layers != 1 ||
++                copy.image_offset != Offset3D{static_cast<s32>(x), static_cast<s32>(y), 0} ||
++                extent.depth != 1 || !extent.width || !extent.height ||
++                extent.height != band_height || extent.width > width - x ||
++                extent.height > height - y || copy.buffer_row_length != extent.width ||
++                copy.buffer_image_height != extent.height || run.run_tiles != extent.width ||
++                run.tile_rows != extent.height || run.src_addr != base + consumed ||
++                !run.guest_bytes || run.guest_bytes > (4ULL << 20) ||
++                run.guest_bytes > size - consumed || run.host_offset != host ||
++                copy.buffer_offset != host || run.host_bytes != run.guest_bytes ||
++                run.host_bytes != copy.buffer_size ||
++                run.host_bytes != u64{extent.width} * extent.height * 2) {
++                return false;
++            }
++            host += run.host_bytes;
++            consumed += run.guest_bytes;
++            x += extent.width;
++            if (x == width) {
++                x = 0;
++                y += extent.height;
++            }
++        }
++        if (host != plan.total_host_bytes)
++            return false;
++    }
++    return consumed == size && x == 0 && y == height;
++}
++
++// Plans have been proven complete before the first read. Capture each run exactly once.
++// On first mixed data, synthesize already consumed zero bytes; never reread their guest addresses.
++template <typename Capture, typename Allocate, typename Decode, typename Upload>
++bool UploadD16Snapshots(std::span<const UnswizzlePlan> plans, Capture&& capture,
++                        Allocate&& allocate, Decode&& decode, Upload&& upload) {
++    using Staging = decltype(allocate(size_t{}));
++    std::vector<u8> bytes;
++    bool all_zero = true;
++    for (size_t chunk = 0; chunk < plans.size(); ++chunk) {
++        const auto& plan = plans[chunk];
++        std::optional<Staging> staging;
++        for (const auto& run : plan.runs) {
++            const bool zero = capture(run, bytes);
++            if (all_zero) {
++                if (zero)
++                    continue;
++                all_zero = false;
++                for (size_t i = 0; i < chunk; ++i) {
++                    const auto& prefix = plans[i];
++                    auto prior = allocate(prefix.total_host_bytes);
++                    std::fill_n(prior.mapped_span.begin(), prefix.total_host_bytes, u8{});
++                    upload(prior, prefix);
++                }
++            }
++            if (!staging) {
++                staging.emplace(allocate(plan.total_host_bytes));
++                std::fill_n(staging->mapped_span.begin(), run.host_offset, u8{});
++            }
++            decode(plan, run, bytes, staging->mapped_span);
++        }
++        if (staging)
++            upload(*staging, plan);
++    }
++    return all_zero;
++}
++
++} // namespace VideoCommon
+diff --git a/src/video_core/vulkan_common/vulkan_memory_allocator.cpp b/src/video_core/vulkan_common/vulkan_memory_allocator.cpp
+index 56bc9388..e6edd02e 100644
+--- a/src/video_core/vulkan_common/vulkan_memory_allocator.cpp
++++ b/src/video_core/vulkan_common/vulkan_memory_allocator.cpp
+@@ -435,7 +435,7 @@ VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedica
+         );
+     }
+ 
+-    image = vk::Image(handle, ci.usage, *device.GetLogical(), allocator, allocation,
++    image = vk::Image(handle, ci.format, ci.usage, *device.GetLogical(), allocator, allocation,
+                       device.GetDispatchLoader());
+     return VK_SUCCESS;
+ }
+@@ -454,7 +454,7 @@ vk::Image MemoryAllocator::CreateUnbackedImage(const VkImageCreateInfo &ci, bool
+                                                  &sparse) != VK_SUCCESS) {
+         return vk::Image{};
+     }
+-    return vk::Image(sparse, ci.usage, *device.GetLogical(), allocator, VK_NULL_HANDLE,
++    return vk::Image(sparse, ci.format, ci.usage, *device.GetLogical(), allocator, VK_NULL_HANDLE,
+                      device.GetDispatchLoader());
+ }
+ 
+diff --git a/src/video_core/vulkan_common/vulkan_wrapper.cpp b/src/video_core/vulkan_common/vulkan_wrapper.cpp
+index 2bf33bf6..ae0ec71e 100644
+--- a/src/video_core/vulkan_common/vulkan_wrapper.cpp
++++ b/src/video_core/vulkan_common/vulkan_wrapper.cpp
+@@ -102,6 +102,7 @@ void Load(VkDevice device, DeviceDispatch& dld) noexcept {
+     X(vkCmdBlitImage);
+     X(vkCmdClearAttachments);
+     X(vkCmdClearColorImage);
++    X(vkCmdClearDepthStencilImage);
+     X(vkCmdCopyBuffer);
+     X(vkCmdCopyBufferToImage);
+     X(vkCmdCopyImage);
+diff --git a/src/video_core/vulkan_common/vulkan_wrapper.h b/src/video_core/vulkan_common/vulkan_wrapper.h
+index 1679316b..1c988d56 100644
+--- a/src/video_core/vulkan_common/vulkan_wrapper.h
++++ b/src/video_core/vulkan_common/vulkan_wrapper.h
+@@ -220,6 +220,7 @@ struct DeviceDispatch : InstanceDispatch {
+     PFN_vkCmdBlitImage vkCmdBlitImage{};
+     PFN_vkCmdClearAttachments vkCmdClearAttachments{};
+     PFN_vkCmdClearColorImage vkCmdClearColorImage{};
++    PFN_vkCmdClearDepthStencilImage vkCmdClearDepthStencilImage{};
+     PFN_vkCmdCopyBuffer vkCmdCopyBuffer{};
+     PFN_vkCmdCopyBufferToImage vkCmdCopyBufferToImage{};
+     PFN_vkCmdCopyImage vkCmdCopyImage{};
+@@ -688,10 +689,10 @@ public:
+ 
+ class Image {
+ public:
+-    explicit Image(VkImage handle_, VkImageUsageFlags usage_, VkDevice owner_,
++    explicit Image(VkImage handle_, VkFormat format_, VkImageUsageFlags usage_, VkDevice owner_,
+                    VmaAllocator allocator_, VmaAllocation allocation_,
+                    const DeviceDispatch& dld_) noexcept
+-        : handle{handle_}, usage{usage_}, owner{owner_}, allocator{allocator_},
++        : handle{handle_}, format{format_}, usage{usage_}, owner{owner_}, allocator{allocator_},
+           allocation{allocation_}, dld{&dld_} {}
+     Image() = default;
+ 
+@@ -704,12 +705,13 @@ public:
+     Image& operator=(const Image&) = delete;
+ 
+     Image(Image&& rhs) noexcept
+-        : handle{std::exchange(rhs.handle, VkImage{})}, usage{rhs.usage}, owner{rhs.owner},
+-          allocator{rhs.allocator}, allocation{rhs.allocation}, dld{rhs.dld} {}
++        : handle{std::exchange(rhs.handle, VkImage{})}, format{rhs.format}, usage{rhs.usage},
++          owner{rhs.owner}, allocator{rhs.allocator}, allocation{rhs.allocation}, dld{rhs.dld} {}
+ 
+     Image& operator=(Image&& rhs) noexcept {
+         Release();
+         handle = std::exchange(rhs.handle, VkImage{});
++        format = rhs.format;
+         usage = rhs.usage;
+         owner = rhs.owner;
+         allocator = rhs.allocator;
+@@ -737,6 +739,10 @@ public:
+ 
+     void SetObjectNameEXT(const char* name) const;
+ 
++    [[nodiscard]] VkFormat Format() const noexcept {
++        return format;
++    }
++
+     [[nodiscard]] VkImageUsageFlags UsageFlags() const noexcept {
+         return usage;
+     }
+@@ -754,6 +760,7 @@ private:
+     void Release() const noexcept;
+ 
+     VkImage handle{};
++    VkFormat format{};
+     VkImageUsageFlags usage{};
+     VkDevice owner = nullptr;
+     VmaAllocator allocator = nullptr;
+@@ -1372,6 +1379,12 @@ public:
+                                    rects.data());
+     }
+ 
++    void ClearDepthStencilImage(VkImage image, VkImageLayout layout, VkClearDepthStencilValue value,
++                                Span<VkImageSubresourceRange> ranges) const noexcept {
++        dld->vkCmdClearDepthStencilImage(handle, image, layout, &value, ranges.size(),
++                                         ranges.data());
++    }
++
+     void ClearColorImage(VkImage image, VkImageLayout layout, VkClearColorValue color,
+                          Span<VkImageSubresourceRange> ranges) {
+         dld->vkCmdClearColorImage(handle, image, layout, &color, ranges.size(), ranges.data());
