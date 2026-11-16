@@ -28,6 +28,6 @@ The first startup command-line game open blocked before the Qt event loop. Selec
 
 ## Recovery material
 
-`source-recovery/numbered-backups/` preserves all 60 pre-existing numbered C++/header/CMake copies, with SHA-256 manifest. They are historical snapshots, not build inputs. The five `.patch` files preserve dirty PR experiment workspaces, with original base commits in `experiments.json`. They are not established fixes and must be reviewed/tested before reuse.
+`source-recovery/numbered-backups/` preserves all 60 pre-existing numbered C++/header/CMake copies, with SHA-256 manifest. They are historical snapshots, not build inputs. The five `.patch` files preserve dirty PR experiment workspaces, with original base commits in `experiments.json`. They are not established fixes and must be reviewed/tested before reuse. Six additional committed, unmerged experiment heads are retained on the remote recovery branches listed in `source-recovery/committed-experiments.json`.
 
 No game, IPS bytes, save/NAND data, keys, credentials, private screenshots, guest shader caches, raw process profiles or binary builds are committed here. The user requested deletion of local Stitch copies after source preservation. The original game/download files and the Steam Machine installation are outside this local cleanup scope.

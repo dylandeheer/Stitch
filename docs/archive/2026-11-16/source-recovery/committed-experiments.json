@@ -1,0 +1,32 @@
+[
+  {
+    "ref": "refs/heads/stitch/recovery-20261116-805-early-download",
+    "commit": "0142ae417ea27415501137752f0d3b36b9ba0409",
+    "status": "Historical unfinished experiment; preserved for recovery, not merged into engine"
+  },
+  {
+    "ref": "refs/heads/stitch/recovery-20261116-805-extent-binding",
+    "commit": "3ca6293e6c8a813932de3b2d2b4988d8ff9d6760",
+    "status": "Historical unfinished experiment; preserved for recovery, not merged into engine"
+  },
+  {
+    "ref": "refs/heads/stitch/recovery-20261116-805-macro-execution",
+    "commit": "8610c2b23d4eb395d57b9b36cc9419cd31e4007f",
+    "status": "Historical unfinished experiment; preserved for recovery, not merged into engine"
+  },
+  {
+    "ref": "refs/heads/stitch/recovery-20261116-805-deferred",
+    "commit": "97aadd09e5f2fd4f58370915ab010f9e82b434c4",
+    "status": "Historical unfinished experiment; preserved for recovery, not merged into engine"
+  },
+  {
+    "ref": "refs/heads/stitch/recovery-20261116-805-implementation",
+    "commit": "d98b29c241b09c08115095be1d41974530cb7a73",
+    "status": "Historical unfinished experiment; preserved for recovery, not merged into engine"
+  },
+  {
+    "ref": "refs/heads/stitch/recovery-20261116-805-macro-ownership",
+    "commit": "e5d17c8134cd1b6c130c5bd3f098c703c0e3b08e",
+    "status": "Historical unfinished experiment; preserved for recovery, not merged into engine"
+  }
+]
